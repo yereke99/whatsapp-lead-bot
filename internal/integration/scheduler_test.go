@@ -384,6 +384,45 @@ func TestUnsubscribeCancelsPendingJobs(t *testing.T) {
 	}
 }
 
+func TestCompleteFinishedEnrollments(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	eventStart := time.Now().UTC().Add(time.Hour)
+	campaign := f.createCampaign(t, "Completion", eventStart, []int{0, 60})
+	f.addTrigger(t, campaign.ID, "Айран")
+
+	contact := f.createContact(t, "77011234567")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := testDB.Exec(ctx,
+		`UPDATE scheduled_messages SET status = 'SENT', sent_at = now() WHERE campaign_id = $1`,
+		campaign.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	completed, err := f.campaignSvc.CompleteFinishedEnrollments(ctx)
+	if err != nil {
+		t.Fatalf("CompleteFinishedEnrollments: %v", err)
+	}
+	if completed != 1 {
+		t.Errorf("completed %d enrollments, want 1", completed)
+	}
+
+	var status domain.EnrollmentStatus
+	if err := testDB.QueryRow(ctx,
+		`SELECT status FROM campaign_contacts WHERE campaign_id = $1 AND contact_id = $2`,
+		campaign.ID, contact.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != domain.EnrollmentCompleted {
+		t.Errorf("enrollment status = %s, want COMPLETED", status)
+	}
+}
+
 // TestUniqueConstraintBlocksDuplicateStepDelivery asserts the database-level
 // guarantee directly, independent of the service layer.
 func TestUniqueConstraintBlocksDuplicateStepDelivery(t *testing.T) {

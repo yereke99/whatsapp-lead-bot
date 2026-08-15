@@ -143,6 +143,84 @@ func TestParseImageWithCaption(t *testing.T) {
 	}
 }
 
+func TestParseInteractiveSelectionsAsText(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "simple button",
+			body: `{
+				"typeWebhook": "incomingMessageReceived",
+				"idMessage": "BTN1",
+				"senderData": {"chatId": "77011234567@c.us"},
+				"messageData": {
+					"typeMessage": "buttonsResponseMessage",
+					"buttonsResponseMessage": {
+						"stanzaId": "ORIG1",
+						"selectedButtonId": "1",
+						"selectedButtonText": "Айран"
+					}
+				}
+			}`,
+			want: "Айран",
+		},
+		{
+			name: "list item",
+			body: `{
+				"typeWebhook": "incomingMessageReceived",
+				"idMessage": "LIST1",
+				"senderData": {"chatId": "77011234567@c.us"},
+				"messageData": {
+					"typeMessage": "listResponseMessage",
+					"listResponseMessage": {
+						"stanzaId": "ORIG2",
+						"title": "Қаймақ",
+						"singleSelectReply": "cream"
+					}
+				}
+			}`,
+			want: "Қаймақ",
+		},
+		{
+			name: "template button",
+			body: `{
+				"typeWebhook": "incomingMessageReceived",
+				"idMessage": "TPLBTN1",
+				"senderData": {"chatId": "77011234567@c.us"},
+				"messageData": {
+					"typeMessage": "templateButtonsReplyMessage",
+					"templateButtonReplyMessage": {
+						"stanzaId": "ORIG3",
+						"selectedId": "free-lesson",
+						"selectedDisplayText": "Айран/Қаймақ кәсібі бойынша тегін сабаққа қатысқым келеді"
+					}
+				}
+			}`,
+			want: "Айран/Қаймақ кәсібі бойынша тегін сабаққа қатысқым келеді",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			event, err := ParseWebhook([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("ParseWebhook: %v", err)
+			}
+			if event.Message.Type != whatsapp.TypeText {
+				t.Errorf("Type = %v, want TEXT", event.Message.Type)
+			}
+			if event.Message.Text != tc.want {
+				t.Errorf("Text = %q, want %q", event.Message.Text, tc.want)
+			}
+			if event.Message.QuotedID == "" {
+				t.Error("button selection should keep the source stanza id")
+			}
+		})
+	}
+}
+
 func TestParseStatusWebhook(t *testing.T) {
 	cases := map[string]whatsapp.DeliveryStatus{
 		"sent":       whatsapp.StatusSent,

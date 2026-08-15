@@ -81,6 +81,21 @@ type messageData struct {
 			OptionName string `json:"optionName"`
 		} `json:"options"`
 	} `json:"pollMessageData"`
+	ButtonsResponseMessage *struct {
+		SelectedButtonID   string `json:"selectedButtonId"`
+		SelectedButtonText string `json:"selectedButtonText"`
+		StanzaID           string `json:"stanzaId"`
+	} `json:"buttonsResponseMessage"`
+	ListResponseMessage *struct {
+		Title             string `json:"title"`
+		SingleSelectReply string `json:"singleSelectReply"`
+		StanzaID          string `json:"stanzaId"`
+	} `json:"listResponseMessage"`
+	TemplateButtonReplyMessage *struct {
+		SelectedID          string `json:"selectedId"`
+		SelectedDisplayText string `json:"selectedDisplayText"`
+		StanzaID            string `json:"stanzaId"`
+	} `json:"templateButtonReplyMessage"`
 	QuotedMessage *struct {
 		StanzaID string `json:"stanzaId"`
 	} `json:"quotedMessage"`
@@ -235,6 +250,33 @@ func parseMessageData(md *messageData) *whatsapp.InboundMessage {
 		if md.ExtendedTextMessageData != nil {
 			msg.Text = md.ExtendedTextMessageData.Text
 		}
+
+	case "buttonsResponseMessage":
+		msg.Type = whatsapp.TypeText
+		if md.ButtonsResponseMessage != nil {
+			msg.Text = firstNonBlank(md.ButtonsResponseMessage.SelectedButtonText, md.ButtonsResponseMessage.SelectedButtonID)
+			if msg.QuotedID == "" {
+				msg.QuotedID = md.ButtonsResponseMessage.StanzaID
+			}
+		}
+
+	case "listResponseMessage":
+		msg.Type = whatsapp.TypeText
+		if md.ListResponseMessage != nil {
+			msg.Text = firstNonBlank(md.ListResponseMessage.Title, md.ListResponseMessage.SingleSelectReply)
+			if msg.QuotedID == "" {
+				msg.QuotedID = md.ListResponseMessage.StanzaID
+			}
+		}
+
+	case "templateButtonsReplyMessage":
+		msg.Type = whatsapp.TypeText
+		if md.TemplateButtonReplyMessage != nil {
+			msg.Text = firstNonBlank(md.TemplateButtonReplyMessage.SelectedDisplayText, md.TemplateButtonReplyMessage.SelectedID)
+			if msg.QuotedID == "" {
+				msg.QuotedID = md.TemplateButtonReplyMessage.StanzaID
+			}
+		}
 	}
 
 	msg.Text = strings.TrimSpace(msg.Text)
@@ -313,4 +355,13 @@ func trimEmpty(in []string) []string {
 		}
 	}
 	return out
+}
+
+func firstNonBlank(values ...string) string {
+	for _, v := range values {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }

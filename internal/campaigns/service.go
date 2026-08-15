@@ -840,13 +840,13 @@ func (s *Service) StopForContact(ctx context.Context, contactID uuid.UUID, statu
 // CompleteFinishedEnrollments closes enrollments whose jobs have all resolved.
 func (s *Service) CompleteFinishedEnrollments(ctx context.Context) (int64, error) {
 	const query = `
-		UPDATE campaign_contacts cc SET
+		UPDATE campaign_contacts SET
 			status = 'COMPLETED', completed_at = now()
-		WHERE cc.status = 'ACTIVE'
-		  AND EXISTS (SELECT 1 FROM scheduled_messages sm WHERE sm.enrollment_id = cc.id)
+		WHERE status = 'ACTIVE'
+		  AND EXISTS (SELECT 1 FROM scheduled_messages sm WHERE sm.enrollment_id = campaign_contacts.id)
 		  AND NOT EXISTS (
 			SELECT 1 FROM scheduled_messages sm
-			WHERE sm.enrollment_id = cc.id AND sm.status IN ('PENDING', 'PROCESSING')
+			WHERE sm.enrollment_id = campaign_contacts.id AND sm.status IN ('PENDING', 'PROCESSING')
 		  )`
 
 	tag, err := s.repo.DB().Exec(ctx, query)

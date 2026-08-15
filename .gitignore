@@ -17,6 +17,7 @@
 # Runtime data
 /storage/
 /data/
+/run/
 *.db
 *.db-wal
 *.db-shm

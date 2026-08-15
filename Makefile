@@ -8,7 +8,12 @@ APP_DIR      := $(shell pwd)
 # Every target that touches the database reads .env the way the service does.
 RUN_ENV = set -a && . ./.env && set +a &&
 
-.PHONY: help run build test test-integration test-all test-race cover fmt vet lint tidy \
+RUN_DIR  := run
+PID_FILE := $(RUN_DIR)/server.pid
+LOG_FILE := $(RUN_DIR)/server.log
+
+.PHONY: help run dev run-stop run-restart run-status run-logs build \
+        test test-integration test-all test-race cover fmt vet lint tidy \
         migrate seed clean install-service start stop restart status logs \
         docker-build docker-up docker-down
 
@@ -17,9 +22,58 @@ help: ## Show available targets
 
 # ------------------------------------------------------------ development --
 
-run: ## Run the whole system locally with the local .env
+# The server is compiled first and the binary is what gets backgrounded.
+# Backgrounding `go run` instead would record the pid of its wrapper process
+# rather than the server's, so stopping it could leave the server orphaned and
+# still holding the port.
+run: ## Start the system in the background (logs to run/server.log)
+	@test -f .env || { echo "no .env found; run: cp .env.example .env"; exit 1; }
+	@if [ -f "$(PID_FILE)" ] && kill -0 "$$(cat $(PID_FILE))" 2>/dev/null; then \
+		echo "already running (pid $$(cat $(PID_FILE))); use 'make run-restart'"; exit 1; \
+	fi
+	@mkdir -p $(RUN_DIR)
+	@$(GO) build -trimpath -o $(BINARY_DIR)/server ./cmd/server
+	@set -a; . ./.env; set +a; nohup $(BINARY_DIR)/server >> $(LOG_FILE) 2>&1 & echo $$! > $(PID_FILE)
+	@sleep 2
+	@if kill -0 "$$(cat $(PID_FILE))" 2>/dev/null; then \
+		echo "started in background (pid $$(cat $(PID_FILE)))"; \
+		echo "  logs:  make run-logs"; \
+		echo "  stop:  make run-stop"; \
+	else \
+		rm -f $(PID_FILE); \
+		echo "failed to start; last lines of $(LOG_FILE):"; tail -n 20 $(LOG_FILE); exit 1; \
+	fi
+
+dev: ## Run in the foreground, for development (Ctrl-C to stop)
 	@test -f .env || { echo "no .env found; run: cp .env.example .env"; exit 1; }
 	$(RUN_ENV) $(GO) run ./cmd/server
+
+run-stop: ## Stop the backgrounded system
+	@if [ ! -f "$(PID_FILE)" ]; then echo "not running (no $(PID_FILE))"; exit 0; fi
+	@pid=$$(cat $(PID_FILE)); \
+	if kill -0 "$$pid" 2>/dev/null; then \
+		kill -INT "$$pid"; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do \
+			kill -0 "$$pid" 2>/dev/null || break; sleep 1; \
+		done; \
+		kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" || true; \
+		echo "stopped (pid $$pid)"; \
+	else \
+		echo "not running (stale pid $$pid)"; \
+	fi; \
+	rm -f $(PID_FILE)
+
+run-restart: run-stop run ## Restart the backgrounded system
+
+run-status: ## Show whether the backgrounded system is running
+	@if [ -f "$(PID_FILE)" ] && kill -0 "$$(cat $(PID_FILE))" 2>/dev/null; then \
+		echo "running (pid $$(cat $(PID_FILE)))"; \
+	else \
+		echo "not running"; \
+	fi
+
+run-logs: ## Follow the backgrounded system's logs
+	@touch $(LOG_FILE); tail -f $(LOG_FILE)
 
 build: ## Compile all binaries into ./bin
 	$(GO) build -trimpath -o $(BINARY_DIR)/server  ./cmd/server
@@ -63,7 +117,7 @@ tidy: ## Tidy module dependencies
 	$(GO) mod tidy
 
 clean: ## Remove build artefacts
-	rm -rf $(BINARY_DIR) coverage.out
+	rm -rf $(BINARY_DIR) $(RUN_DIR) coverage.out
 
 # ------------------------------------------------------------ deployment --
 

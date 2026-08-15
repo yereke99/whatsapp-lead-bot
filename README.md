@@ -103,10 +103,27 @@ cp .env.example .env      # set SESSION_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD
 make run
 ```
 
-`make run` starts the whole system: it applies migrations, creates the first
-admin account, and brings up the HTTP server, the scheduler workers and the
-webhook processor. The database file is created on first start at
-`DATABASE_PATH` (default `./data/whatsapp.db`).
+`make run` starts the whole system **in the background**: it applies
+migrations, creates the first admin account, and brings up the HTTP server, the
+scheduler workers and the webhook processor. The database file is created on
+first start at `DATABASE_PATH` (default `./data/whatsapp.db`).
+
+| Target | What it does |
+|---|---|
+| `make run` | Build, then start detached. Logs to `run/server.log`, pid in `run/server.pid`. Refuses to start twice. |
+| `make run-logs` | Follow those logs. |
+| `make run-status` | Report whether it is running, and its pid. |
+| `make run-stop` | Stop it: SIGINT, then SIGKILL after 10s if it has not exited. |
+| `make run-restart` | Stop and start. |
+| `make dev` | Run in the foreground instead, for development. Ctrl-C stops it. |
+
+`make run` compiles to `bin/server` and backgrounds that binary rather than
+backgrounding `go run`. `go run` stays alive as a parent wrapper around the
+process it compiled, so its pid is not the server's — stopping it can leave the
+server orphaned and still holding the port.
+
+This survives logging out, but it does not restart on crash and does not come
+back after a reboot. Use the systemd service below for anything long-lived.
 
 ### As a systemd service
 

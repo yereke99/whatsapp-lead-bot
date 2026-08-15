@@ -34,7 +34,7 @@ export async function renderTriggers(root, { navigate }) {
         api.triggerStats().catch(() => []),
       ]);
 
-      const counts = new Map(stats.map((s) => [s.keyword, s.count]));
+      const counts = new Map((stats || []).map((s) => [s.keyword, s.count]));
       clear(holder);
 
       if (!triggers || triggers.length === 0) {

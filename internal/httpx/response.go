@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -57,13 +58,42 @@ const (
 
 // JSON writes a success response.
 func JSON(w http.ResponseWriter, status int, data any) {
-	write(w, status, Envelope{Data: data})
+	write(w, status, Envelope{Data: emptyNotNull(data)})
+}
+
+// emptyNotNull turns a nil slice or map into an empty one.
+//
+// Go encodes a nil slice as JSON null, so an endpoint with nothing to return
+// answers "null" rather than "[]". That pushes a guard onto every consumer of
+// every list endpoint, and a single missing one is a page that breaks the
+// moment the table happens to be empty. Returning the empty collection makes
+// "no rows" the same shape as "some rows".
+//
+// Pointers are left alone: a nil pointer means absent, and null is the right
+// encoding for that.
+func emptyNotNull(data any) any {
+	if data == nil {
+		return nil
+	}
+
+	value := reflect.ValueOf(data)
+	switch value.Kind() {
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.MakeSlice(value.Type(), 0, 0).Interface()
+		}
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.MakeMap(value.Type()).Interface()
+		}
+	}
+	return data
 }
 
 // Paged writes a success response with pagination metadata.
 func Paged(w http.ResponseWriter, data any, total, limit, offset int) {
 	write(w, http.StatusOK, Envelope{
-		Data: data,
+		Data: emptyNotNull(data),
 		Meta: &Meta{
 			Total:   total,
 			Limit:   limit,

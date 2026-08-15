@@ -186,17 +186,46 @@ the edges. A server running on UTC and an operator in Almaty see the same
 1. Create an instance at [green-api.com](https://green-api.com) and scan the QR
    code with the WhatsApp account that will send the messages.
 2. Copy the instance id and API token into `GREEN_API_INSTANCE_ID` and
-   `GREEN_API_TOKEN`.
-3. Enable these notifications in the instance settings: incoming messages,
-   incoming file messages, outgoing message status, and outgoing API message.
+   `GREEN_API_TOKEN`, and set `GREEN_API_URL` to **your instance's host**. Green
+   API shards instances by the first four digits of the id, so `7105xxxxxx` is
+   served by `https://7105.api.greenapi.com`. The generic host does not reach a
+   sharded instance, and it fails silently: polls succeed and return an empty
+   queue, which is indistinguishable from nobody having messaged the bot.
+3. Turn the notification types on. **This is the step that is easy to miss** —
+   a new instance has them all off, and Green API only queues the types that
+   are enabled, so with them off the bot receives nothing and reports no error:
 
-**There is no webhook to configure.** Messages are pulled from Green API's
-notification queue with `receiveNotification`, so the server needs no public
-url, no TLS certificate and no inbound firewall rule. Leave the webhook url
-blank in the Green API console.
+   ```bash
+   set -a; . ./.env; set +a
+   curl -s -X POST "$GREEN_API_URL/waInstance$GREEN_API_INSTANCE_ID/setSettings/$GREEN_API_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"webhookUrl": "",
+          "incomingWebhook": "yes",
+          "outgoingMessageWebhook": "yes",
+          "outgoingAPIMessageWebhook": "yes",
+          "stateWebhook": "yes"}'
+   ```
 
-Check the connection under **Баптаулар → Жүйе**; it reports the live instance
-state.
+   Green API restarts the instance after this; give it a minute. `incomingWebhook`
+   is the one triggers depend on.
+
+**There is no webhook to configure.** Despite their names, those settings
+control whether a notification is *produced* at all, not where it is delivered.
+Messages are pulled from the queue with `receiveNotification`, so the server
+needs no public url, no TLS certificate and no inbound firewall rule — keep
+`webhookUrl` empty.
+
+Verify the instance is connected:
+
+```bash
+curl -s "$GREEN_API_URL/waInstance$GREEN_API_INSTANCE_ID/getStateInstance/$GREEN_API_TOKEN"
+# {"stateInstance":"authorized"}
+
+curl -s "$GREEN_API_URL/waInstance$GREEN_API_INSTANCE_ID/getSettings/$GREEN_API_TOKEN" \
+  | python3 -m json.tool | grep -iE "webhookUrl|incomingWebhook"
+```
+
+The panel reports the same state under **Баптаулар → Жүйе**.
 
 ---
 
@@ -430,6 +459,33 @@ actions and authentication events are all logged. Credentials never are.
 4. Open the contact and check whether they unsubscribed or were blocked.
 
 Failed jobs can be retried individually from the queue page.
+
+### The bot does not react to an inbound message
+
+Work down this list; each step distinguishes the next.
+
+```bash
+grep GREENAPI run/server.log | tail -20
+```
+
+| What the log shows | Meaning |
+|---|---|
+| no `polling started` line | The poller never ran. Credentials are missing, or the build predates polling. |
+| repeated `receive failed` | The provider is unreachable or the token is wrong. The error text says which. |
+| **only** `polling started`, nothing else | Polls succeed and the queue is always empty — the provider is not producing notifications. Continue below. |
+| `notification queued` but no `trigger handled` | The message arrived; the text did not match a trigger. |
+
+An always-empty queue is almost always one of two setup mistakes, both silent:
+
+- **Notification types are off.** A fresh instance has `incomingWebhook: "no"`,
+  and Green API only queues what is enabled. Check with `getSettings` and fix
+  with `setSettings` — see [Green API setup](#green-api-setup).
+- **Wrong host.** A sharded instance (`7105xxxxxx`) must be polled on
+  `7105.api.greenapi.com`. The generic host answers, but for a different shard.
+
+If notifications arrive but no trigger fires, compare the message against the
+configured keyword and match mode: `EXACT` requires the whole message to equal
+the keyword, so a long trigger phrase will not fire on a single word from it.
 
 ### Backups
 

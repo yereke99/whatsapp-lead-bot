@@ -129,7 +129,7 @@ func TestConcurrentTriggersEnrollOnce(t *testing.T) {
 	}
 
 	var enrollments int
-	if err := testDB.Pool.QueryRow(ctx,
+	if err := testDB.QueryRow(ctx,
 		`SELECT count(*) FROM campaign_contacts WHERE campaign_id = $1`, campaign.ID).Scan(&enrollments); err != nil {
 		t.Fatal(err)
 	}
@@ -228,9 +228,9 @@ func TestReleaseStaleRequeuesOrphanedJobs(t *testing.T) {
 	}
 
 	// Age the lock past the timeout, as the reaper would find it.
-	if _, err := testDB.Pool.Exec(ctx,
-		`UPDATE scheduled_messages SET locked_at = now() - interval '10 minutes' WHERE id = $1`,
-		claimed[0].ID); err != nil {
+	if _, err := testDB.Exec(ctx,
+		`UPDATE scheduled_messages SET locked_at = $2 WHERE id = $1`,
+		claimed[0].ID, time.Now().UTC().Add(-10*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -277,7 +277,7 @@ func TestRescheduleOnlyMovesPendingJobs(t *testing.T) {
 	sentAt := time.Now().UTC()
 	if err := f.jobRepo.MarkSent(ctx, nil, sentJob.ID, uuid.Nil, sentAt); err != nil {
 		// MarkSent needs a real message id; write the state directly instead.
-		if _, execErr := testDB.Pool.Exec(ctx,
+		if _, execErr := testDB.Exec(ctx,
 			`UPDATE scheduled_messages SET status = 'SENT', sent_at = now() WHERE id = $1`,
 			sentJob.ID); execErr != nil {
 			t.Fatal(execErr)
@@ -285,7 +285,7 @@ func TestRescheduleOnlyMovesPendingJobs(t *testing.T) {
 	}
 
 	var frozenAt time.Time
-	if err := testDB.Pool.QueryRow(ctx,
+	if err := testDB.QueryRow(ctx,
 		`SELECT scheduled_at FROM scheduled_messages WHERE id = $1`, sentJob.ID).Scan(&frozenAt); err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +300,7 @@ func TestRescheduleOnlyMovesPendingJobs(t *testing.T) {
 	}
 
 	var afterAt time.Time
-	if err := testDB.Pool.QueryRow(ctx,
+	if err := testDB.QueryRow(ctx,
 		`SELECT scheduled_at FROM scheduled_messages WHERE id = $1`, sentJob.ID).Scan(&afterAt); err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestRescheduleOnlyMovesPendingJobs(t *testing.T) {
 	}
 
 	// Every pending job should now sit exactly one hour earlier.
-	rows, err := testDB.Pool.Query(ctx, `
+	rows, err := testDB.Query(ctx, `
 		SELECT sm.scheduled_at, cs.offset_seconds
 		FROM scheduled_messages sm
 		JOIN campaign_steps cs ON cs.id = sm.campaign_step_id
@@ -363,7 +363,7 @@ func TestUnsubscribeCancelsPendingJobs(t *testing.T) {
 	}
 
 	var pending int
-	if err := testDB.Pool.QueryRow(ctx,
+	if err := testDB.QueryRow(ctx,
 		`SELECT count(*) FROM scheduled_messages WHERE contact_id = $1 AND status = 'PENDING'`,
 		contact.ID).Scan(&pending); err != nil {
 		t.Fatal(err)
@@ -401,7 +401,7 @@ func TestUniqueConstraintBlocksDuplicateStepDelivery(t *testing.T) {
 	}
 
 	var enrollmentID, stepID uuid.UUID
-	if err := testDB.Pool.QueryRow(ctx,
+	if err := testDB.QueryRow(ctx,
 		`SELECT enrollment_id, campaign_step_id FROM scheduled_messages LIMIT 1`).
 		Scan(&enrollmentID, &stepID); err != nil {
 		t.Fatal(err)

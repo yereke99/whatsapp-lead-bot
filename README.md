@@ -40,10 +40,10 @@ Green API webhook  ──▶  stored raw, deduplicated by event id
 Background worker: create contact ─▶ record consent ─▶ match trigger
         │
         ▼
-Enrol into campaign, write one job per step into PostgreSQL
+Enrol into campaign, write one job per step into SQLite
         │
         ▼
-Scheduler claims due jobs (FOR UPDATE SKIP LOCKED) ─▶ renders ─▶ sends
+Scheduler claims due jobs (one atomic UPDATE) ─▶ renders ─▶ sends
         │
         ▼
 Delivery webhooks update the message; the dashboard sees it over SSE
@@ -76,14 +76,14 @@ Offsets are stored in **seconds**, which is why the 7.5-minute step lands on
 cp .env.example .env
 
 # Fill in at minimum:
-#   POSTGRES_PASSWORD, SESSION_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD
+#   SESSION_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD
 # Generate a session secret with:
 openssl rand -base64 48
 
 docker compose up -d --build
 ```
 
-The panel is at <http://localhost:8080>. Migrations run automatically on start.
+The panel is at <http://localhost:8086>. Migrations run automatically on start.
 
 Load the example campaign:
 
@@ -93,16 +93,43 @@ docker compose exec app seed -date 2026-09-01 -time 21:00 -link "https://your-we
 
 ### Without Docker
 
-Requires Go 1.25+, PostgreSQL 14+, and ffmpeg (only for voice messages).
+Requires Go 1.25+ and ffmpeg (only for voice messages). There is no database
+server to install: the storage engine is SQLite, and the driver is pure Go, so
+nothing needs CGO or a system libsqlite3.
 
 ```bash
-createdb whatsapp_automation
-cp .env.example .env      # set DATABASE_URL, SESSION_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD
+cp .env.example .env      # set SESSION_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD
 
-make build
-make migrate
 make run
 ```
+
+`make run` starts the whole system: it applies migrations, creates the first
+admin account, and brings up the HTTP server, the scheduler workers and the
+webhook processor. The database file is created on first start at
+`DATABASE_PATH` (default `./data/whatsapp.db`).
+
+### As a systemd service
+
+```bash
+make start      # writes the unit if absent, then starts the service
+```
+
+`make start` runs `deploy/install-service.sh`, which writes
+`/etc/systemd/system/whatsapp.service` **only when that file does not already
+exist**. An existing unit is never modified, since it may carry hand-tuned
+limits or a different user; pass `--force` to replace it (the previous version
+is backed up alongside it first).
+
+Once installed, the service is managed the usual way:
+
+```bash
+sudo systemctl start whatsapp.service
+systemctl status whatsapp.service
+journalctl -u whatsapp.service -f
+```
+
+`make stop`, `make restart`, `make status` and `make logs` wrap the same
+commands.
 
 ---
 
@@ -113,7 +140,7 @@ variable. The settings that matter most:
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection string. Required. |
+| `DATABASE_PATH` | SQLite file holding all state. Default `./data/whatsapp.db`. |
 | `SESSION_SECRET` | ≥ 32 characters. Required. |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Creates the first owner account when none exists. |
 | `GREEN_API_INSTANCE_ID` / `GREEN_API_TOKEN` | Provider credentials. Without them the panel runs but nothing is sent or received. |
@@ -226,7 +253,7 @@ internal/
   exports/       CSV streaming
   audit/         administrative action log
   domain/        entity types shared across packages
-  storage/       PostgreSQL pool and migration runner
+  storage/       SQLite handle, query helpers and migration runner
 
 pkg/
   textnorm/      trigger normalization and matching
@@ -262,25 +289,29 @@ The alternative — snapshotting content into each job at enrollment — was
 rejected because it makes a correction impossible to apply to a queue that may
 already hold thousands of jobs.
 
-### The queue lives in PostgreSQL
+### The queue lives in SQLite
 
 Jobs are rows, not timers. A restart, crash or deploy loses nothing. Workers
 claim work with a single statement:
 
 ```sql
-UPDATE scheduled_messages SET status = 'PROCESSING', locked_by = $1, locked_at = $2
+UPDATE scheduled_messages AS sm
+SET status = 'PROCESSING', locked_by = $1, locked_at = $2
 FROM (SELECT id FROM scheduled_messages
       WHERE status = 'PENDING' AND scheduled_at <= $2
-      ORDER BY scheduled_at FOR UPDATE SKIP LOCKED LIMIT $3) due
+      ORDER BY scheduled_at LIMIT $3) due
 WHERE sm.id = due.id RETURNING ...
 ```
 
-`SKIP LOCKED` lets any number of replicas run concurrently without ever handing
-the same job to two of them, and the selection and state change are atomic, so
-a crash between "found" and "claimed" is impossible. A `PROCESSING` row whose
-lock has aged past `SCHEDULER_LOCK_TIMEOUT` is assumed orphaned and re-queued.
+Selection and state change happen in one statement, so a crash between "found"
+and "claimed" is impossible. SQLite admits one writer at a time, so a second
+worker polling at the same moment either waits for the write lock or sees the
+rows already in `PROCESSING` and takes the next batch — the same guarantee
+Postgres gets from `SKIP LOCKED`, arrived at by serialising rather than by
+skipping. A `PROCESSING` row whose lock has aged past
+`SCHEDULER_LOCK_TIMEOUT` is assumed orphaned and re-queued.
 
-**No Redis.** Postgres provides the locking, durability and ordering this queue
+**No Redis.** SQLite provides the locking, durability and ordering this queue
 needs; a second datastore would add an availability dependency and a
 consistency boundary for no benefit at this scale.
 
@@ -330,7 +361,7 @@ Bulk messaging is deliberately absent from the bulk actions menu.
 ```bash
 make test              # unit tests
 make test-race         # unit tests under the race detector
-make test-integration  # needs TEST_DATABASE_URL
+make test-integration  # no setup: uses a scratch SQLite file
 make test-all
 ```
 
@@ -339,7 +370,7 @@ case folding and word boundaries), schedule computation against the reference
 webinar, timezone conversion, template rendering, webhook parsing and dedupe
 keys, password hashing, and upload validation.
 
-Integration tests run against a real PostgreSQL instance and cover the
+Integration tests run against a real SQLite database and cover the
 guarantees that only show up under concurrency:
 
 - eight simultaneous triggers produce one enrollment
@@ -350,11 +381,13 @@ guarantees that only show up under concurrency:
 - the unique constraint rejects a duplicate step
 
 ```bash
-createdb whatsapp_test
-TEST_DATABASE_URL="postgres://localhost/whatsapp_test?sslmode=disable" make test-integration
+make test-integration
 ```
 
-The suite truncates every table, so point it at a throwaway database.
+Nothing needs provisioning: the suite creates a scratch database in a temp
+directory and clears every table between cases. Set `TEST_DATABASE_PATH` to run
+against a specific file instead — point it at a throwaway one, since the suite
+empties it.
 
 ---
 
@@ -382,15 +415,31 @@ Failed jobs can be retried individually from the queue page.
 
 ### Backups
 
-Two things hold state: the PostgreSQL database and the media directory
+Two things hold state: the SQLite database file and the media directory
 (`media_data` volume). Back up both; media files are referenced by path from
 the database.
 
+The database is written in WAL mode, so `DATABASE_PATH` is accompanied by
+`-wal` and `-shm` sidecar files. Copying the main file alone while the service
+runs can capture a torn state. Either stop the service first and copy all
+three, or take a consistent snapshot in place:
+
+```bash
+sqlite3 ./data/whatsapp.db ".backup '/backup/whatsapp-$(date +%F).db'"
+```
+
 ### Scaling
 
-The app is stateless apart from the media directory. Run several replicas
-behind a load balancer — `SKIP LOCKED` makes concurrent schedulers safe. If
-replicas do not share a filesystem, mount the media volume on all of them.
+The service runs as a single process against a local database file. Vertical
+headroom is large — SQLite handles this workload comfortably, and the send rate
+is capped by the provider's rate limit long before the database is the
+constraint — but **it does not scale horizontally**: a second replica would
+need the same file, and SQLite over a network filesystem is not safe.
+
+If you ever outgrow one machine, the replaceable piece is
+`internal/storage/sqlite`, which is the only package that knows what the
+database is. Everything above it talks to `Querier` and Postgres-style `$1`
+placeholders.
 
 ---
 

@@ -1,39 +1,21 @@
-services:
-  postgres:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-whatsapp}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-      POSTGRES_DB: ${POSTGRES_DB:-whatsapp_automation}
-      # C collation keeps index behaviour predictable across host locales.
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-whatsapp} -d ${POSTGRES_DB:-whatsapp_automation}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-    # Not published by default: only the application needs to reach the
-    # database. Uncomment for local inspection.
-    # ports:
-    #   - "127.0.0.1:5432:5432"
+# The platform is a single process over a single SQLite file, so the stack is
+# one service. The database and the uploaded media live on named volumes and
+# survive `docker compose down`.
 
+services:
   app:
     build:
       context: .
       args:
         VERSION: ${VERSION:-dev}
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-whatsapp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-whatsapp_automation}?sslmode=disable
+      DATABASE_PATH: /app/data/whatsapp.db
+      DATABASE_MAX_CONNS: ${DATABASE_MAX_CONNS:-8}
+      DATABASE_BUSY_TIMEOUT: ${DATABASE_BUSY_TIMEOUT:-10s}
+
       APP_ENV: ${APP_ENV:-production}
-      PORT: 8080
+      PORT: 8086
       TIMEZONE: ${TIMEZONE:-Asia/Almaty}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: ${LOG_FORMAT:-json}
@@ -61,16 +43,17 @@ services:
       SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-true}
       SCHEDULER_WORKERS: ${SCHEDULER_WORKERS:-4}
     volumes:
+      - sqlite_data:/app/data
       - media_data:/app/storage/media
     ports:
-      - "${APP_PORT:-8080}:8080"
+      - "${APP_PORT:-8086}:8086"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8086/api/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 20s
 
 volumes:
-  postgres_data:
+  sqlite_data:
   media_data:

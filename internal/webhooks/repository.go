@@ -12,14 +12,14 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ayran/whatsapp-automation/internal/domain"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 )
 
 type Repository struct {
-	db *postgres.DB
+	db *sqlite.DB
 }
 
-func NewRepository(db *postgres.DB) *Repository { return &Repository{db: db} }
+func NewRepository(db *sqlite.DB) *Repository { return &Repository{db: db} }
 
 // StoredEvent is a queued notification awaiting processing.
 type StoredEvent struct {
@@ -44,11 +44,11 @@ func (r *Repository) Insert(ctx context.Context, provider, eventType, dedupeKey,
 		RETURNING id`
 
 	var id uuid.UUID
-	err := r.db.Pool.QueryRow(ctx, query,
+	err := r.db.QueryRow(ctx, query,
 		provider, eventType, dedupeKey, externalID, payload, receivedAt).Scan(&id)
 
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return uuid.Nil, false, nil
 		}
 		return uuid.Nil, false, fmt.Errorf("store webhook event: %w", err)
@@ -62,20 +62,21 @@ func (r *Repository) Claim(ctx context.Context, limit int) ([]StoredEvent, error
 		limit = 25
 	}
 
+	// RETURNING names the updated table's own columns; SQLite rejects an alias
+	// prefix there even though the UPDATE itself is aliased.
 	const query = `
-		UPDATE webhook_events we
+		UPDATE webhook_events AS we
 		SET status = 'PROCESSING', attempts = we.attempts + 1, updated_at = now()
 		FROM (
 			SELECT id FROM webhook_events
 			WHERE status = 'RECEIVED'
 			ORDER BY received_at
-			FOR UPDATE SKIP LOCKED
 			LIMIT $1
 		) queued
 		WHERE we.id = queued.id
-		RETURNING we.id, we.provider, we.event_type, we.dedupe_key, we.payload, we.attempts`
+		RETURNING id, provider, event_type, dedupe_key, payload, attempts`
 
-	rows, err := r.db.Pool.Query(ctx, query, limit)
+	rows, err := r.db.Query(ctx, query, limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim webhook events: %w", err)
 	}
@@ -98,7 +99,7 @@ func (r *Repository) MarkProcessed(ctx context.Context, id uuid.UUID, status dom
 		SET status = $2, error = $3, processed_at = now(), updated_at = now()
 		WHERE id = $1`
 
-	_, err := r.db.Pool.Exec(ctx, query, id, status, truncate(errText, 2000))
+	_, err := r.db.Exec(ctx, query, id, status, truncate(errText, 2000))
 	return err
 }
 
@@ -109,7 +110,7 @@ func (r *Repository) Requeue(ctx context.Context, id uuid.UUID, errText string) 
 		SET status = 'RECEIVED', error = $2, updated_at = now()
 		WHERE id = $1`
 
-	_, err := r.db.Pool.Exec(ctx, query, id, truncate(errText, 2000))
+	_, err := r.db.Exec(ctx, query, id, truncate(errText, 2000))
 	return err
 }
 
@@ -120,7 +121,7 @@ func (r *Repository) ReleaseStale(ctx context.Context, olderThan time.Duration) 
 		SET status = 'RECEIVED', updated_at = now()
 		WHERE status = 'PROCESSING' AND updated_at < $1`
 
-	tag, err := r.db.Pool.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
+	tag, err := r.db.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
 	if err != nil {
 		return 0, err
 	}
@@ -134,7 +135,7 @@ func (r *Repository) List(ctx context.Context, status string, limit, offset int)
 	}
 
 	var total int
-	if err := r.db.Pool.QueryRow(ctx,
+	if err := r.db.QueryRow(ctx,
 		`SELECT count(*) FROM webhook_events WHERE ($1 = '' OR status = $1)`, status).Scan(&total); err != nil {
 		return nil, 0, err
 	}
@@ -147,7 +148,7 @@ func (r *Repository) List(ctx context.Context, status string, limit, offset int)
 		ORDER BY received_at DESC
 		LIMIT $2 OFFSET $3`
 
-	rows, err := r.db.Pool.Query(ctx, query, status, limit, offset)
+	rows, err := r.db.Query(ctx, query, status, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -172,7 +173,7 @@ func (r *Repository) Prune(ctx context.Context, olderThan time.Duration) (int64,
 		DELETE FROM webhook_events
 		WHERE status IN ('PROCESSED', 'IGNORED') AND received_at < $1`
 
-	tag, err := r.db.Pool.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
+	tag, err := r.db.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
 	if err != nil {
 		return 0, err
 	}

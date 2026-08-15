@@ -38,9 +38,12 @@ type HTTP struct {
 }
 
 type Database struct {
-	URL             string
+	// Path is the SQLite file. Everything the application stores lives in it,
+	// so backing the service up means copying this file (and its -wal
+	// sidecar) while the service is stopped.
+	Path            string
 	MaxConns        int32
-	MinConns        int32
+	BusyTimeout     time.Duration
 	MaxConnLifetime time.Duration
 	MaxConnIdleTime time.Duration
 	AutoMigrate     bool
@@ -105,7 +108,7 @@ func Load() (*Config, error) {
 			LogFormat:       envStr("LOG_FORMAT", "json"),
 		},
 		HTTP: HTTP{
-			Port:            envInt("PORT", 8080),
+			Port:            envInt("PORT", 8086),
 			ReadTimeout:     envDuration("HTTP_READ_TIMEOUT", 30*time.Second),
 			WriteTimeout:    envDuration("HTTP_WRITE_TIMEOUT", 60*time.Second),
 			IdleTimeout:     envDuration("HTTP_IDLE_TIMEOUT", 120*time.Second),
@@ -115,9 +118,12 @@ func Load() (*Config, error) {
 			WebDir:          envStr("WEB_DIR", "./web"),
 		},
 		Database: Database{
-			URL:             envStr("DATABASE_URL", ""),
-			MaxConns:        int32(envInt("DATABASE_MAX_CONNS", 20)),
-			MinConns:        int32(envInt("DATABASE_MIN_CONNS", 2)),
+			Path: envStr("DATABASE_PATH", "./data/whatsapp.db"),
+			// SQLite serialises writes regardless of pool size; a handful of
+			// connections is enough to keep readers moving without piling up
+			// on the write lock.
+			MaxConns:        int32(envInt("DATABASE_MAX_CONNS", 8)),
+			BusyTimeout:     envDuration("DATABASE_BUSY_TIMEOUT", 10*time.Second),
 			MaxConnLifetime: envDuration("DATABASE_CONN_LIFETIME", time.Hour),
 			MaxConnIdleTime: envDuration("DATABASE_CONN_IDLE", 30*time.Minute),
 			AutoMigrate:     envBool("DATABASE_AUTO_MIGRATE", true),
@@ -176,8 +182,8 @@ func Load() (*Config, error) {
 func (c *Config) validate() error {
 	var problems []string
 
-	if c.Database.URL == "" {
-		problems = append(problems, "DATABASE_URL is required")
+	if strings.TrimSpace(c.Database.Path) == "" {
+		problems = append(problems, "DATABASE_PATH is required")
 	}
 	if len(c.Auth.SessionSecret) < 32 {
 		problems = append(problems, "SESSION_SECRET is required and must be at least 32 characters")

@@ -17,10 +17,9 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/ayran/whatsapp-automation/internal/domain"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 )
 
 const templateColumns = `
@@ -34,16 +33,16 @@ var (
 )
 
 type Repository struct {
-	db *postgres.DB
+	db *sqlite.DB
 }
 
-func NewRepository(db *postgres.DB) *Repository { return &Repository{db: db} }
+func NewRepository(db *sqlite.DB) *Repository { return &Repository{db: db} }
 
-func (r *Repository) querier(q postgres.Querier) postgres.Querier {
+func (r *Repository) querier(q sqlite.Querier) sqlite.Querier {
 	if q != nil {
 		return q
 	}
-	return r.db.Pool
+	return r.db
 }
 
 func (r *Repository) List(ctx context.Context, search, typeFilter string, includeArchived bool) ([]domain.MessageTemplate, error) {
@@ -76,7 +75,7 @@ func (r *Repository) List(ctx context.Context, search, typeFilter string, includ
 		WHERE ` + where + `
 		ORDER BY t.updated_at DESC`
 
-	rows, err := r.db.Pool.Query(ctx, query, args...)
+	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list templates: %w", err)
 	}
@@ -93,7 +92,7 @@ func (r *Repository) List(ctx context.Context, search, typeFilter string, includ
 	return out, rows.Err()
 }
 
-func (r *Repository) GetByID(ctx context.Context, q postgres.Querier, id uuid.UUID) (*domain.MessageTemplate, error) {
+func (r *Repository) GetByID(ctx context.Context, q sqlite.Querier, id uuid.UUID) (*domain.MessageTemplate, error) {
 	query := `SELECT ` + templateColumns + `,
 			COALESCE((SELECT count(*) FROM campaign_steps cs WHERE cs.message_template_id = t.id), 0),
 			mf.id, mf.original_name, mf.mime_type, mf.size_bytes, mf.kind, mf.duration_ms
@@ -133,7 +132,7 @@ type SendSpec struct {
 	MediaName   string
 }
 
-func (r *Repository) ResolveForSend(ctx context.Context, q postgres.Querier, id uuid.UUID) (*SendSpec, error) {
+func (r *Repository) ResolveForSend(ctx context.Context, q sqlite.Querier, id uuid.UUID) (*SendSpec, error) {
 	const query = `
 		SELECT t.id, t.version, t.name, t.type, t.body, t.link_preview, t.file_name,
 		       t.media_file_id, COALESCE(mf.relative_path, ''), COALESCE(mf.mime_type, ''),
@@ -149,7 +148,7 @@ func (r *Repository) ResolveForSend(ctx context.Context, q postgres.Querier, id 
 		&spec.MediaMIME, &spec.MediaName,
 	)
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return nil, ErrNotFound
 		}
 		return nil, err
@@ -158,7 +157,7 @@ func (r *Repository) ResolveForSend(ctx context.Context, q postgres.Querier, id 
 }
 
 func (r *Repository) Create(ctx context.Context, t *domain.MessageTemplate) error {
-	return r.db.InTx(ctx, func(tx pgx.Tx) error {
+	return r.db.InTx(ctx, func(tx sqlite.Querier) error {
 		const query = `
 			INSERT INTO message_templates (name, description, type, body, media_file_id, file_name, link_preview, created_by)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
@@ -168,7 +167,7 @@ func (r *Repository) Create(ctx context.Context, t *domain.MessageTemplate) erro
 			t.Name, t.Description, t.Type, t.Body, t.MediaFileID, t.FileName, t.LinkPreview, t.CreatedBy,
 		).Scan(&t.ID, &t.Version, &t.CreatedAt, &t.UpdatedAt)
 		if err != nil {
-			if postgres.IsUniqueViolation(err, "message_templates_name_key") {
+			if sqlite.IsUniqueViolation(err, "message_templates_name_key") {
 				return ErrNameTaken
 			}
 			return fmt.Errorf("insert template: %w", err)
@@ -181,7 +180,7 @@ func (r *Repository) Create(ctx context.Context, t *domain.MessageTemplate) erro
 // Update writes a new revision. The version counter increments on every save
 // so a sent message can always be traced back to exact content.
 func (r *Repository) Update(ctx context.Context, t *domain.MessageTemplate) error {
-	return r.db.InTx(ctx, func(tx pgx.Tx) error {
+	return r.db.InTx(ctx, func(tx sqlite.Querier) error {
 		const query = `
 			UPDATE message_templates SET
 				name = $2, description = $3, type = $4, body = $5,
@@ -194,10 +193,10 @@ func (r *Repository) Update(ctx context.Context, t *domain.MessageTemplate) erro
 			t.ID, t.Name, t.Description, t.Type, t.Body, t.MediaFileID, t.FileName, t.LinkPreview,
 		).Scan(&t.Version, &t.CreatedAt, &t.UpdatedAt)
 		if err != nil {
-			if postgres.IsNoRows(err) {
+			if sqlite.IsNoRows(err) {
 				return ErrNotFound
 			}
-			if postgres.IsUniqueViolation(err, "message_templates_name_key") {
+			if sqlite.IsUniqueViolation(err, "message_templates_name_key") {
 				return ErrNameTaken
 			}
 			return fmt.Errorf("update template: %w", err)
@@ -207,7 +206,7 @@ func (r *Repository) Update(ctx context.Context, t *domain.MessageTemplate) erro
 	})
 }
 
-func insertVersion(ctx context.Context, tx pgx.Tx, t *domain.MessageTemplate) error {
+func insertVersion(ctx context.Context, tx sqlite.Querier, t *domain.MessageTemplate) error {
 	const query = `
 		INSERT INTO message_template_versions (template_id, version, name, type, body, media_file_id, file_name, created_by)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
@@ -225,13 +224,13 @@ func insertVersion(ctx context.Context, tx pgx.Tx, t *domain.MessageTemplate) er
 // it otherwise so historical steps and sent messages keep resolving.
 func (r *Repository) Delete(ctx context.Context, id uuid.UUID) (archived bool, err error) {
 	var uses int
-	if err := r.db.Pool.QueryRow(ctx,
+	if err := r.db.QueryRow(ctx,
 		`SELECT count(*) FROM campaign_steps WHERE message_template_id = $1`, id).Scan(&uses); err != nil {
 		return false, err
 	}
 
 	if uses > 0 {
-		tag, err := r.db.Pool.Exec(ctx,
+		tag, err := r.db.Exec(ctx,
 			`UPDATE message_templates SET archived_at = now() WHERE id = $1 AND archived_at IS NULL`, id)
 		if err != nil {
 			return false, err
@@ -242,9 +241,9 @@ func (r *Repository) Delete(ctx context.Context, id uuid.UUID) (archived bool, e
 		return true, nil
 	}
 
-	tag, err := r.db.Pool.Exec(ctx, `DELETE FROM message_templates WHERE id = $1`, id)
+	tag, err := r.db.Exec(ctx, `DELETE FROM message_templates WHERE id = $1`, id)
 	if err != nil {
-		if postgres.IsForeignKeyViolation(err) {
+		if sqlite.IsForeignKeyViolation(err) {
 			return false, ErrInUse
 		}
 		return false, err
@@ -266,7 +265,7 @@ func (r *Repository) Versions(ctx context.Context, templateID uuid.UUID, limit i
 		ORDER BY v.version DESC
 		LIMIT $2`
 
-	rows, err := r.db.Pool.Query(ctx, query, templateID, limit)
+	rows, err := r.db.Query(ctx, query, templateID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +285,7 @@ func (r *Repository) Versions(ctx context.Context, templateID uuid.UUID, limit i
 // UsageCount reports how many campaign steps reference the template.
 func (r *Repository) UsageCount(ctx context.Context, id uuid.UUID) (int, error) {
 	var n int
-	err := r.db.Pool.QueryRow(ctx,
+	err := r.db.QueryRow(ctx,
 		`SELECT count(*) FROM campaign_steps WHERE message_template_id = $1`, id).Scan(&n)
 	return n, err
 }

@@ -6,15 +6,15 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/pkg/timex"
 )
 
 type Service struct {
-	db *postgres.DB
+	db *sqlite.DB
 }
 
-func NewService(db *postgres.DB) *Service { return &Service{db: db} }
+func NewService(db *sqlite.DB) *Service { return &Service{db: db} }
 
 // Summary is the dashboard's headline block.
 type Summary struct {
@@ -57,7 +57,7 @@ func (s *Service) Summarize(ctx context.Context, tz string) (*Summary, error) {
 			(SELECT count(*) FROM messages WHERE direction = 'OUTGOING' AND read_at >= $1)`
 
 	var out Summary
-	err := s.db.Pool.QueryRow(ctx, query, dayStart).Scan(
+	err := s.db.QueryRow(ctx, query, dayStart).Scan(
 		&out.TotalContacts, &out.ActiveContacts, &out.NewContactsToday, &out.Unsubscribed,
 		&out.MessagesSentToday, &out.MessagesRecvToday, &out.ActiveCampaigns,
 		&out.PendingJobs, &out.FailedJobs, &out.CompletedRuns, &out.UnreadChats,
@@ -78,7 +78,7 @@ type SeriesPoint struct {
 // ContactsOverTime returns daily new-contact counts for the last n days.
 func (s *Service) ContactsOverTime(ctx context.Context, tz string, days int) ([]SeriesPoint, error) {
 	return s.dailySeries(ctx, tz, days, `
-		SELECT (c.created_at AT TIME ZONE $1)::date AS day, count(*)
+		SELECT to_local_date(c.created_at, $1) AS day, count(*)
 		FROM contacts c
 		WHERE c.created_at >= $2
 		GROUP BY day`)
@@ -92,7 +92,7 @@ type MessageSeries struct {
 
 func (s *Service) MessagesOverTime(ctx context.Context, tz string, days int) (*MessageSeries, error) {
 	incoming, err := s.dailySeries(ctx, tz, days, `
-		SELECT (m.created_at AT TIME ZONE $1)::date AS day, count(*)
+		SELECT to_local_date(m.created_at, $1) AS day, count(*)
 		FROM messages m
 		WHERE m.direction = 'INCOMING' AND m.created_at >= $2
 		GROUP BY day`)
@@ -101,7 +101,7 @@ func (s *Service) MessagesOverTime(ctx context.Context, tz string, days int) (*M
 	}
 
 	outgoing, err := s.dailySeries(ctx, tz, days, `
-		SELECT (m.created_at AT TIME ZONE $1)::date AS day, count(*)
+		SELECT to_local_date(m.created_at, $1) AS day, count(*)
 		FROM messages m
 		WHERE m.direction = 'OUTGOING' AND m.created_at >= $2
 		GROUP BY day`)
@@ -123,7 +123,7 @@ func (s *Service) dailySeries(ctx context.Context, tz string, days int, query st
 	now := time.Now().In(loc)
 	start := timex.StartOfDayIn(now.UTC(), tz).Add(-time.Duration(days-1) * 24 * time.Hour)
 
-	rows, err := s.db.Pool.Query(ctx, query, tz, start)
+	rows, err := s.db.Query(ctx, query, tz, start)
 	if err != nil {
 		return nil, fmt.Errorf("daily series: %w", err)
 	}
@@ -176,7 +176,7 @@ func (s *Service) Delivery(ctx context.Context, days int) (*DeliveryBreakdown, e
 		WHERE direction = 'OUTGOING' AND created_at >= $1`
 
 	var out DeliveryBreakdown
-	if err := s.db.Pool.QueryRow(ctx, query, since).Scan(
+	if err := s.db.QueryRow(ctx, query, since).Scan(
 		&out.Sent, &out.Delivered, &out.Read, &out.Failed, &out.Pending); err != nil {
 		return nil, fmt.Errorf("delivery breakdown: %w", err)
 	}
@@ -220,7 +220,7 @@ func (s *Service) CampaignStats(ctx context.Context) ([]CampaignStat, error) {
 		WHERE c.archived_at IS NULL
 		ORDER BY COALESCE(cc.total, 0) DESC, c.created_at DESC`
 
-	rows, err := s.db.Pool.Query(ctx, query)
+	rows, err := s.db.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("campaign stats: %w", err)
 	}
@@ -262,7 +262,7 @@ func (s *Service) TriggerStats(ctx context.Context, limit int) ([]TriggerStat, e
 		ORDER BY count(*) DESC
 		LIMIT $1`
 
-	rows, err := s.db.Pool.Query(ctx, query, limit)
+	rows, err := s.db.Query(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}

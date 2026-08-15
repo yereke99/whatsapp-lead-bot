@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ayran/whatsapp-automation/internal/domain"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 )
 
 // Action names are stable identifiers; the UI maps them to Kazakh labels.
@@ -83,11 +83,11 @@ type Entry struct {
 }
 
 type Logger struct {
-	db  *postgres.DB
+	db  *sqlite.DB
 	log *slog.Logger
 }
 
-func NewLogger(db *postgres.DB, log *slog.Logger) *Logger {
+func NewLogger(db *sqlite.DB, log *slog.Logger) *Logger {
 	return &Logger{db: db, log: log.With(slog.String("component", "audit"))}
 }
 
@@ -106,7 +106,7 @@ func (l *Logger) Record(ctx context.Context, actor Actor, entry Entry) {
 			summary, old_values, new_values, ip_address, user_agent
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`
 
-	_, err := l.db.Pool.Exec(ctx, query,
+	_, err := l.db.Exec(ctx, query,
 		actor.ID, actor.Email, entry.Action, entry.EntityType, entry.EntityID,
 		truncate(entry.Summary, 1000), oldJSON, newJSON,
 		actor.IPAddress, truncate(actor.UserAgent, 500))
@@ -174,7 +174,7 @@ func (l *Logger) List(ctx context.Context, f ListFilter) ([]domain.AuditLog, int
 	}
 
 	var total int
-	if err := l.db.Pool.QueryRow(ctx,
+	if err := l.db.QueryRow(ctx,
 		`SELECT count(*) FROM audit_logs WHERE `+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
@@ -188,7 +188,7 @@ func (l *Logger) List(ctx context.Context, f ListFilter) ([]domain.AuditLog, int
 		ORDER BY created_at DESC
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
 
-	rows, err := l.db.Pool.Query(ctx, query, args...)
+	rows, err := l.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, 0, err
 	}

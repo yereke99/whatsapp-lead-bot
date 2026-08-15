@@ -1,4 +1,4 @@
-package postgres
+package sqlite
 
 import (
 	"context"
@@ -22,8 +22,12 @@ type migration struct {
 	checksum string
 }
 
-// Migrate applies every pending migration found in fsys inside a single
-// advisory lock so concurrent replicas cannot race each other on boot.
+// Migrate applies every pending migration found in fsys.
+//
+// Each migration runs in its own transaction together with the row that
+// records it, so a failure leaves the schema exactly where it was. SQLite
+// permits one writer at a time, and every transaction here takes the write
+// lock on BEGIN, so two processes starting at once serialise rather than race.
 func (db *DB) Migrate(ctx context.Context, fsys fs.FS, log *slog.Logger) error {
 	migrationsList, err := loadMigrations(fsys)
 	if err != nil {
@@ -33,47 +37,30 @@ func (db *DB) Migrate(ctx context.Context, fsys fs.FS, log *slog.Logger) error {
 		return fmt.Errorf("no migrations found")
 	}
 
-	conn, err := db.Pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire migration connection: %w", err)
-	}
-	defer conn.Release()
-
-	// Arbitrary but stable key; every replica of this service uses the same one.
-	const lockKey int64 = 8123401928374651
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", lockKey); err != nil {
-		return fmt.Errorf("acquire advisory lock: %w", err)
-	}
-	defer func() {
-		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_, _ = conn.Exec(unlockCtx, "SELECT pg_advisory_unlock($1)", lockKey)
-	}()
-
-	_, err = conn.Exec(ctx, `
+	_, err = db.sql.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version     integer PRIMARY KEY,
-			name        text        NOT NULL,
-			checksum    text        NOT NULL,
-			applied_at  timestamptz NOT NULL DEFAULT now()
+			version    INTEGER PRIMARY KEY,
+			name       TEXT NOT NULL,
+			checksum   TEXT NOT NULL,
+			applied_at TEXT NOT NULL DEFAULT (now())
 		)`)
 	if err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
 
 	applied := map[int]string{}
-	rows, err := conn.Query(ctx, "SELECT version, checksum FROM schema_migrations")
+	rows, err := db.sql.QueryContext(ctx, "SELECT version, checksum FROM schema_migrations")
 	if err != nil {
 		return fmt.Errorf("read applied migrations: %w", err)
 	}
 	for rows.Next() {
-		var v int
-		var sum string
-		if err := rows.Scan(&v, &sum); err != nil {
+		var version int
+		var checksum string
+		if err := rows.Scan(&version, &checksum); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan applied migration: %w", err)
 		}
-		applied[v] = sum
+		applied[version] = checksum
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -81,31 +68,16 @@ func (db *DB) Migrate(ctx context.Context, fsys fs.FS, log *slog.Logger) error {
 	}
 
 	for _, m := range migrationsList {
-		if sum, ok := applied[m.version]; ok {
-			if sum != m.checksum {
+		if checksum, ok := applied[m.version]; ok {
+			if checksum != m.checksum {
 				return fmt.Errorf("migration %d (%s) was modified after being applied; create a new migration instead", m.version, m.name)
 			}
 			continue
 		}
 
 		start := time.Now()
-		tx, err := conn.Begin(ctx)
-		if err != nil {
-			return fmt.Errorf("begin migration %d: %w", m.version, err)
-		}
-		if _, err := tx.Exec(ctx, m.body); err != nil {
-			_ = tx.Rollback(context.WithoutCancel(ctx))
-			return fmt.Errorf("apply migration %d (%s): %w", m.version, m.name, err)
-		}
-		if _, err := tx.Exec(ctx,
-			"INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)",
-			m.version, m.name, m.checksum,
-		); err != nil {
-			_ = tx.Rollback(context.WithoutCancel(ctx))
-			return fmt.Errorf("record migration %d: %w", m.version, err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit migration %d: %w", m.version, err)
+		if err := db.applyMigration(ctx, m); err != nil {
+			return err
 		}
 
 		if log != nil {
@@ -116,6 +88,28 @@ func (db *DB) Migrate(ctx context.Context, fsys fs.FS, log *slog.Logger) error {
 		}
 	}
 
+	return nil
+}
+
+func (db *DB) applyMigration(ctx context.Context, m migration) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration %d: %w", m.version, err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, m.body); err != nil {
+		return fmt.Errorf("apply migration %d (%s): %w", m.version, m.name, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO schema_migrations (version, name, checksum) VALUES (?1, ?2, ?3)",
+		m.version, m.name, m.checksum,
+	); err != nil {
+		return fmt.Errorf("record migration %d: %w", m.version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration %d: %w", m.version, err)
+	}
 	return nil
 }
 

@@ -302,7 +302,7 @@ func (s *Server) requireOwner(w http.ResponseWriter, r *http.Request) bool {
 // ------------------------------------------------------- login throttling --
 
 // loginLimiter is an in-process burst limiter in front of the database-backed
-// lockout. It absorbs a flood cheaply; the durable counters in Postgres are
+// lockout. It absorbs a flood cheaply; the durable counters in SQLite are
 // what actually lock an account out.
 type loginLimiter struct {
 	mu      sync.Mutex

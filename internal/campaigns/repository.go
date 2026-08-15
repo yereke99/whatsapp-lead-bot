@@ -9,10 +9,9 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/ayran/whatsapp-automation/internal/domain"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 )
 
 var (
@@ -35,20 +34,20 @@ const stepColumns = `
 	s.enabled, s.order_index, s.schedule_kind, s.created_at, s.updated_at`
 
 type Repository struct {
-	db *postgres.DB
+	db *sqlite.DB
 }
 
-func NewRepository(db *postgres.DB) *Repository { return &Repository{db: db} }
+func NewRepository(db *sqlite.DB) *Repository { return &Repository{db: db} }
 
-func (r *Repository) querier(q postgres.Querier) postgres.Querier {
+func (r *Repository) querier(q sqlite.Querier) sqlite.Querier {
 	if q != nil {
 		return q
 	}
-	return r.db.Pool
+	return r.db
 }
 
 // DB exposes the pool for service-level transactions that span repositories.
-func (r *Repository) DB() *postgres.DB { return r.db }
+func (r *Repository) DB() *sqlite.DB { return r.db }
 
 // ------------------------------------------------------------- campaigns --
 
@@ -90,7 +89,7 @@ func (r *Repository) List(ctx context.Context, f ListFilter) ([]domain.Campaign,
 			c.event_start_at DESC NULLS LAST,
 			c.created_at DESC`
 
-	rows, err := r.db.Pool.Query(ctx, query, args...)
+	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list campaigns: %w", err)
 	}
@@ -133,10 +132,10 @@ func (r *Repository) attachTriggers(ctx context.Context, list []domain.Campaign)
 	const query = `
 		SELECT id, campaign_id, keyword, normalized_keyword, match_mode, is_active, created_at, updated_at
 		FROM campaign_triggers
-		WHERE campaign_id = ANY($1)
+		WHERE campaign_id IN (SELECT value FROM json_each($1))
 		ORDER BY created_at`
 
-	rows, err := r.db.Pool.Query(ctx, query, ids)
+	rows, err := r.db.Query(ctx, query, ids)
 	if err != nil {
 		return fmt.Errorf("load triggers: %w", err)
 	}
@@ -155,7 +154,7 @@ func (r *Repository) attachTriggers(ctx context.Context, list []domain.Campaign)
 	return rows.Err()
 }
 
-func (r *Repository) GetByID(ctx context.Context, q postgres.Querier, id uuid.UUID) (*domain.Campaign, error) {
+func (r *Repository) GetByID(ctx context.Context, q sqlite.Querier, id uuid.UUID) (*domain.Campaign, error) {
 	query := `SELECT ` + campaignColumns + `,
 			COALESCE((SELECT count(*) FROM campaign_contacts cc WHERE cc.campaign_id = c.id), 0),
 			COALESCE((SELECT count(*) FROM scheduled_messages sm WHERE sm.campaign_id = c.id AND sm.status = 'PENDING'), 0),
@@ -167,7 +166,7 @@ func (r *Repository) GetByID(ctx context.Context, q postgres.Querier, id uuid.UU
 	dest = append(dest, &c.ContactCount, &c.PendingJobs, &c.SentCount)
 
 	if err := r.querier(q).QueryRow(ctx, query, id).Scan(dest...); err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get campaign: %w", err)
@@ -196,7 +195,7 @@ func (r *Repository) GetFull(ctx context.Context, id uuid.UUID) (*domain.Campaig
 	return campaign, nil
 }
 
-func (r *Repository) Create(ctx context.Context, q postgres.Querier, c *domain.Campaign) error {
+func (r *Repository) Create(ctx context.Context, q sqlite.Querier, c *domain.Campaign) error {
 	const query = `
 		INSERT INTO campaigns (
 			name, description, event_type, event_start_at, timezone, webinar_link,
@@ -212,7 +211,7 @@ func (r *Repository) Create(ctx context.Context, q postgres.Querier, c *domain.C
 	).Scan(&c.ID, &c.CreatedAt, &c.UpdatedAt)
 
 	if err != nil {
-		if postgres.IsUniqueViolation(err, "campaigns_name_key") {
+		if sqlite.IsUniqueViolation(err, "campaigns_name_key") {
 			return ErrNameTaken
 		}
 		return fmt.Errorf("insert campaign: %w", err)
@@ -220,7 +219,7 @@ func (r *Repository) Create(ctx context.Context, q postgres.Querier, c *domain.C
 	return nil
 }
 
-func (r *Repository) Update(ctx context.Context, q postgres.Querier, c *domain.Campaign) error {
+func (r *Repository) Update(ctx context.Context, q sqlite.Querier, c *domain.Campaign) error {
 	const query = `
 		UPDATE campaigns SET
 			name = $2, description = $3, event_type = $4, event_start_at = $5,
@@ -237,10 +236,10 @@ func (r *Repository) Update(ctx context.Context, q postgres.Querier, c *domain.C
 	).Scan(&c.UpdatedAt)
 
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return ErrNotFound
 		}
-		if postgres.IsUniqueViolation(err, "campaigns_name_key") {
+		if sqlite.IsUniqueViolation(err, "campaigns_name_key") {
 			return ErrNameTaken
 		}
 		return fmt.Errorf("update campaign: %w", err)
@@ -248,7 +247,7 @@ func (r *Repository) Update(ctx context.Context, q postgres.Querier, c *domain.C
 	return nil
 }
 
-func (r *Repository) SetStatus(ctx context.Context, q postgres.Querier, id uuid.UUID, status domain.CampaignStatus) error {
+func (r *Repository) SetStatus(ctx context.Context, q sqlite.Querier, id uuid.UUID, status domain.CampaignStatus) error {
 	tag, err := r.querier(q).Exec(ctx,
 		`UPDATE campaigns SET status = $2 WHERE id = $1`, id, status)
 	if err != nil {
@@ -263,7 +262,7 @@ func (r *Repository) SetStatus(ctx context.Context, q postgres.Querier, id uuid.
 // Archive hides a campaign and deactivates its triggers so the keyword becomes
 // available to another campaign.
 func (r *Repository) Archive(ctx context.Context, id uuid.UUID) error {
-	return r.db.InTx(ctx, func(tx pgx.Tx) error {
+	return r.db.InTx(ctx, func(tx sqlite.Querier) error {
 		if _, err := tx.Exec(ctx,
 			`UPDATE campaigns SET status = 'ARCHIVED', archived_at = now() WHERE id = $1`, id); err != nil {
 			return err
@@ -281,7 +280,7 @@ func (r *Repository) Archive(ctx context.Context, id uuid.UUID) error {
 }
 
 func (r *Repository) Delete(ctx context.Context, id uuid.UUID) error {
-	tag, err := r.db.Pool.Exec(ctx, `DELETE FROM campaigns WHERE id = $1`, id)
+	tag, err := r.db.Exec(ctx, `DELETE FROM campaigns WHERE id = $1`, id)
 	if err != nil {
 		return err
 	}
@@ -308,7 +307,7 @@ type TriggerMatch struct {
 //
 // Ordering is deterministic: exact matches first, then longer keywords before
 // shorter ones, so an ambiguous message always resolves the same way.
-func (r *Repository) ActiveTriggers(ctx context.Context, q postgres.Querier) ([]TriggerMatch, error) {
+func (r *Repository) ActiveTriggers(ctx context.Context, q sqlite.Querier) ([]TriggerMatch, error) {
 	const query = `
 		SELECT t.id, t.campaign_id, c.name, t.keyword, t.normalized_keyword, t.match_mode
 		FROM campaign_triggers t
@@ -344,7 +343,7 @@ func (r *Repository) ListTriggers(ctx context.Context, campaignID uuid.UUID) ([]
 		SELECT id, campaign_id, keyword, normalized_keyword, match_mode, is_active, created_at, updated_at
 		FROM campaign_triggers WHERE campaign_id = $1 ORDER BY created_at`
 
-	rows, err := r.db.Pool.Query(ctx, query, campaignID)
+	rows, err := r.db.Query(ctx, query, campaignID)
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +371,7 @@ func (r *Repository) AllTriggers(ctx context.Context) ([]domain.CampaignTrigger,
 		WHERE c.archived_at IS NULL
 		ORDER BY c.name, t.created_at`
 
-	rows, err := r.db.Pool.Query(ctx, query)
+	rows, err := r.db.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -390,7 +389,7 @@ func (r *Repository) AllTriggers(ctx context.Context) ([]domain.CampaignTrigger,
 	return out, rows.Err()
 }
 
-func (r *Repository) CreateTrigger(ctx context.Context, q postgres.Querier, t *domain.CampaignTrigger) error {
+func (r *Repository) CreateTrigger(ctx context.Context, q sqlite.Querier, t *domain.CampaignTrigger) error {
 	const query = `
 		INSERT INTO campaign_triggers (campaign_id, keyword, normalized_keyword, match_mode, is_active)
 		VALUES ($1,$2,$3,$4,$5)
@@ -401,7 +400,7 @@ func (r *Repository) CreateTrigger(ctx context.Context, q postgres.Querier, t *d
 	).Scan(&t.ID, &t.CreatedAt, &t.UpdatedAt)
 
 	if err != nil {
-		if postgres.IsUniqueViolation(err, "campaign_triggers_unique_active") {
+		if sqlite.IsUniqueViolation(err, "campaign_triggers_unique_active") {
 			return ErrTriggerTaken
 		}
 		return fmt.Errorf("insert trigger: %w", err)
@@ -416,15 +415,15 @@ func (r *Repository) UpdateTrigger(ctx context.Context, t *domain.CampaignTrigge
 		WHERE id = $1
 		RETURNING campaign_id, created_at, updated_at`
 
-	err := r.db.Pool.QueryRow(ctx, query,
+	err := r.db.QueryRow(ctx, query,
 		t.ID, t.Keyword, t.Normalized, t.MatchMode, t.IsActive,
 	).Scan(&t.CampaignID, &t.CreatedAt, &t.UpdatedAt)
 
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return ErrNotFound
 		}
-		if postgres.IsUniqueViolation(err, "campaign_triggers_unique_active") {
+		if sqlite.IsUniqueViolation(err, "campaign_triggers_unique_active") {
 			return ErrTriggerTaken
 		}
 		return fmt.Errorf("update trigger: %w", err)
@@ -433,7 +432,7 @@ func (r *Repository) UpdateTrigger(ctx context.Context, t *domain.CampaignTrigge
 }
 
 func (r *Repository) DeleteTrigger(ctx context.Context, id uuid.UUID) error {
-	tag, err := r.db.Pool.Exec(ctx, `DELETE FROM campaign_triggers WHERE id = $1`, id)
+	tag, err := r.db.Exec(ctx, `DELETE FROM campaign_triggers WHERE id = $1`, id)
 	if err != nil {
 		return err
 	}
@@ -445,9 +444,9 @@ func (r *Repository) DeleteTrigger(ctx context.Context, id uuid.UUID) error {
 
 // ----------------------------------------------------------------- steps --
 
-func (r *Repository) ListSteps(ctx context.Context, q postgres.Querier, campaignID uuid.UUID) ([]domain.CampaignStep, error) {
+func (r *Repository) ListSteps(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID) ([]domain.CampaignStep, error) {
 	query := `SELECT ` + stepColumns + `, t.name, t.type,
-			CASE WHEN length(t.body) > 120 THEN left(t.body, 120) || '…' ELSE t.body END
+			CASE WHEN length(t.body) > 120 THEN substr(t.body, 1, 120) || '…' ELSE t.body END
 		FROM campaign_steps s
 		JOIN message_templates t ON t.id = s.message_template_id
 		WHERE s.campaign_id = $1
@@ -477,11 +476,11 @@ func (r *Repository) GetStep(ctx context.Context, id uuid.UUID) (*domain.Campaig
 	query := `SELECT ` + stepColumns + ` FROM campaign_steps s WHERE s.id = $1`
 
 	var s domain.CampaignStep
-	err := r.db.Pool.QueryRow(ctx, query, id).Scan(
+	err := r.db.QueryRow(ctx, query, id).Scan(
 		&s.ID, &s.CampaignID, &s.Name, &s.OffsetSeconds, &s.TemplateID,
 		&s.Enabled, &s.OrderIndex, &s.ScheduleKind, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -489,7 +488,7 @@ func (r *Repository) GetStep(ctx context.Context, id uuid.UUID) (*domain.Campaig
 	return &s, nil
 }
 
-func (r *Repository) CreateStep(ctx context.Context, q postgres.Querier, s *domain.CampaignStep) error {
+func (r *Repository) CreateStep(ctx context.Context, q sqlite.Querier, s *domain.CampaignStep) error {
 	querier := r.querier(q)
 
 	if s.OrderIndex <= 0 {
@@ -514,7 +513,7 @@ func (r *Repository) CreateStep(ctx context.Context, q postgres.Querier, s *doma
 	return nil
 }
 
-func (r *Repository) UpdateStep(ctx context.Context, q postgres.Querier, s *domain.CampaignStep) error {
+func (r *Repository) UpdateStep(ctx context.Context, q sqlite.Querier, s *domain.CampaignStep) error {
 	const query = `
 		UPDATE campaign_steps SET
 			name = $2, offset_seconds = $3, message_template_id = $4,
@@ -527,7 +526,7 @@ func (r *Repository) UpdateStep(ctx context.Context, q postgres.Querier, s *doma
 	).Scan(&s.CampaignID, &s.OrderIndex, &s.CreatedAt, &s.UpdatedAt)
 
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return ErrStepNotFound
 		}
 		return fmt.Errorf("update step: %w", err)
@@ -536,7 +535,7 @@ func (r *Repository) UpdateStep(ctx context.Context, q postgres.Querier, s *doma
 }
 
 func (r *Repository) DeleteStep(ctx context.Context, id uuid.UUID) error {
-	tag, err := r.db.Pool.Exec(ctx, `DELETE FROM campaign_steps WHERE id = $1`, id)
+	tag, err := r.db.Exec(ctx, `DELETE FROM campaign_steps WHERE id = $1`, id)
 	if err != nil {
 		return err
 	}
@@ -546,11 +545,22 @@ func (r *Repository) DeleteStep(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-// ReorderSteps rewrites order_index for a campaign in one transaction. The
-// unique constraint is deferred, so intermediate collisions during the shuffle
-// are allowed and only the final arrangement is checked.
+// ReorderSteps rewrites order_index for a campaign in one transaction.
+//
+// SQLite cannot defer a unique constraint to commit time, so the shuffle may
+// never pass through a state where two steps share an index. Renumbering
+// happens in two phases instead: every step is first parked in the negative
+// range, which no valid arrangement uses, and then given its final position.
+// Any step left negative at the end was missing from orderedIDs, which would
+// otherwise leave the campaign with a hole in its ordering.
 func (r *Repository) ReorderSteps(ctx context.Context, campaignID uuid.UUID, orderedIDs []uuid.UUID) error {
-	return r.db.InTx(ctx, func(tx pgx.Tx) error {
+	return r.db.InTx(ctx, func(tx sqlite.Querier) error {
+		if _, err := tx.Exec(ctx,
+			`UPDATE campaign_steps SET order_index = -order_index
+			 WHERE campaign_id = $1 AND order_index > 0`, campaignID); err != nil {
+			return fmt.Errorf("stage step reorder: %w", err)
+		}
+
 		for i, id := range orderedIDs {
 			tag, err := tx.Exec(ctx,
 				`UPDATE campaign_steps SET order_index = $3 WHERE id = $1 AND campaign_id = $2`,
@@ -562,13 +572,23 @@ func (r *Repository) ReorderSteps(ctx context.Context, campaignID uuid.UUID, ord
 				return fmt.Errorf("%w: %s", ErrStepNotFound, id)
 			}
 		}
+
+		var unplaced int
+		if err := tx.QueryRow(ctx,
+			`SELECT count(*) FROM campaign_steps WHERE campaign_id = $1 AND order_index < 0`,
+			campaignID).Scan(&unplaced); err != nil {
+			return fmt.Errorf("verify step reorder: %w", err)
+		}
+		if unplaced > 0 {
+			return fmt.Errorf("reorder must list every step: %d missing", unplaced)
+		}
 		return nil
 	})
 }
 
 // ----------------------------------------------------------- enrollments --
 
-func (r *Repository) FindEnrollment(ctx context.Context, q postgres.Querier, campaignID, contactID uuid.UUID) (*domain.Enrollment, error) {
+func (r *Repository) FindEnrollment(ctx context.Context, q sqlite.Querier, campaignID, contactID uuid.UUID) (*domain.Enrollment, error) {
 	const query = `
 		SELECT id, campaign_id, contact_id, trigger_id, trigger_keyword, status,
 		       run_number, restart_count, enrolled_at, completed_at, cancelled_at,
@@ -582,7 +602,7 @@ func (r *Repository) FindEnrollment(ctx context.Context, q postgres.Querier, cam
 		&e.RunNumber, &e.RestartCount, &e.EnrolledAt, &e.CompletedAt, &e.CancelledAt,
 		&e.CancelReason, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("find enrollment: %w", err)
@@ -590,7 +610,7 @@ func (r *Repository) FindEnrollment(ctx context.Context, q postgres.Querier, cam
 	return &e, nil
 }
 
-func (r *Repository) CreateEnrollment(ctx context.Context, q postgres.Querier, e *domain.Enrollment) error {
+func (r *Repository) CreateEnrollment(ctx context.Context, q sqlite.Querier, e *domain.Enrollment) error {
 	const query = `
 		INSERT INTO campaign_contacts (campaign_id, contact_id, trigger_id, trigger_keyword, status, run_number)
 		VALUES ($1,$2,$3,$4,'ACTIVE',1)
@@ -602,7 +622,7 @@ func (r *Repository) CreateEnrollment(ctx context.Context, q postgres.Querier, e
 	).Scan(&e.ID, &e.Status, &e.RunNumber, &e.RestartCount, &e.EnrolledAt, &e.CreatedAt, &e.UpdatedAt)
 
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			// Another delivery of the same trigger won the race; the caller
 			// re-reads the existing row.
 			return ErrAlreadyEnrolled
@@ -617,7 +637,7 @@ var ErrAlreadyEnrolled = errors.New("contact is already enrolled in this campaig
 
 // RestartEnrollment bumps the run counter so a fresh set of jobs can be
 // created without colliding with the previous run's unique keys.
-func (r *Repository) RestartEnrollment(ctx context.Context, q postgres.Querier, enrollmentID uuid.UUID, keyword string) (*domain.Enrollment, error) {
+func (r *Repository) RestartEnrollment(ctx context.Context, q sqlite.Querier, enrollmentID uuid.UUID, keyword string) (*domain.Enrollment, error) {
 	const query = `
 		UPDATE campaign_contacts SET
 			run_number    = run_number + 1,
@@ -644,7 +664,7 @@ func (r *Repository) RestartEnrollment(ctx context.Context, q postgres.Querier, 
 	return &e, nil
 }
 
-func (r *Repository) SetEnrollmentStatus(ctx context.Context, q postgres.Querier, id uuid.UUID, status domain.EnrollmentStatus, reason string) error {
+func (r *Repository) SetEnrollmentStatus(ctx context.Context, q sqlite.Querier, id uuid.UUID, status domain.EnrollmentStatus, reason string) error {
 	const query = `
 		UPDATE campaign_contacts SET
 			status       = $2,
@@ -659,7 +679,7 @@ func (r *Repository) SetEnrollmentStatus(ctx context.Context, q postgres.Querier
 
 // StopAllForContact ends every active enrollment, used when a contact
 // unsubscribes or is blocked.
-func (r *Repository) StopAllForContact(ctx context.Context, q postgres.Querier, contactID uuid.UUID, status domain.EnrollmentStatus, reason string) error {
+func (r *Repository) StopAllForContact(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, status domain.EnrollmentStatus, reason string) error {
 	const query = `
 		UPDATE campaign_contacts SET
 			status = $2, cancelled_at = COALESCE(cancelled_at, now()), cancel_reason = $3
@@ -683,7 +703,7 @@ func (r *Repository) ListEnrollmentsForContact(ctx context.Context, contactID uu
 		WHERE cc.contact_id = $1
 		ORDER BY cc.enrolled_at DESC`
 
-	rows, err := r.db.Pool.Query(ctx, query, contactID)
+	rows, err := r.db.Query(ctx, query, contactID)
 	if err != nil {
 		return nil, err
 	}
@@ -705,7 +725,7 @@ func (r *Repository) ListEnrollmentsForContact(ctx context.Context, contactID uu
 
 // ActiveEnrollmentIDs lists enrollments still running in a campaign, used when
 // a newly enabled step must be back-filled.
-func (r *Repository) ActiveEnrollmentIDs(ctx context.Context, q postgres.Querier, campaignID uuid.UUID) ([]domain.Enrollment, error) {
+func (r *Repository) ActiveEnrollmentIDs(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID) ([]domain.Enrollment, error) {
 	const query = `
 		SELECT cc.id, cc.contact_id, cc.run_number, cc.enrolled_at
 		FROM campaign_contacts cc
@@ -744,10 +764,12 @@ func campaignScanDest(c *domain.Campaign) []any {
 
 // UnsubscribeKeywordsFor returns every configured stop word, normalized by the
 // caller, across the campaigns a contact belongs to plus the global defaults.
-func (r *Repository) UnsubscribeKeywordsFor(ctx context.Context, q postgres.Querier, contactID uuid.UUID) ([]string, error) {
+func (r *Repository) UnsubscribeKeywordsFor(ctx context.Context, q sqlite.Querier, contactID uuid.UUID) ([]string, error) {
+	// unsubscribe_keywords is a JSON array; json_each expands it into rows the
+	// same way unnest did.
 	const query = `
-		SELECT DISTINCT unnest(c.unsubscribe_keywords)
-		FROM campaigns c
+		SELECT DISTINCT keyword.value
+		FROM campaigns c, json_each(c.unsubscribe_keywords) AS keyword
 		WHERE c.archived_at IS NULL
 		  AND (
 			c.status = 'ACTIVE'
@@ -775,6 +797,6 @@ func (r *Repository) UnsubscribeKeywordsFor(ctx context.Context, q postgres.Quer
 // Touch updates a campaign's timestamp without changing content, so the list
 // ordering reflects recent administrative activity.
 func (r *Repository) Touch(ctx context.Context, id uuid.UUID) error {
-	_, err := r.db.Pool.Exec(ctx, `UPDATE campaigns SET updated_at = now() WHERE id = $1`, id)
+	_, err := r.db.Exec(ctx, `UPDATE campaigns SET updated_at = now() WHERE id = $1`, id)
 	return err
 }

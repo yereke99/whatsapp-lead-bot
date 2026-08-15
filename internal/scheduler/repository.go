@@ -1,10 +1,10 @@
 // Package scheduler owns the persistent outbound job queue and the workers
 // that drain it.
 //
-// Jobs live in Postgres, never in memory, so a restart, crash or deploy loses
-// nothing. Workers claim rows with FOR UPDATE SKIP LOCKED, which lets any
-// number of replicas run concurrently without ever handing the same job to two
-// of them.
+// Jobs live in SQLite, never in memory, so a restart, crash or deploy loses
+// nothing. Workers claim rows with a single UPDATE that both selects and
+// transitions them; SQLite runs one writer at a time, so two workers can never
+// come away holding the same job.
 package scheduler
 
 import (
@@ -16,7 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ayran/whatsapp-automation/internal/domain"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 )
 
 const jobColumns = `
@@ -25,17 +25,25 @@ const jobColumns = `
 	sm.locked_by, sm.locked_at, sm.sent_at, sm.cancelled_at, sm.cancel_reason,
 	sm.last_error, sm.message_id, sm.created_at, sm.updated_at`
 
+// SQLite's RETURNING clause names columns of the updated table directly and
+// rejects a table alias, so the claim query needs its own unprefixed list.
+const jobColumnsUnqualified = `
+	id, campaign_id, contact_id, enrollment_id, campaign_step_id,
+	run_number, scheduled_at, status, attempt_count, next_attempt_at,
+	locked_by, locked_at, sent_at, cancelled_at, cancel_reason,
+	last_error, message_id, created_at, updated_at`
+
 type Repository struct {
-	db *postgres.DB
+	db *sqlite.DB
 }
 
-func NewRepository(db *postgres.DB) *Repository { return &Repository{db: db} }
+func NewRepository(db *sqlite.DB) *Repository { return &Repository{db: db} }
 
-func (r *Repository) querier(q postgres.Querier) postgres.Querier {
+func (r *Repository) querier(q sqlite.Querier) sqlite.Querier {
 	if q != nil {
 		return q
 	}
-	return r.db.Pool
+	return r.db
 }
 
 // NewJob describes one row to enqueue.
@@ -54,7 +62,7 @@ type NewJob struct {
 // anti-duplicate guarantee: re-running enrollment after a partial failure, or
 // two webhook deliveries racing, can never produce a second delivery of the
 // same step.
-func (r *Repository) Enqueue(ctx context.Context, q postgres.Querier, jobs []NewJob) (int, error) {
+func (r *Repository) Enqueue(ctx context.Context, q sqlite.Querier, jobs []NewJob) (int, error) {
 	if len(jobs) == 0 {
 		return 0, nil
 	}
@@ -84,15 +92,16 @@ func (r *Repository) Enqueue(ctx context.Context, q postgres.Querier, jobs []New
 // Claim atomically moves up to limit due jobs into PROCESSING and returns them.
 //
 // The whole selection and state transition happens in one statement, so a
-// crash between "found" and "claimed" is impossible. SKIP LOCKED means a
-// worker never blocks behind another worker's batch.
+// crash between "found" and "claimed" is impossible. The statement runs under
+// SQLite's write lock, so a second worker polling at the same moment sees the
+// rows already in PROCESSING and picks up the next batch instead.
 func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now time.Time) ([]domain.ScheduledMessage, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 
 	query := `
-		UPDATE scheduled_messages sm
+		UPDATE scheduled_messages AS sm
 		SET status = 'PROCESSING', locked_by = $1, locked_at = $2, updated_at = now()
 		FROM (
 			SELECT id FROM scheduled_messages
@@ -100,13 +109,12 @@ func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now 
 			  AND scheduled_at <= $2
 			  AND (next_attempt_at IS NULL OR next_attempt_at <= $2)
 			ORDER BY scheduled_at
-			FOR UPDATE SKIP LOCKED
 			LIMIT $3
 		) due
 		WHERE sm.id = due.id
-		RETURNING ` + jobColumns
+		RETURNING ` + jobColumnsUnqualified
 
-	rows, err := r.db.Pool.Query(ctx, query, workerID, now, limit)
+	rows, err := r.db.Query(ctx, query, workerID, now, limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim jobs: %w", err)
 	}
@@ -167,7 +175,7 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 		WHERE sm.id = $1`
 
 	var jc JobContext
-	row := r.db.Pool.QueryRow(ctx, query, jobID)
+	row := r.db.QueryRow(ctx, query, jobID)
 
 	dest := jobScanDest(&jc.Job)
 	dest = append(dest,
@@ -180,7 +188,7 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 	)
 
 	if err := row.Scan(dest...); err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("load job context: %w", err)
@@ -188,7 +196,7 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 	return &jc, nil
 }
 
-func (r *Repository) MarkSent(ctx context.Context, q postgres.Querier, jobID, messageID uuid.UUID, sentAt time.Time) error {
+func (r *Repository) MarkSent(ctx context.Context, q sqlite.Querier, jobID, messageID uuid.UUID, sentAt time.Time) error {
 	const query = `
 		UPDATE scheduled_messages SET
 			status = 'SENT', sent_at = $2, message_id = $3, locked_by = NULL, locked_at = NULL,
@@ -207,7 +215,7 @@ func (r *Repository) Retry(ctx context.Context, jobID uuid.UUID, nextAttempt tim
 			last_error = $3, locked_by = NULL, locked_at = NULL, updated_at = now()
 		WHERE id = $1`
 
-	_, err := r.db.Pool.Exec(ctx, query, jobID, nextAttempt, truncate(reason, 2000))
+	_, err := r.db.Exec(ctx, query, jobID, nextAttempt, truncate(reason, 2000))
 	return err
 }
 
@@ -218,7 +226,7 @@ func (r *Repository) Fail(ctx context.Context, jobID uuid.UUID, reason string) e
 			locked_by = NULL, locked_at = NULL, updated_at = now()
 		WHERE id = $1`
 
-	_, err := r.db.Pool.Exec(ctx, query, jobID, truncate(reason, 2000))
+	_, err := r.db.Exec(ctx, query, jobID, truncate(reason, 2000))
 	return err
 }
 
@@ -229,7 +237,7 @@ func (r *Repository) Cancel(ctx context.Context, jobID uuid.UUID, reason string)
 			locked_by = NULL, locked_at = NULL, updated_at = now()
 		WHERE id = $1 AND status IN ('PENDING', 'PROCESSING')`
 
-	_, err := r.db.Pool.Exec(ctx, query, jobID, truncate(reason, 500))
+	_, err := r.db.Exec(ctx, query, jobID, truncate(reason, 500))
 	return err
 }
 
@@ -247,7 +255,7 @@ func (r *Repository) ReleaseStale(ctx context.Context, olderThan time.Duration) 
 			updated_at = now()
 		WHERE status = 'PROCESSING' AND locked_at < $1`
 
-	tag, err := r.db.Pool.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
+	tag, err := r.db.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
 	if err != nil {
 		return 0, err
 	}
@@ -263,7 +271,7 @@ func (r *Repository) CancelStale(ctx context.Context, olderThan time.Duration) (
 			cancel_reason = 'send window expired', updated_at = now()
 		WHERE status = 'PENDING' AND scheduled_at < $1`
 
-	tag, err := r.db.Pool.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
+	tag, err := r.db.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
 	if err != nil {
 		return 0, err
 	}
@@ -274,12 +282,10 @@ func (r *Repository) CancelStale(ctx context.Context, olderThan time.Duration) (
 //
 // Only PENDING rows are touched. Sent, failed and cancelled jobs are history
 // and must never be rewritten.
-func (r *Repository) RescheduleCampaign(ctx context.Context, q postgres.Querier, campaignID uuid.UUID, eventStart time.Time) (int64, error) {
-	// The parameter is cast explicitly: without it Postgres cannot infer the
-	// left operand's type and reads the whole expression as an interval.
+func (r *Repository) RescheduleCampaign(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID, eventStart time.Time) (int64, error) {
 	const query = `
-		UPDATE scheduled_messages sm SET
-			scheduled_at = $2::timestamptz + (cs.offset_seconds * interval '1 second'),
+		UPDATE scheduled_messages AS sm SET
+			scheduled_at = ts_add($2, cs.offset_seconds),
 			updated_at = now()
 		FROM campaign_steps cs
 		WHERE cs.id = sm.campaign_step_id
@@ -296,10 +302,10 @@ func (r *Repository) RescheduleCampaign(ctx context.Context, q postgres.Querier,
 
 // RescheduleStep recomputes pending jobs for a single step after its offset
 // changed.
-func (r *Repository) RescheduleStep(ctx context.Context, q postgres.Querier, stepID uuid.UUID) (int64, error) {
+func (r *Repository) RescheduleStep(ctx context.Context, q sqlite.Querier, stepID uuid.UUID) (int64, error) {
 	const query = `
-		UPDATE scheduled_messages sm SET
-			scheduled_at = camp.event_start_at + (cs.offset_seconds * interval '1 second'),
+		UPDATE scheduled_messages AS sm SET
+			scheduled_at = ts_add(camp.event_start_at, cs.offset_seconds),
 			updated_at = now()
 		FROM campaign_steps cs
 		JOIN campaigns camp ON camp.id = cs.campaign_id
@@ -316,7 +322,7 @@ func (r *Repository) RescheduleStep(ctx context.Context, q postgres.Querier, ste
 	return tag.RowsAffected(), nil
 }
 
-func (r *Repository) CancelPendingForStep(ctx context.Context, q postgres.Querier, stepID uuid.UUID, reason string) (int64, error) {
+func (r *Repository) CancelPendingForStep(ctx context.Context, q sqlite.Querier, stepID uuid.UUID, reason string) (int64, error) {
 	const query = `
 		UPDATE scheduled_messages SET
 			status = 'CANCELLED', cancelled_at = now(), cancel_reason = $2, updated_at = now()
@@ -329,7 +335,7 @@ func (r *Repository) CancelPendingForStep(ctx context.Context, q postgres.Querie
 	return tag.RowsAffected(), nil
 }
 
-func (r *Repository) CancelPendingForEnrollment(ctx context.Context, q postgres.Querier, enrollmentID uuid.UUID, reason string) (int64, error) {
+func (r *Repository) CancelPendingForEnrollment(ctx context.Context, q sqlite.Querier, enrollmentID uuid.UUID, reason string) (int64, error) {
 	const query = `
 		UPDATE scheduled_messages SET
 			status = 'CANCELLED', cancelled_at = now(), cancel_reason = $2, updated_at = now()
@@ -342,7 +348,7 @@ func (r *Repository) CancelPendingForEnrollment(ctx context.Context, q postgres.
 	return tag.RowsAffected(), nil
 }
 
-func (r *Repository) CancelPendingForContact(ctx context.Context, q postgres.Querier, contactID uuid.UUID, reason string) (int64, error) {
+func (r *Repository) CancelPendingForContact(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, reason string) (int64, error) {
 	const query = `
 		UPDATE scheduled_messages SET
 			status = 'CANCELLED', cancelled_at = now(), cancel_reason = $2, updated_at = now()
@@ -355,7 +361,7 @@ func (r *Repository) CancelPendingForContact(ctx context.Context, q postgres.Que
 	return tag.RowsAffected(), nil
 }
 
-func (r *Repository) CancelPendingForCampaign(ctx context.Context, q postgres.Querier, campaignID uuid.UUID, reason string) (int64, error) {
+func (r *Repository) CancelPendingForCampaign(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID, reason string) (int64, error) {
 	const query = `
 		UPDATE scheduled_messages SET
 			status = 'CANCELLED', cancelled_at = now(), cancel_reason = $2, updated_at = now()
@@ -377,7 +383,7 @@ func (r *Repository) Requeue(ctx context.Context, jobID uuid.UUID) error {
 			last_error = '', locked_by = NULL, locked_at = NULL, updated_at = now()
 		WHERE id = $1 AND status IN ('FAILED', 'CANCELLED')`
 
-	_, err := r.db.Pool.Exec(ctx, query, jobID)
+	_, err := r.db.Exec(ctx, query, jobID)
 	return err
 }
 
@@ -427,7 +433,7 @@ func (r *Repository) List(ctx context.Context, f ListFilter) ([]domain.Scheduled
 	}
 
 	var total int
-	if err := r.db.Pool.QueryRow(ctx,
+	if err := r.db.QueryRow(ctx,
 		`SELECT count(*) FROM scheduled_messages sm WHERE `+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count jobs: %w", err)
 	}
@@ -443,7 +449,7 @@ func (r *Repository) List(ctx context.Context, f ListFilter) ([]domain.Scheduled
 		ORDER BY sm.scheduled_at DESC
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
 
-	rows, err := r.db.Pool.Query(ctx, query, args...)
+	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list jobs: %w", err)
 	}
@@ -484,7 +490,7 @@ func (r *Repository) Stats(ctx context.Context) (*Stats, error) {
 		FROM scheduled_messages`
 
 	var s Stats
-	err := r.db.Pool.QueryRow(ctx, query).Scan(
+	err := r.db.QueryRow(ctx, query).Scan(
 		&s.Pending, &s.Processing, &s.Sent, &s.Failed, &s.Cancelled, &s.DueNow)
 	if err != nil {
 		return nil, err
@@ -494,7 +500,7 @@ func (r *Repository) Stats(ctx context.Context) (*Stats, error) {
 
 // EnrollmentProgress reports how far a contact is through a campaign, used to
 // close out enrollments once every step has resolved.
-func (r *Repository) EnrollmentProgress(ctx context.Context, q postgres.Querier, enrollmentID uuid.UUID) (pending, total int, err error) {
+func (r *Repository) EnrollmentProgress(ctx context.Context, q sqlite.Querier, enrollmentID uuid.UUID) (pending, total int, err error) {
 	const query = `
 		SELECT count(*) FILTER (WHERE status IN ('PENDING', 'PROCESSING')), count(*)
 		FROM scheduled_messages WHERE enrollment_id = $1`

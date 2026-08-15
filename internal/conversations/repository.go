@@ -12,7 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ayran/whatsapp-automation/internal/domain"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp"
 )
 
@@ -28,16 +28,16 @@ const messageColumns = `
 var ErrDuplicate = errors.New("message already recorded")
 
 type Repository struct {
-	db *postgres.DB
+	db *sqlite.DB
 }
 
-func NewRepository(db *postgres.DB) *Repository { return &Repository{db: db} }
+func NewRepository(db *sqlite.DB) *Repository { return &Repository{db: db} }
 
-func (r *Repository) querier(q postgres.Querier) postgres.Querier {
+func (r *Repository) querier(q sqlite.Querier) sqlite.Querier {
 	if q != nil {
 		return q
 	}
-	return r.db.Pool
+	return r.db
 }
 
 // Create inserts a message.
@@ -46,7 +46,7 @@ func (r *Repository) querier(q postgres.Querier) postgres.Querier {
 // message reached us twice (a webhook replay, or a retry that actually
 // succeeded the first time). That is reported as ErrDuplicate rather than an
 // error, because it is a normal and expected outcome.
-func (r *Repository) Create(ctx context.Context, q postgres.Querier, m *domain.Message) error {
+func (r *Repository) Create(ctx context.Context, q sqlite.Querier, m *domain.Message) error {
 	const query = `
 		INSERT INTO messages (
 			contact_id, campaign_id, enrollment_id, campaign_step_id, scheduled_message_id,
@@ -71,7 +71,7 @@ func (r *Repository) Create(ctx context.Context, q postgres.Querier, m *domain.M
 	).Scan(&m.ID, &m.CreatedAt, &m.UpdatedAt)
 
 	if err != nil {
-		if postgres.IsUniqueViolation(err, "messages_external_id_key") {
+		if sqlite.IsUniqueViolation(err, "messages_external_id_key") {
 			return ErrDuplicate
 		}
 		return fmt.Errorf("insert message: %w", err)
@@ -83,11 +83,11 @@ func (r *Repository) Create(ctx context.Context, q postgres.Querier, m *domain.M
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Message, error) {
 	query := `SELECT ` + messageColumns + ` FROM messages m WHERE m.id = $1`
-	row := r.db.Pool.QueryRow(ctx, query, id)
+	row := r.db.QueryRow(ctx, query, id)
 
 	var m domain.Message
 	if err := scanMessage(row, &m); err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -95,7 +95,7 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Message
 	return &m, nil
 }
 
-func (r *Repository) ExistsByExternalID(ctx context.Context, q postgres.Querier, externalID string) (bool, error) {
+func (r *Repository) ExistsByExternalID(ctx context.Context, q sqlite.Querier, externalID string) (bool, error) {
 	var exists bool
 	err := r.querier(q).QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM messages WHERE external_id = $1)`, externalID).Scan(&exists)
@@ -138,7 +138,7 @@ func (r *Repository) Timeline(ctx context.Context, contactID uuid.UUID, beforeID
 		ORDER BY m.created_at DESC, m.id DESC
 		LIMIT $` + fmt.Sprint(len(args))
 
-	rows, err := r.db.Pool.Query(ctx, query, args...)
+	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("load timeline: %w", err)
 	}
@@ -163,20 +163,20 @@ func (r *Repository) Timeline(ctx context.Context, contactID uuid.UUID, beforeID
 }
 
 // MarkSent records a successful send and attaches the provider id.
-func (r *Repository) MarkSent(ctx context.Context, q postgres.Querier, id uuid.UUID, externalID string, sentAt time.Time) error {
+func (r *Repository) MarkSent(ctx context.Context, q sqlite.Querier, id uuid.UUID, externalID string, sentAt time.Time) error {
 	const query = `
 		UPDATE messages
 		SET status = 'SENT', external_id = $2, sent_at = $3, error = '', updated_at = now()
 		WHERE id = $1`
 
 	_, err := r.querier(q).Exec(ctx, query, id, externalID, sentAt)
-	if err != nil && postgres.IsUniqueViolation(err, "messages_external_id_key") {
+	if err != nil && sqlite.IsUniqueViolation(err, "messages_external_id_key") {
 		return ErrDuplicate
 	}
 	return err
 }
 
-func (r *Repository) MarkFailed(ctx context.Context, q postgres.Querier, id uuid.UUID, reason string) error {
+func (r *Repository) MarkFailed(ctx context.Context, q sqlite.Querier, id uuid.UUID, reason string) error {
 	const query = `
 		UPDATE messages SET status = 'FAILED', error = $2, updated_at = now() WHERE id = $1`
 	_, err := r.querier(q).Exec(ctx, query, id, truncate(reason, 2000))
@@ -188,7 +188,7 @@ func (r *Repository) MarkFailed(ctx context.Context, q postgres.Querier, id uuid
 // Providers do not guarantee ordering, so a READ notification can arrive
 // before its DELIVERED counterpart. The rank comparison makes the transition
 // monotonic and keeps the timeline honest.
-func (r *Repository) ApplyStatus(ctx context.Context, q postgres.Querier, externalID string, status whatsapp.DeliveryStatus, at time.Time, description string) (bool, error) {
+func (r *Repository) ApplyStatus(ctx context.Context, q sqlite.Querier, externalID string, status whatsapp.DeliveryStatus, at time.Time, description string) (bool, error) {
 	if status == "" {
 		return false, nil
 	}
@@ -223,10 +223,10 @@ func (r *Repository) ApplyStatus(ctx context.Context, q postgres.Querier, extern
 // so the realtime layer knows which chat to refresh.
 func (r *Repository) ContactIDForExternalID(ctx context.Context, externalID string) (uuid.UUID, bool, error) {
 	var id uuid.UUID
-	err := r.db.Pool.QueryRow(ctx,
+	err := r.db.QueryRow(ctx,
 		`SELECT contact_id FROM messages WHERE external_id = $1`, externalID).Scan(&id)
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return uuid.Nil, false, nil
 		}
 		return uuid.Nil, false, err
@@ -252,7 +252,7 @@ func (r *Repository) PendingMediaDownloads(ctx context.Context, limit int) ([]Pe
 		ORDER BY created_at
 		LIMIT $1`
 
-	rows, err := r.db.Pool.Query(ctx, query, limit)
+	rows, err := r.db.Query(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +270,7 @@ func (r *Repository) PendingMediaDownloads(ctx context.Context, limit int) ([]Pe
 }
 
 func (r *Repository) AttachDownloadedMedia(ctx context.Context, messageID, mediaFileID uuid.UUID) error {
-	_, err := r.db.Pool.Exec(ctx,
+	_, err := r.db.Exec(ctx,
 		`UPDATE messages SET media_file_id = $2, media_download_status = 'DONE',
 			media_download_error = '', updated_at = now()
 		 WHERE id = $1`, messageID, mediaFileID)
@@ -278,7 +278,7 @@ func (r *Repository) AttachDownloadedMedia(ctx context.Context, messageID, media
 }
 
 func (r *Repository) MarkDownloadFailed(ctx context.Context, messageID uuid.UUID, reason string) error {
-	_, err := r.db.Pool.Exec(ctx,
+	_, err := r.db.Exec(ctx,
 		`UPDATE messages SET media_download_status = 'FAILED', media_download_error = $2, updated_at = now()
 		 WHERE id = $1`, messageID, truncate(reason, 500))
 	return err
@@ -294,7 +294,7 @@ func (r *Repository) RecentFailures(ctx context.Context, limit int) ([]domain.Me
 		ORDER BY m.created_at DESC
 		LIMIT $1`
 
-	rows, err := r.db.Pool.Query(ctx, query, limit)
+	rows, err := r.db.Query(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +315,7 @@ func (r *Repository) RecentFailures(ctx context.Context, limit int) ([]domain.Me
 // is the consent check used before any manual send.
 func (r *Repository) HasIncomingMessages(ctx context.Context, contactID uuid.UUID) (bool, error) {
 	var exists bool
-	err := r.db.Pool.QueryRow(ctx,
+	err := r.db.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM messages WHERE contact_id = $1 AND direction = 'INCOMING')`,
 		contactID).Scan(&exists)
 	return exists, err

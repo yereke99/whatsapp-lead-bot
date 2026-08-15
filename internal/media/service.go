@@ -12,7 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ayran/whatsapp-automation/internal/domain"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 )
 
 // Service combines validated storage, database bookkeeping and audio
@@ -224,7 +224,7 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
 
 	relPath, err := s.repo.Delete(ctx, id)
 	if err != nil {
-		if postgres.IsForeignKeyViolation(err) {
+		if sqlite.IsForeignKeyViolation(err) {
 			return ErrMediaInUse
 		}
 		return err

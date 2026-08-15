@@ -1,12 +1,15 @@
 //go:build integration
 
-// Package integration exercises the platform against a real PostgreSQL
-// instance: migrations, concurrent job claiming, the anti-duplicate
-// constraints and the end-to-end trigger flow.
+// Package integration exercises the platform against a real SQLite database:
+// migrations, concurrent job claiming, the anti-duplicate constraints and the
+// end-to-end trigger flow.
 //
-// Run with:
+// The database is a scratch file created per run, so there is nothing to
+// provision. Run with:
 //
-//	TEST_DATABASE_URL=postgres://... go test -tags=integration ./internal/integration/...
+//	go test -tags=integration ./internal/integration/...
+//
+// Set TEST_DATABASE_PATH to point at a specific file instead.
 package integration
 
 import (
@@ -15,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -26,12 +30,12 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/conversations"
 	"github.com/ayran/whatsapp-automation/internal/domain"
 	"github.com/ayran/whatsapp-automation/internal/scheduler"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/internal/templates"
 	"github.com/ayran/whatsapp-automation/migrations"
 )
 
-var testDB *postgres.DB
+var testDB *sqlite.DB
 
 // discardLogger keeps test output readable.
 func discardLogger() *slog.Logger {
@@ -39,19 +43,23 @@ func discardLogger() *slog.Logger {
 }
 
 func TestMain(m *testing.M) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		fmt.Fprintln(os.Stderr, "TEST_DATABASE_URL is not set; skipping integration tests")
-		os.Exit(0)
+	path := os.Getenv("TEST_DATABASE_PATH")
+	if path == "" {
+		dir, err := os.MkdirTemp("", "whatsapp-integration-*")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create temp dir: %v\n", err)
+			os.Exit(1)
+		}
+		defer os.RemoveAll(dir)
+		path = filepath.Join(dir, "test.db")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	db, err := postgres.Connect(ctx, config.Database{
-		URL:      url,
+	db, err := sqlite.Connect(ctx, config.Database{
+		Path:     path,
 		MaxConns: 10,
-		MinConns: 1,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "connect to test database: %v\n", err)
@@ -70,19 +78,30 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// resetTables lists every table child-first, so deleting in order never trips a
+// foreign key even though the schema also cascades.
+var resetTables = []string{
+	"scheduled_messages", "messages", "campaign_contacts", "campaign_steps",
+	"campaign_triggers", "campaigns", "message_template_versions", "message_templates",
+	"contact_tags", "tags", "contacts", "media_files", "webhook_events", "audit_logs",
+	"admin_sessions", "login_attempts", "admins",
+}
+
 // reset clears every table between tests so cases stay independent.
+//
+// SQLite has no TRUNCATE; a plain DELETE with the autoincrement counters reset
+// is the equivalent.
 func reset(t *testing.T) {
 	t.Helper()
 
 	ctx := context.Background()
-	_, err := testDB.Pool.Exec(ctx, `
-		TRUNCATE scheduled_messages, messages, campaign_contacts, campaign_steps,
-			campaign_triggers, campaigns, message_template_versions, message_templates,
-			contact_tags, tags, contacts, media_files, webhook_events, audit_logs,
-			admin_sessions, login_attempts, admins
-		RESTART IDENTITY CASCADE`)
-	if err != nil {
-		t.Fatalf("reset database: %v", err)
+	for _, table := range resetTables {
+		if _, err := testDB.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("reset %s: %v", table, err)
+		}
+	}
+	if _, err := testDB.Exec(ctx, "DELETE FROM sqlite_sequence"); err != nil {
+		t.Fatalf("reset identity counters: %v", err)
 	}
 }
 

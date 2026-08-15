@@ -10,10 +10,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/ayran/whatsapp-automation/internal/domain"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/pkg/phone"
 )
 
@@ -27,16 +26,16 @@ const contactColumns = `
 	c.last_message_direction, c.created_at, c.updated_at`
 
 type Repository struct {
-	db *postgres.DB
+	db *sqlite.DB
 }
 
-func NewRepository(db *postgres.DB) *Repository { return &Repository{db: db} }
+func NewRepository(db *sqlite.DB) *Repository { return &Repository{db: db} }
 
-func (r *Repository) querier(q postgres.Querier) postgres.Querier {
+func (r *Repository) querier(q sqlite.Querier) sqlite.Querier {
 	if q != nil {
 		return q
 	}
-	return r.db.Pool
+	return r.db
 }
 
 // UpsertFromInbound finds or creates the contact behind an incoming message.
@@ -45,28 +44,51 @@ func (r *Repository) querier(q postgres.Querier) postgres.Querier {
 // on the first inbound message. Nothing may be sent to a contact whose anchor
 // is still NULL, which is what makes "never message first" structural rather
 // than a convention.
-func (r *Repository) UpsertFromInbound(ctx context.Context, q postgres.Querier, chatID, phoneDigits, pushName string, at time.Time) (*domain.Contact, bool, error) {
-	query := `
+// Whether the contact was created is answered by which of the two statements
+// produced the row. Postgres could fold this into one upsert and read xmax to
+// tell an insert from an update; SQLite exposes no such marker, and deriving it
+// from the stored timestamps would misreport a second message that carries the
+// same provider timestamp as the first.
+func (r *Repository) UpsertFromInbound(ctx context.Context, q sqlite.Querier, chatID, phoneDigits, pushName string, at time.Time) (*domain.Contact, bool, error) {
+	querier := r.querier(q)
+	columns := strings.ReplaceAll(contactColumns, "c.", "")
+
+	const insertQuery = `
 		INSERT INTO contacts (phone, chat_id, push_name, first_contact_at, last_incoming_at, last_activity_at, status)
 		VALUES ($1, $2, $3, $4, $4, $4, 'NEW')
-		ON CONFLICT (phone) DO UPDATE SET
-			chat_id          = EXCLUDED.chat_id,
-			push_name        = CASE WHEN EXCLUDED.push_name <> '' THEN EXCLUDED.push_name ELSE contacts.push_name END,
-			first_contact_at = COALESCE(contacts.first_contact_at, EXCLUDED.first_contact_at),
-			updated_at       = now()
-		RETURNING ` + strings.ReplaceAll(contactColumns, "c.", "") + `,
-			(xmax = 0) AS inserted`
-
-	row := r.querier(q).QueryRow(ctx, query, phoneDigits, chatID, pushName, at)
+		ON CONFLICT (phone) DO NOTHING
+		RETURNING `
 
 	var contact domain.Contact
-	var inserted bool
-	if err := scanContactWith(row, &contact, &inserted); err != nil {
+	err := scanContactWith(
+		querier.QueryRow(ctx, insertQuery+columns, phoneDigits, chatID, pushName, at), &contact)
+	switch {
+	case err == nil:
+		contact.PhoneDisplay = phone.Display(contact.Phone)
+		return &contact, true, nil
+	case !sqlite.IsNoRows(err):
+		return nil, false, fmt.Errorf("upsert contact: %w", err)
+	}
+
+	// The insert conflicted, so the contact already existed. Refresh only what
+	// an inbound message is authoritative about, and leave the consent anchor
+	// alone once it is set.
+	const updateQuery = `
+		UPDATE contacts SET
+			chat_id          = $2,
+			push_name        = CASE WHEN $3 <> '' THEN $3 ELSE push_name END,
+			first_contact_at = COALESCE(first_contact_at, $4),
+			updated_at       = now()
+		WHERE phone = $1
+		RETURNING `
+
+	if err := scanContactWith(
+		querier.QueryRow(ctx, updateQuery+columns, phoneDigits, chatID, pushName, at), &contact); err != nil {
 		return nil, false, fmt.Errorf("upsert contact: %w", err)
 	}
 
 	contact.PhoneDisplay = phone.Display(contact.Phone)
-	return &contact, inserted, nil
+	return &contact, false, nil
 }
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Contact, error) {
@@ -75,10 +97,10 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Contact
 		LEFT JOIN campaigns camp ON camp.id = c.first_campaign_id
 		WHERE c.id = $1`
 
-	row := r.db.Pool.QueryRow(ctx, query, id)
+	row := r.db.QueryRow(ctx, query, id)
 	var contact domain.Contact
 	if err := scanContactWith(row, &contact, &contact.CampaignName); err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -87,13 +109,13 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Contact
 	return &contact, nil
 }
 
-func (r *Repository) GetByPhone(ctx context.Context, q postgres.Querier, phoneDigits string) (*domain.Contact, error) {
+func (r *Repository) GetByPhone(ctx context.Context, q sqlite.Querier, phoneDigits string) (*domain.Contact, error) {
 	query := `SELECT ` + contactColumns + ` FROM contacts c WHERE c.phone = $1`
 
 	row := r.querier(q).QueryRow(ctx, query, phoneDigits)
 	var contact domain.Contact
 	if err := scanContactWith(row, &contact); err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -194,7 +216,7 @@ func (r *Repository) List(ctx context.Context, f Filter) ([]domain.Contact, int,
 
 	var total int
 	countQuery := `SELECT count(*) FROM contacts c WHERE ` + where
-	if err := r.db.Pool.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
+	if err := r.db.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count contacts: %w", err)
 	}
 
@@ -208,7 +230,7 @@ func (r *Repository) List(ctx context.Context, f Filter) ([]domain.Contact, int,
 		ORDER BY ` + orderBy(f.Sort) + `
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
 
-	rows, err := r.db.Pool.Query(ctx, query, args...)
+	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list contacts: %w", err)
 	}
@@ -257,7 +279,7 @@ func (r *Repository) ChatList(ctx context.Context, search string, unreadOnly boo
 	where := strings.Join(clauses, " AND ")
 
 	var total int
-	if err := r.db.Pool.QueryRow(ctx,
+	if err := r.db.QueryRow(ctx,
 		`SELECT count(*) FROM contacts c WHERE `+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count chats: %w", err)
 	}
@@ -273,7 +295,7 @@ func (r *Repository) ChatList(ctx context.Context, search string, unreadOnly boo
 		ORDER BY c.last_activity_at DESC NULLS LAST, c.created_at DESC
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
 
-	rows, err := r.db.Pool.Query(ctx, query, args...)
+	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list chats: %w", err)
 	}
@@ -292,7 +314,7 @@ func (r *Repository) ChatList(ctx context.Context, search string, unreadOnly boo
 }
 
 // RecordIncoming updates activity counters and the denormalized chat preview.
-func (r *Repository) RecordIncoming(ctx context.Context, q postgres.Querier, contactID uuid.UUID, preview, msgType string, at time.Time) error {
+func (r *Repository) RecordIncoming(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, preview, msgType string, at time.Time) error {
 	const query = `
 		UPDATE contacts SET
 			last_incoming_at       = GREATEST(COALESCE(last_incoming_at, $2), $2),
@@ -310,7 +332,7 @@ func (r *Repository) RecordIncoming(ctx context.Context, q postgres.Querier, con
 }
 
 // RecordOutgoing mirrors RecordIncoming for messages the platform sent.
-func (r *Repository) RecordOutgoing(ctx context.Context, q postgres.Querier, contactID uuid.UUID, preview, msgType string, at time.Time) error {
+func (r *Repository) RecordOutgoing(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, preview, msgType string, at time.Time) error {
 	const query = `
 		UPDATE contacts SET
 			last_outgoing_at       = GREATEST(COALESCE(last_outgoing_at, $2), $2),
@@ -328,12 +350,12 @@ func (r *Repository) RecordOutgoing(ctx context.Context, q postgres.Querier, con
 }
 
 func (r *Repository) MarkRead(ctx context.Context, contactID uuid.UUID) error {
-	_, err := r.db.Pool.Exec(ctx,
+	_, err := r.db.Exec(ctx,
 		`UPDATE contacts SET unread_count = 0, updated_at = now() WHERE id = $1`, contactID)
 	return err
 }
 
-func (r *Repository) UpdateStatus(ctx context.Context, q postgres.Querier, contactID uuid.UUID, status domain.ContactStatus) error {
+func (r *Repository) UpdateStatus(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, status domain.ContactStatus) error {
 	_, err := r.querier(q).Exec(ctx,
 		`UPDATE contacts SET status = $2, updated_at = now() WHERE id = $1`, contactID, status)
 	return err
@@ -341,7 +363,7 @@ func (r *Repository) UpdateStatus(ctx context.Context, q postgres.Querier, conta
 
 // SetOptOut records an unsubscribe. It is idempotent: repeating STOP does not
 // move the timestamp.
-func (r *Repository) SetOptOut(ctx context.Context, q postgres.Querier, contactID uuid.UUID, optedOut bool) error {
+func (r *Repository) SetOptOut(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, optedOut bool) error {
 	const query = `
 		UPDATE contacts SET
 			opted_out    = $2,
@@ -366,19 +388,19 @@ func (r *Repository) SetBlocked(ctx context.Context, contactID uuid.UUID, blocke
 			updated_at = now()
 		WHERE id = $1`
 
-	_, err := r.db.Pool.Exec(ctx, query, contactID, blocked)
+	_, err := r.db.Exec(ctx, query, contactID, blocked)
 	return err
 }
 
 func (r *Repository) UpdateProfile(ctx context.Context, contactID uuid.UUID, name, notes string) error {
-	_, err := r.db.Pool.Exec(ctx,
+	_, err := r.db.Exec(ctx,
 		`UPDATE contacts SET name = $2, notes = $3, updated_at = now() WHERE id = $1`,
 		contactID, name, notes)
 	return err
 }
 
 func (r *Repository) UpdateAvatar(ctx context.Context, contactID uuid.UUID, localURL, sourceURL string) error {
-	_, err := r.db.Pool.Exec(ctx,
+	_, err := r.db.Exec(ctx,
 		`UPDATE contacts SET avatar_url = $2, avatar_source_url = $3, avatar_checked_at = now(), updated_at = now()
 		 WHERE id = $1`, contactID, localURL, sourceURL)
 	return err
@@ -386,7 +408,7 @@ func (r *Repository) UpdateAvatar(ctx context.Context, contactID uuid.UUID, loca
 
 // SetFirstCampaign records the campaign a contact originally entered through.
 // It only fills an empty slot, so the attribution never changes later.
-func (r *Repository) SetFirstCampaign(ctx context.Context, q postgres.Querier, contactID, campaignID uuid.UUID, keyword string) error {
+func (r *Repository) SetFirstCampaign(ctx context.Context, q sqlite.Querier, contactID, campaignID uuid.UUID, keyword string) error {
 	const query = `
 		UPDATE contacts SET
 			first_campaign_id     = COALESCE(first_campaign_id, $2),
@@ -410,7 +432,7 @@ func (r *Repository) StaleAvatars(ctx context.Context, ttl time.Duration, limit 
 		ORDER BY c.last_activity_at DESC NULLS LAST
 		LIMIT $2`
 
-	rows, err := r.db.Pool.Query(ctx, query, time.Now().UTC().Add(-ttl), limit)
+	rows, err := r.db.Query(ctx, query, time.Now().UTC().Add(-ttl), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -429,8 +451,8 @@ func (r *Repository) StaleAvatars(ctx context.Context, ttl time.Duration, limit 
 
 // BulkSetStatus applies a status change to many contacts at once.
 func (r *Repository) BulkSetStatus(ctx context.Context, ids []uuid.UUID, status domain.ContactStatus) (int64, error) {
-	tag, err := r.db.Pool.Exec(ctx,
-		`UPDATE contacts SET status = $2, updated_at = now() WHERE id = ANY($1)`, ids, status)
+	tag, err := r.db.Exec(ctx,
+		`UPDATE contacts SET status = $2, updated_at = now() WHERE id IN (SELECT value FROM json_each($1))`, ids, status)
 	if err != nil {
 		return 0, err
 	}
@@ -446,9 +468,9 @@ func (r *Repository) BulkSetOptOut(ctx context.Context, ids []uuid.UUID, optedOu
 			                    WHEN status = 'UNSUBSCRIBED' THEN 'ACTIVE'
 			                    ELSE status END,
 			updated_at   = now()
-		WHERE id = ANY($1)`
+		WHERE id IN (SELECT value FROM json_each($1))`
 
-	tag, err := r.db.Pool.Exec(ctx, query, ids, optedOut)
+	tag, err := r.db.Exec(ctx, query, ids, optedOut)
 	if err != nil {
 		return 0, err
 	}
@@ -463,9 +485,9 @@ func (r *Repository) BulkSetBlocked(ctx context.Context, ids []uuid.UUID, blocke
 			                  WHEN status = 'BLOCKED' THEN 'ACTIVE'
 			                  ELSE status END,
 			updated_at = now()
-		WHERE id = ANY($1)`
+		WHERE id IN (SELECT value FROM json_each($1))`
 
-	tag, err := r.db.Pool.Exec(ctx, query, ids, blocked)
+	tag, err := r.db.Exec(ctx, query, ids, blocked)
 	if err != nil {
 		return 0, err
 	}
@@ -473,14 +495,14 @@ func (r *Repository) BulkSetBlocked(ctx context.Context, ids []uuid.UUID, blocke
 }
 
 func (r *Repository) Delete(ctx context.Context, id uuid.UUID) error {
-	_, err := r.db.Pool.Exec(ctx, `DELETE FROM contacts WHERE id = $1`, id)
+	_, err := r.db.Exec(ctx, `DELETE FROM contacts WHERE id = $1`, id)
 	return err
 }
 
 // ---------------------------------------------------------------- tagging --
 
 func (r *Repository) ListTags(ctx context.Context) ([]domain.Tag, error) {
-	rows, err := r.db.Pool.Query(ctx, `SELECT id, name, color FROM tags ORDER BY lower(name)`)
+	rows, err := r.db.Query(ctx, `SELECT id, name, color FROM tags ORDER BY lower(name)`)
 	if err != nil {
 		return nil, err
 	}
@@ -501,11 +523,11 @@ func (r *Repository) ListTags(ctx context.Context) ([]domain.Tag, error) {
 func (r *Repository) EnsureTag(ctx context.Context, name, color string) (*domain.Tag, error) {
 	const query = `
 		INSERT INTO tags (name, color) VALUES ($1, $2)
-		ON CONFLICT (lower(btrim(name))) DO UPDATE SET name = tags.name
+		ON CONFLICT (lower(trim(name))) DO UPDATE SET name = tags.name
 		RETURNING id, name, color`
 
 	var t domain.Tag
-	if err := r.db.Pool.QueryRow(ctx, query, strings.TrimSpace(name), color).
+	if err := r.db.QueryRow(ctx, query, strings.TrimSpace(name), color).
 		Scan(&t.ID, &t.Name, &t.Color); err != nil {
 		return nil, err
 	}
@@ -515,10 +537,10 @@ func (r *Repository) EnsureTag(ctx context.Context, name, color string) (*domain
 func (r *Repository) AttachTag(ctx context.Context, contactIDs []uuid.UUID, tagID uuid.UUID) (int64, error) {
 	const query = `
 		INSERT INTO contact_tags (contact_id, tag_id)
-		SELECT id, $2 FROM contacts WHERE id = ANY($1)
+		SELECT id, $2 FROM contacts WHERE id IN (SELECT value FROM json_each($1))
 		ON CONFLICT DO NOTHING`
 
-	tag, err := r.db.Pool.Exec(ctx, query, contactIDs, tagID)
+	tag, err := r.db.Exec(ctx, query, contactIDs, tagID)
 	if err != nil {
 		return 0, err
 	}
@@ -532,7 +554,7 @@ func (r *Repository) TagsFor(ctx context.Context, contactID uuid.UUID) ([]domain
 		WHERE ct.contact_id = $1
 		ORDER BY lower(t.name)`
 
-	rows, err := r.db.Pool.Query(ctx, query, contactID)
+	rows, err := r.db.Query(ctx, query, contactID)
 	if err != nil {
 		return nil, err
 	}
@@ -581,7 +603,7 @@ func truncatePreview(s string) string {
 }
 
 // ExportRows streams the filtered contact set for CSV export.
-func (r *Repository) ExportRows(ctx context.Context, f Filter) (pgx.Rows, error) {
+func (r *Repository) ExportRows(ctx context.Context, f Filter) (*sqlite.Rows, error) {
 	var args []any
 	where := f.buildWhere(&args)
 
@@ -593,5 +615,5 @@ func (r *Repository) ExportRows(ctx context.Context, f Filter) (pgx.Rows, error)
 		WHERE ` + where + `
 		ORDER BY ` + orderBy(f.Sort)
 
-	return r.db.Pool.Query(ctx, query, args...)
+	return r.db.Query(ctx, query, args...)
 }

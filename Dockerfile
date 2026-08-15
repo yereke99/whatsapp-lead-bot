@@ -9,7 +9,8 @@ RUN go mod download
 
 COPY . .
 
-# CGO is not needed: pgx is pure Go, which keeps the runtime image minimal.
+# CGO is not needed: the SQLite driver is pure Go, which keeps the runtime
+# image minimal and avoids a libsqlite3 dependency.
 ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux go build \
         -trimpath \
@@ -32,21 +33,23 @@ WORKDIR /app
 COPY --from=build /out/server /out/migrate /out/seed /usr/local/bin/
 COPY --chown=app:app web ./web
 
-# Media lives on a volume; the directory is created up front so the mount
-# inherits the right ownership.
-RUN mkdir -p /app/storage/media && chown -R app:app /app/storage
+# The database and media live on volumes; both directories are created up
+# front so the mounts inherit the right ownership.
+RUN mkdir -p /app/storage/media /app/data \
+ && chown -R app:app /app/storage /app/data
 
 USER app
 
 ENV APP_ENV=production \
-    PORT=8080 \
+    PORT=8086 \
     WEB_DIR=/app/web \
+    DATABASE_PATH=/app/data/whatsapp.db \
     MEDIA_STORAGE_PATH=/app/storage/media \
     TIMEZONE=Asia/Almaty
 
-EXPOSE 8080
+EXPOSE 8086
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://localhost:8080/api/health || exit 1
+    CMD curl -fsS http://localhost:8086/api/health || exit 1
 
 ENTRYPOINT ["server"]

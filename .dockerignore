@@ -6,6 +6,7 @@
 bin/
 dist/
 storage/
+data/
 *.log
 *.test
 coverage.*

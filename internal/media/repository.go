@@ -5,10 +5,9 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/ayran/whatsapp-automation/internal/domain"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 )
 
 const mediaColumns = `
@@ -17,14 +16,14 @@ const mediaColumns = `
 	uploaded_by, created_at`
 
 type Repository struct {
-	db *postgres.DB
+	db *sqlite.DB
 }
 
-func NewRepository(db *postgres.DB) *Repository { return &Repository{db: db} }
+func NewRepository(db *sqlite.DB) *Repository { return &Repository{db: db} }
 
-func (r *Repository) Create(ctx context.Context, q postgres.Querier, m *domain.MediaFile) error {
+func (r *Repository) Create(ctx context.Context, q sqlite.Querier, m *domain.MediaFile) error {
 	if q == nil {
-		q = r.db.Pool
+		q = r.db
 	}
 
 	const query = `
@@ -46,7 +45,7 @@ func (r *Repository) Create(ctx context.Context, q postgres.Querier, m *domain.M
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.MediaFile, error) {
 	query := `SELECT ` + mediaColumns + ` FROM media_files WHERE id = $1`
-	return scanMedia(r.db.Pool.QueryRow(ctx, query, id))
+	return scanMedia(r.db.QueryRow(ctx, query, id))
 }
 
 func (r *Repository) List(ctx context.Context, kind string, limit, offset int) ([]domain.MediaFile, int, error) {
@@ -56,7 +55,7 @@ func (r *Repository) List(ctx context.Context, kind string, limit, offset int) (
 
 	countQuery := `SELECT count(*) FROM media_files WHERE ($1 = '' OR kind = $1)`
 	var total int
-	if err := r.db.Pool.QueryRow(ctx, countQuery, kind).Scan(&total); err != nil {
+	if err := r.db.QueryRow(ctx, countQuery, kind).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count media: %w", err)
 	}
 
@@ -66,7 +65,7 @@ func (r *Repository) List(ctx context.Context, kind string, limit, offset int) (
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3`
 
-	rows, err := r.db.Pool.Query(ctx, query, kind, limit, offset)
+	rows, err := r.db.Query(ctx, query, kind, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list media: %w", err)
 	}
@@ -88,7 +87,7 @@ func (r *Repository) List(ctx context.Context, kind string, limit, offset int) (
 // breaking a scheduled send.
 func (r *Repository) Delete(ctx context.Context, id uuid.UUID) (string, error) {
 	var relPath string
-	err := r.db.Pool.QueryRow(ctx,
+	err := r.db.QueryRow(ctx,
 		`DELETE FROM media_files WHERE id = $1 RETURNING relative_path`, id).Scan(&relPath)
 	if err != nil {
 		return "", err
@@ -99,7 +98,7 @@ func (r *Repository) Delete(ctx context.Context, id uuid.UUID) (string, error) {
 // InUse reports how many templates reference the file.
 func (r *Repository) InUse(ctx context.Context, id uuid.UUID) (int, error) {
 	var count int
-	err := r.db.Pool.QueryRow(ctx,
+	err := r.db.QueryRow(ctx,
 		`SELECT count(*) FROM message_templates WHERE media_file_id = $1 AND archived_at IS NULL`,
 		id).Scan(&count)
 	return count, err
@@ -109,10 +108,10 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanMedia(row pgx.Row) (*domain.MediaFile, error) {
+func scanMedia(row rowScanner) (*domain.MediaFile, error) {
 	m, err := scanMediaRow(row)
 	if err != nil {
-		if postgres.IsNoRows(err) {
+		if sqlite.IsNoRows(err) {
 			return nil, nil
 		}
 		return nil, err

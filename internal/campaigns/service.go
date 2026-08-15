@@ -9,12 +9,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/ayran/whatsapp-automation/internal/contacts"
 	"github.com/ayran/whatsapp-automation/internal/domain"
 	"github.com/ayran/whatsapp-automation/internal/scheduler"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/pkg/textnorm"
 	"github.com/ayran/whatsapp-automation/pkg/timex"
 )
@@ -44,7 +43,7 @@ func (s *Service) Repo() *Repository { return s.repo }
 // Only triggers belonging to ACTIVE campaigns are considered, so pausing a
 // campaign immediately stops new entries. Ordering from the query makes the
 // result deterministic when several keywords could match.
-func (s *Service) MatchTrigger(ctx context.Context, q postgres.Querier, messageText string) (*TriggerMatch, error) {
+func (s *Service) MatchTrigger(ctx context.Context, q sqlite.Querier, messageText string) (*TriggerMatch, error) {
 	normalized := textnorm.Normalize(messageText)
 	if normalized == "" {
 		return nil, nil
@@ -65,7 +64,7 @@ func (s *Service) MatchTrigger(ctx context.Context, q postgres.Querier, messageT
 }
 
 // IsUnsubscribe reports whether a message is a stop word for this contact.
-func (s *Service) IsUnsubscribe(ctx context.Context, q postgres.Querier, contactID uuid.UUID, messageText string) (bool, error) {
+func (s *Service) IsUnsubscribe(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, messageText string) (bool, error) {
 	normalized := textnorm.Normalize(messageText)
 	if normalized == "" {
 		return false, nil
@@ -127,7 +126,7 @@ func (s *Service) HandleTrigger(ctx context.Context, contact *domain.Contact, ma
 
 	result := &EnrollResult{}
 
-	err := s.repo.DB().InTx(ctx, func(tx pgx.Tx) error {
+	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
 		campaign, err := s.repo.GetByID(ctx, tx, match.CampaignID)
 		if err != nil {
 			return err
@@ -197,7 +196,7 @@ func (s *Service) HandleTrigger(ctx context.Context, contact *domain.Contact, ma
 }
 
 func (s *Service) applyExistingBehavior(
-	ctx context.Context, tx pgx.Tx,
+	ctx context.Context, tx sqlite.Querier,
 	campaign *domain.Campaign, contact *domain.Contact,
 	existing *domain.Enrollment, match *TriggerMatch,
 	at time.Time, result *EnrollResult,
@@ -256,7 +255,7 @@ func (s *Service) applyExistingBehavior(
 }
 
 // scheduleEnrollment turns the campaign's steps into persisted jobs.
-func (s *Service) scheduleEnrollment(ctx context.Context, tx pgx.Tx, campaign *domain.Campaign, enrollment *domain.Enrollment, at time.Time) (int, error) {
+func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, campaign *domain.Campaign, enrollment *domain.Enrollment, at time.Time) (int, error) {
 	steps, err := s.repo.ListSteps(ctx, tx, campaign.ID)
 	if err != nil {
 		return 0, err
@@ -400,7 +399,7 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*Upda
 
 	result := &UpdateResult{}
 
-	err = s.repo.DB().InTx(ctx, func(tx pgx.Tx) error {
+	err = s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
 		existing, err := s.repo.GetByID(ctx, tx, id)
 		if err != nil {
 			return err
@@ -502,7 +501,7 @@ func (s *Service) Duplicate(ctx context.Context, id uuid.UUID, adminID *uuid.UUI
 	}
 
 	var created *domain.Campaign
-	err = s.repo.DB().InTx(ctx, func(tx pgx.Tx) error {
+	err = s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
 		clone := *src
 		clone.ID = uuid.Nil
 		clone.Status = domain.CampaignDraft
@@ -591,7 +590,7 @@ func (s *Service) AddStep(ctx context.Context, campaignID uuid.UUID, in StepInpu
 		ScheduleKind:  domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent))),
 	}
 
-	err := s.repo.DB().InTx(ctx, func(tx pgx.Tx) error {
+	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
 		if err := s.repo.CreateStep(ctx, tx, step); err != nil {
 			return err
 		}
@@ -623,7 +622,7 @@ func (s *Service) UpdateStep(ctx context.Context, stepID uuid.UUID, in StepInput
 		ScheduleKind:  domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent))),
 	}
 
-	err := s.repo.DB().InTx(ctx, func(tx pgx.Tx) error {
+	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
 		previous, err := s.repo.GetStep(ctx, stepID)
 		if err != nil {
 			return err
@@ -657,7 +656,7 @@ func (s *Service) UpdateStep(ctx context.Context, stepID uuid.UUID, in StepInput
 }
 
 // backfillStep enqueues a newly enabled step for every active enrollment.
-func (s *Service) backfillStep(ctx context.Context, tx pgx.Tx, campaignID uuid.UUID, step *domain.CampaignStep) error {
+func (s *Service) backfillStep(ctx context.Context, tx sqlite.Querier, campaignID uuid.UUID, step *domain.CampaignStep) error {
 	campaign, err := s.repo.GetByID(ctx, tx, campaignID)
 	if err != nil {
 		return err
@@ -710,7 +709,7 @@ func (s *Service) backfillStep(ctx context.Context, tx pgx.Tx, campaignID uuid.U
 }
 
 func (s *Service) DeleteStep(ctx context.Context, stepID uuid.UUID) error {
-	return s.repo.DB().InTx(ctx, func(tx pgx.Tx) error {
+	return s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
 		if _, err := s.jobs.CancelPendingForStep(ctx, tx, stepID, "step deleted"); err != nil {
 			return err
 		}
@@ -829,7 +828,7 @@ func (s *Service) Preview(ctx context.Context, id uuid.UUID) ([]PreviewEntry, er
 // StopForContact ends every active enrollment and cancels pending jobs, used
 // on unsubscribe and on block.
 func (s *Service) StopForContact(ctx context.Context, contactID uuid.UUID, status domain.EnrollmentStatus, reason string) error {
-	return s.repo.DB().InTx(ctx, func(tx pgx.Tx) error {
+	return s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
 		if err := s.repo.StopAllForContact(ctx, tx, contactID, status, reason); err != nil {
 			return err
 		}
@@ -850,7 +849,7 @@ func (s *Service) CompleteFinishedEnrollments(ctx context.Context) (int64, error
 			WHERE sm.enrollment_id = cc.id AND sm.status IN ('PENDING', 'PROCESSING')
 		  )`
 
-	tag, err := s.repo.DB().Pool.Exec(ctx, query)
+	tag, err := s.repo.DB().Exec(ctx, query)
 	if err != nil {
 		return 0, err
 	}

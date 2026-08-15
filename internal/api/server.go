@@ -17,7 +17,7 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/messaging"
 	"github.com/ayran/whatsapp-automation/internal/realtime"
 	"github.com/ayran/whatsapp-automation/internal/scheduler"
-	"github.com/ayran/whatsapp-automation/internal/storage/postgres"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/internal/templates"
 	"github.com/ayran/whatsapp-automation/internal/webhooks"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
@@ -27,7 +27,7 @@ import (
 type Dependencies struct {
 	Config       *config.Config
 	Log          *slog.Logger
-	DB           *postgres.DB
+	DB           *sqlite.DB
 	Auth         *auth.Service
 	Audit        *audit.Logger
 	Contacts     *contacts.Repository

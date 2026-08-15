@@ -12,6 +12,10 @@ seed
 
 # Runtime data
 /storage/
+/data/
+*.db
+*.db-wal
+*.db-shm
 *.log
 
 # Go

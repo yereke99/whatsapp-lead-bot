@@ -200,6 +200,23 @@ func TestParseInteractiveSelectionsAsText(t *testing.T) {
 			}`,
 			want: "Айран/Қаймақ кәсібі бойынша тегін сабаққа қатысқым келеді",
 		},
+		{
+			name: "template button singular type",
+			body: `{
+				"typeWebhook": "incomingMessageReceived",
+				"idMessage": "TPLBTN2",
+				"senderData": {"chatId": "77011234567@c.us"},
+				"messageData": {
+					"typeMessage": "templateButtonReplyMessage",
+					"templateButtonReplyMessage": {
+						"stanzaId": "ORIG4",
+						"selectedId": "free-lesson",
+						"selectedDisplayText": "Айран/Қаймақ кәсібі бойынша тегін сабаққа қатысқым келеді"
+					}
+				}
+			}`,
+			want: "Айран/Қаймақ кәсібі бойынша тегін сабаққа қатысқым келеді",
+		},
 	}
 
 	for _, tc := range cases {

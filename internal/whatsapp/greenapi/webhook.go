@@ -269,7 +269,7 @@ func parseMessageData(md *messageData) *whatsapp.InboundMessage {
 			}
 		}
 
-	case "templateButtonsReplyMessage":
+	case "templateButtonReplyMessage", "templateButtonsReplyMessage":
 		msg.Type = whatsapp.TypeText
 		if md.TemplateButtonReplyMessage != nil {
 			msg.Text = firstNonBlank(md.TemplateButtonReplyMessage.SelectedDisplayText, md.TemplateButtonReplyMessage.SelectedID)

@@ -64,14 +64,19 @@ type Auth struct {
 }
 
 type GreenAPI struct {
-	InstanceID   string
-	Token        string
-	BaseURL      string
-	MediaURL     string
-	WebhookToken string
-	Timeout      time.Duration
+	InstanceID string
+	Token      string
+	BaseURL    string
+	MediaURL   string
+	Timeout    time.Duration
 	// RateInterval is the minimum spacing between two outbound API calls.
 	RateInterval time.Duration
+
+	// ReceiveTimeout is how long the provider holds an inbound poll open
+	// waiting for a notification before answering "nothing".
+	ReceiveTimeout time.Duration
+	// PollInterval is the pause after an empty queue before polling again.
+	PollInterval time.Duration
 }
 
 type Media struct {
@@ -84,17 +89,19 @@ type Media struct {
 }
 
 type Scheduler struct {
-	Enabled          bool
-	Workers          int
-	PollInterval     time.Duration
-	BatchSize        int
-	MaxAttempts      int
-	RetryBaseDelay   time.Duration
-	RetryMaxDelay    time.Duration
-	LockTimeout      time.Duration
-	StaleJobTTL      time.Duration
-	WebhookWorkers   int
-	WebhookBatchSize int
+	Enabled        bool
+	Workers        int
+	PollInterval   time.Duration
+	BatchSize      int
+	MaxAttempts    int
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
+	LockTimeout    time.Duration
+	StaleJobTTL    time.Duration
+	// Inbound provider notifications: how many workers apply them and how
+	// many are claimed per batch.
+	NotificationWorkers   int
+	NotificationBatchSize int
 }
 
 // Load reads configuration from the environment, applying defaults and
@@ -146,9 +153,11 @@ func Load() (*Config, error) {
 			Token:        envStr("GREEN_API_TOKEN", ""),
 			BaseURL:      strings.TrimRight(envStr("GREEN_API_URL", "https://api.green-api.com"), "/"),
 			MediaURL:     strings.TrimRight(envStr("GREEN_API_MEDIA_URL", "https://media.green-api.com"), "/"),
-			WebhookToken: envStr("GREEN_API_WEBHOOK_TOKEN", ""),
 			Timeout:      envDuration("GREEN_API_TIMEOUT", 45*time.Second),
 			RateInterval: envDuration("GREEN_API_RATE_INTERVAL", 1100*time.Millisecond),
+
+			ReceiveTimeout: envDuration("GREEN_API_RECEIVE_TIMEOUT", 20*time.Second),
+			PollInterval:   time.Duration(envInt("GREEN_API_POLL_INTERVAL_MS", 1000)) * time.Millisecond,
 		},
 		Media: Media{
 			StoragePath:  envStr("MEDIA_STORAGE_PATH", "./storage/media"),
@@ -159,17 +168,17 @@ func Load() (*Config, error) {
 			VoiceBitrate: envStr("VOICE_BITRATE", "32k"),
 		},
 		Scheduler: Scheduler{
-			Enabled:          envBool("SCHEDULER_ENABLED", true),
-			Workers:          envInt("SCHEDULER_WORKERS", 4),
-			PollInterval:     envDuration("SCHEDULER_POLL_INTERVAL", 5*time.Second),
-			BatchSize:        envInt("SCHEDULER_BATCH_SIZE", 25),
-			MaxAttempts:      envInt("SCHEDULER_MAX_ATTEMPTS", 5),
-			RetryBaseDelay:   envDuration("SCHEDULER_RETRY_BASE_DELAY", 30*time.Second),
-			RetryMaxDelay:    envDuration("SCHEDULER_RETRY_MAX_DELAY", 30*time.Minute),
-			LockTimeout:      envDuration("SCHEDULER_LOCK_TIMEOUT", 5*time.Minute),
-			StaleJobTTL:      envDuration("SCHEDULER_STALE_JOB_TTL", 2*time.Hour),
-			WebhookWorkers:   envInt("WEBHOOK_WORKERS", 2),
-			WebhookBatchSize: envInt("WEBHOOK_BATCH_SIZE", 50),
+			Enabled:               envBool("SCHEDULER_ENABLED", true),
+			Workers:               envInt("SCHEDULER_WORKERS", 4),
+			PollInterval:          envDuration("SCHEDULER_POLL_INTERVAL", 5*time.Second),
+			BatchSize:             envInt("SCHEDULER_BATCH_SIZE", 25),
+			MaxAttempts:           envInt("SCHEDULER_MAX_ATTEMPTS", 5),
+			RetryBaseDelay:        envDuration("SCHEDULER_RETRY_BASE_DELAY", 30*time.Second),
+			RetryMaxDelay:         envDuration("SCHEDULER_RETRY_MAX_DELAY", 30*time.Minute),
+			LockTimeout:           envDuration("SCHEDULER_LOCK_TIMEOUT", 5*time.Minute),
+			StaleJobTTL:           envDuration("SCHEDULER_STALE_JOB_TTL", 2*time.Hour),
+			NotificationWorkers:   envInt("GREEN_API_WORKERS", 5),
+			NotificationBatchSize: envInt("GREEN_API_BATCH_SIZE", 50),
 		},
 	}
 
@@ -202,6 +211,17 @@ func (c *Config) validate() error {
 	}
 	if c.Media.MaxUploadMB < 1 {
 		problems = append(problems, "MEDIA_MAX_UPLOAD_MB must be at least 1")
+	}
+	if c.Scheduler.NotificationWorkers < 1 {
+		problems = append(problems, "GREEN_API_WORKERS must be at least 1")
+	}
+	// Inbound polling holds the connection open for ReceiveTimeout. A client
+	// timeout below that aborts every poll before the provider can answer,
+	// which looks exactly like the provider being down.
+	if c.GreenAPI.Timeout <= c.GreenAPI.ReceiveTimeout {
+		problems = append(problems, fmt.Sprintf(
+			"GREEN_API_TIMEOUT (%s) must be greater than GREEN_API_RECEIVE_TIMEOUT (%s)",
+			c.GreenAPI.Timeout, c.GreenAPI.ReceiveTimeout))
 	}
 	if c.IsProduction() && !c.Auth.SecureCookies {
 		problems = append(problems, "SECURE_COOKIES must be true when APP_ENV=production")

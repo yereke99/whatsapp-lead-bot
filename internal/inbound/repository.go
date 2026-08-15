@@ -1,7 +1,7 @@
-// Package webhooks ingests provider notifications, guarantees each one is
+// Package inbound ingests provider notifications, guarantees each one is
 // processed exactly once, and drives the inbound side of the automation:
 // contact creation, conversation history, trigger detection and unsubscribes.
-package webhooks
+package inbound
 
 import (
 	"context"

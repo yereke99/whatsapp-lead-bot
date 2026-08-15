@@ -13,38 +13,35 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/contacts"
 	"github.com/ayran/whatsapp-automation/internal/conversations"
 	"github.com/ayran/whatsapp-automation/internal/exports"
+	"github.com/ayran/whatsapp-automation/internal/inbound"
 	"github.com/ayran/whatsapp-automation/internal/media"
 	"github.com/ayran/whatsapp-automation/internal/messaging"
-	"github.com/ayran/whatsapp-automation/internal/realtime"
 	"github.com/ayran/whatsapp-automation/internal/scheduler"
 	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/internal/templates"
-	"github.com/ayran/whatsapp-automation/internal/webhooks"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
 )
 
 // Dependencies collects everything the handlers need.
 type Dependencies struct {
-	Config       *config.Config
-	Log          *slog.Logger
-	DB           *sqlite.DB
-	Auth         *auth.Service
-	Audit        *audit.Logger
-	Contacts     *contacts.Repository
-	Messages     *conversations.Repository
-	Campaigns    *campaigns.Service
-	Templates    *templates.Service
-	TemplateRepo *templates.Repository
-	Media        *media.Service
-	Jobs         *scheduler.Repository
-	Sender       *messaging.Sender
-	Webhooks     *webhooks.Processor
-	WebhookRepo  *webhooks.Repository
-	Enricher     *webhooks.Enricher
-	Analytics    *analytics.Service
-	Exports      *exports.Service
-	Hub          *realtime.Hub
-	Provider     *greenapi.Client
+	Config           *config.Config
+	Log              *slog.Logger
+	DB               *sqlite.DB
+	Auth             *auth.Service
+	Audit            *audit.Logger
+	Contacts         *contacts.Repository
+	Messages         *conversations.Repository
+	Campaigns        *campaigns.Service
+	Templates        *templates.Service
+	TemplateRepo     *templates.Repository
+	Media            *media.Service
+	Jobs             *scheduler.Repository
+	Sender           *messaging.Sender
+	Notifications    *inbound.Processor
+	NotificationRepo *inbound.Repository
+	Analytics        *analytics.Service
+	Exports          *exports.Service
+	Provider         *greenapi.Client
 }
 
 // Server owns the HTTP router.
@@ -80,9 +77,6 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) routes() {
 	// ---- public -----------------------------------------------------------
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
-	s.mux.HandleFunc("POST /api/webhooks/greenapi", s.handleGreenAPIWebhook)
-	// Green API sends a GET probe when the webhook url is saved.
-	s.mux.HandleFunc("GET /api/webhooks/greenapi", s.handleWebhookProbe)
 
 	s.mux.Handle("POST /api/auth/login", s.rateLimitLogin(http.HandlerFunc(s.handleLogin)))
 	s.mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
@@ -105,16 +99,10 @@ func (s *Server) routes() {
 	protected.HandleFunc("PUT /api/contacts/{id}", s.handleUpdateContact)
 	protected.HandleFunc("DELETE /api/contacts/{id}", s.handleDeleteContact)
 	protected.HandleFunc("GET /api/contacts/{id}/messages", s.handleContactMessages)
-	protected.HandleFunc("POST /api/contacts/{id}/send", s.handleSendMessage)
-	protected.HandleFunc("POST /api/contacts/{id}/read", s.handleMarkRead)
 	protected.HandleFunc("POST /api/contacts/{id}/block", s.handleBlockContact)
 	protected.HandleFunc("POST /api/contacts/{id}/unsubscribe", s.handleUnsubscribeContact)
-	protected.HandleFunc("POST /api/contacts/{id}/refresh-profile", s.handleRefreshProfile)
 	protected.HandleFunc("POST /api/contacts/bulk", s.handleBulkAction)
 	protected.HandleFunc("GET /api/tags", s.handleListTags)
-
-	protected.HandleFunc("GET /api/chats", s.handleChatList)
-	protected.HandleFunc("GET /api/stream", s.handleEventStream)
 
 	protected.HandleFunc("GET /api/campaigns", s.handleListCampaigns)
 	protected.HandleFunc("POST /api/campaigns", s.handleCreateCampaign)

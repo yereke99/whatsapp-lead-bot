@@ -184,10 +184,6 @@ export async function renderContacts(root, { navigate }) {
       el('td', { 'data-label': 'Белсенділік' }, relativeTime(contact.last_activity_at)),
       el('td', { 'data-label': 'Тіркелген' }, formatDateTime(contact.created_at)),
       el('td', { class: 'table__actions' },
-        button('', {
-          iconName: 'chat', size: 'sm', title: 'Чатты ашу',
-          onClick: (event) => { event.stopPropagation(); navigate('/chats'); },
-        }),
         button('', { iconName: 'eye', size: 'sm', title: 'Ашу', onClick: open })),
     );
   }

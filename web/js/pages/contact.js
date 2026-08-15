@@ -40,7 +40,6 @@ export async function renderContactDetail(root, { params, navigate }) {
           contact.opted_out ? badge('Жазылымнан шықты', 'warn') : null,
           contact.blocked_at ? badge('Бұғатталған', 'danger') : null))),
     el('div', { class: 'page-head__actions' },
-      button('Чат', { iconName: 'chat', variant: 'primary', onClick: () => navigate('/chats') }),
       button('Өңдеу', { iconName: 'edit', onClick: openEditor }),
       button(contact.opted_out ? 'Жазылымды қалпына келтіру' : 'Жазылымнан шығару', {
         onClick: toggleSubscription,
@@ -125,7 +124,6 @@ export async function renderContactDetail(root, { params, navigate }) {
   const conversationCard = card('Хабарламалар тарихы', {
     subtitle: `${messages.length} хабарлама`,
     flush: true,
-    actions: button('Чатты ашу', { size: 'sm', iconName: 'chat', onClick: () => navigate('/chats') }),
     body: messages.length === 0
       ? el('div', { class: 'card__body' }, emptyState('Хабарлама жоқ', 'Бұл байланыспен әлі сөйлесу болмаған.'))
       : thread,

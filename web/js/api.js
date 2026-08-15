@@ -154,15 +154,9 @@ export const api = {
   updateContact: (id, body) => put(`/api/contacts/${id}`, body),
   deleteContact: (id) => del(`/api/contacts/${id}`),
   contactMessages: (id, query) => get(`/api/contacts/${id}/messages`, query),
-  sendMessage: (id, body) => post(`/api/contacts/${id}/send`, body),
-  markRead: (id) => post(`/api/contacts/${id}/read`),
   blockContact: (id, blocked) => post(`/api/contacts/${id}/block`, { blocked }),
   unsubscribeContact: (id, opted_out) => post(`/api/contacts/${id}/unsubscribe`, { opted_out }),
-  refreshProfile: (id) => post(`/api/contacts/${id}/refresh-profile`),
   bulkAction: (body) => post('/api/contacts/bulk', body),
-
-  // chats
-  chats: (query) => get('/api/chats', query),
 
   // campaigns
   campaigns: (query) => get('/api/campaigns', query),

@@ -11,7 +11,7 @@ export async function renderSettings(root) {
     { id: 'system', label: 'Жүйе' },
     { id: 'admins', label: 'Әкімшілер' },
     { id: 'audit', label: 'Аудит журналы' },
-    { id: 'webhooks', label: 'Webhook оқиғалары' },
+    { id: 'webhooks', label: 'Кіріс оқиғалар' },
     { id: 'account', label: 'Менің тіркелгім' },
   ];
 
@@ -87,17 +87,17 @@ async function renderSystem(panel) {
                 icon('alert', 16),
                 el('div', {},
                   el('div', { class: 'alert__title' }, 'Баптау қажет'),
-                  el('div', {}, 'GREEN_API_INSTANCE_ID, GREEN_API_TOKEN және GREEN_API_WEBHOOK_TOKEN ' +
+                  el('div', {}, 'GREEN_API_INSTANCE_ID және GREEN_API_TOKEN ' +
                     'айнымалыларын енгізіп, серверді қайта іске қосыңыз.')))
             : null,
           el('div', { class: 'alert alert--info mt-3' },
             icon('link', 16),
             el('div', {},
-              el('div', { class: 'alert__title' }, 'Webhook мекенжайы'),
-              el('div', { class: 'mono', style: { wordBreak: 'break-all' } },
-                `${window.location.origin}/api/webhooks/greenapi`),
-              el('div', { class: 'small mt-2' },
-                'Green API кабинетінде осы мекенжайды көрсетіңіз және webhook токенін қосыңыз.')))),
+              el('div', { class: 'alert__title' }, 'Кіріс хабарламалар'),
+              el('div', { class: 'small' },
+                'Хабарламалар Green API кезегінен тікелей оқылады. ' +
+                'Webhook мекенжайын көрсетудің қажеті жоқ — сервердің сыртқы ' +
+                'мекенжайы болмаса да жүйе жұмыс істейді.')))),
       }),
       card('Жүйе параметрлері', {
         body: el('dl', { class: 'kv' },
@@ -350,7 +350,7 @@ async function renderWebhooks(panel) {
       if (!events || events.length === 0) {
         mount(tableBody, el('tr', {}, el('td', { colspan: '5' },
           emptyState('Оқиға жоқ',
-            'Green API webhook жібергенде оқиғалар осында тіркеледі. ' +
+            'Green API кезегінен оқылған оқиғалар осында тіркеледі. ' +
             'Қайталанған оқиғалар автоматты түрде еленбейді.'))));
         return;
       }

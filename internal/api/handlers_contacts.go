@@ -271,37 +271,6 @@ func (s *Server) handleUnsubscribeContact(w http.ResponseWriter, r *http.Request
 	httpx.JSON(w, http.StatusOK, map[string]bool{"opted_out": req.OptedOut})
 }
 
-func (s *Server) handleRefreshProfile(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWriter(w, r) {
-		return
-	}
-
-	id, err := httpx.PathUUID(r, "id")
-	if err != nil {
-		httpx.Fail(w, http.StatusBadRequest, httpx.CodeBadRequest, err.Error())
-		return
-	}
-
-	contact, err := s.deps.Contacts.GetByID(r.Context(), id)
-	if err != nil {
-		httpx.Internal(w, s.log, err, "get contact")
-		return
-	}
-	if contact == nil {
-		httpx.Fail(w, http.StatusNotFound, httpx.CodeNotFound, "Байланыс табылмады")
-		return
-	}
-
-	avatarURL, err := s.deps.Enricher.RefreshContactProfile(r.Context(), contact)
-	if err != nil {
-		httpx.Fail(w, http.StatusBadGateway, httpx.CodeUnavailable,
-			"Профильді жаңарту мүмкін болмады: "+err.Error())
-		return
-	}
-
-	httpx.JSON(w, http.StatusOK, map[string]string{"avatar_url": avatarURL})
-}
-
 // ------------------------------------------------------------ bulk actions --
 
 type bulkRequest struct {
@@ -313,8 +282,8 @@ type bulkRequest struct {
 
 // handleBulkAction applies an administrative action to many contacts.
 //
-// Bulk messaging is intentionally absent: the only outbound paths are campaign
-// automation and a one-to-one manual reply, both of which enforce consent.
+// Bulk messaging is intentionally absent: the platform's only outbound path is
+// campaign automation, which enforces consent on every send.
 func (s *Server) handleBulkAction(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWriter(w, r) {
 		return

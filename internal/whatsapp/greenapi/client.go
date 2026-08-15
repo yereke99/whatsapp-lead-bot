@@ -463,7 +463,15 @@ func (c *Client) do(ctx context.Context, method, url, contentType string, body [
 	if err := c.limiter.wait(ctx); err != nil {
 		return nil, &whatsapp.Error{Provider: providerName, Op: op, Retryable: true, Err: err}
 	}
+	return c.doRequest(ctx, method, url, contentType, body, op)
+}
 
+// doRequest performs the call without consuming a rate limiter slot.
+//
+// The limiter exists to pace *sending*, which is what Green API throttles.
+// Queue polling runs continuously and must not spend that budget, or every
+// campaign message would queue up behind the poller's own requests.
+func (c *Client) doRequest(ctx context.Context, method, url, contentType string, body []byte, op string) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)

@@ -4,12 +4,10 @@ import { api, ApiError, onUnauthorized } from './api.js';
 import { el, mount, clear, icon, button, notify } from './ui.js';
 import {
   state, on, emit, loadSession, loadSettings, clearSession,
-  connectStream, refreshUnread,
 } from './store.js';
 
 import { renderLogin } from './pages/login.js';
 import { renderDashboard } from './pages/dashboard.js';
-import { renderChats } from './pages/chats.js';
 import { renderContacts } from './pages/contacts.js';
 import { renderContactDetail } from './pages/contact.js';
 import { renderCampaigns } from './pages/campaigns.js';
@@ -22,7 +20,6 @@ import { renderSettings } from './pages/settings.js';
 const NAV = [
   { section: 'Негізгі' },
   { path: '/', label: 'Басты бет', icon: 'dashboard', render: renderDashboard, title: 'Басты бет' },
-  { path: '/chats', label: 'Чаттар', icon: 'chat', render: renderChats, title: 'Чаттар', badge: 'unread', flush: true },
   { path: '/contacts', label: 'Клиенттер', icon: 'contacts', render: renderContacts, title: 'Клиенттер' },
 
   { section: 'Автоматтандыру' },
@@ -104,7 +101,6 @@ function renderShell() {
     el('button', { class: 'burger', 'aria-label': 'Мәзір', onClick: toggleSidebar }, icon('menu', 18)),
     el('div', { class: 'topbar__title', id: 'page-title' }, ''),
     el('div', { class: 'topbar__spacer' }),
-    el('div', { id: 'stream-indicator', class: 'row small subtle' }),
   );
 
   const main = el('main', { class: 'main' },
@@ -116,7 +112,6 @@ function renderShell() {
   root.classList.remove('app-loading');
 
   renderNav();
-  renderStreamIndicator(state.streamConnected);
 }
 
 function renderNav() {
@@ -140,28 +135,10 @@ function renderNav() {
       'data-link': '',
     }, icon(item.icon, 17), el('span', { class: 'truncate' }, item.label));
 
-    if (item.badge === 'unread' && state.unreadTotal > 0) {
-      link.append(el('span', { class: 'nav-link__badge' }, String(state.unreadTotal)));
-    }
 
     link.addEventListener('click', closeSidebar);
     nav.append(link);
   }
-}
-
-function renderStreamIndicator(connected) {
-  const holder = document.getElementById('stream-indicator');
-  if (!holder) return;
-
-  clear(holder);
-  holder.append(
-    el('span', {
-      class: 'stat__dot',
-      style: { background: connected ? 'var(--success)' : 'var(--text-subtle)' },
-      title: connected ? 'Нақты уақыттағы байланыс белсенді' : 'Байланыс жоқ',
-    }),
-    el('span', { class: 'nowrap' }, connected ? 'Онлайн' : 'Офлайн'),
-  );
 }
 
 function toggleSidebar() {
@@ -273,19 +250,8 @@ async function handleLogout() {
 
 async function bootAuthenticated() {
   await loadSettings();
-  connectStream();
-  await refreshUnread();
   renderShell();
 }
-
-on('stream:status', renderStreamIndicator);
-on('unread', renderNav);
-
-// Any inbound message anywhere refreshes the sidebar badge, so the operator
-// notices a new conversation without being on the chats page.
-on('chat.updated', () => {
-  if (window.location.pathname !== '/chats') refreshUnread();
-});
 
 onUnauthorized(() => {
   if (!state.admin) return;

@@ -104,13 +104,24 @@ type messageData struct {
 // ParseWebhook converts a raw Green API notification body into the neutral
 // event shape. It never returns a partially populated event: either the
 // payload is understood, or an error explains why it was rejected.
+// ParseError marks a payload that cannot be understood.
+//
+// It is distinguishable from a transient failure on purpose: a caller draining
+// a provider queue must be able to tell "this will never parse, drop it" from
+// "try again later". Retrying a malformed payload forever would block every
+// message queued behind it.
+type ParseError struct{ Err error }
+
+func (e *ParseError) Error() string { return e.Err.Error() }
+func (e *ParseError) Unwrap() error { return e.Err }
+
 func ParseWebhook(body []byte) (*whatsapp.Event, error) {
 	var payload webhookPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("decode webhook payload: %w", err)
+		return nil, &ParseError{Err: fmt.Errorf("decode webhook payload: %w", err)}
 	}
 	if strings.TrimSpace(payload.TypeWebhook) == "" {
-		return nil, fmt.Errorf("webhook payload has no typeWebhook field")
+		return nil, &ParseError{Err: fmt.Errorf("webhook payload has no typeWebhook field")}
 	}
 
 	event := &whatsapp.Event{

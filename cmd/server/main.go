@@ -1,5 +1,6 @@
 // Command server runs the WhatsApp campaign automation platform: the REST
-// API, the admin dashboard, the webhook receiver and the background workers.
+// API, the admin dashboard, the provider notification poller and the
+// background workers.
 package main
 
 import (
@@ -23,14 +24,13 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/contacts"
 	"github.com/ayran/whatsapp-automation/internal/conversations"
 	"github.com/ayran/whatsapp-automation/internal/exports"
+	"github.com/ayran/whatsapp-automation/internal/inbound"
 	"github.com/ayran/whatsapp-automation/internal/logging"
 	"github.com/ayran/whatsapp-automation/internal/media"
 	"github.com/ayran/whatsapp-automation/internal/messaging"
-	"github.com/ayran/whatsapp-automation/internal/realtime"
 	"github.com/ayran/whatsapp-automation/internal/scheduler"
 	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/internal/templates"
-	"github.com/ayran/whatsapp-automation/internal/webhooks"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
 	"github.com/ayran/whatsapp-automation/migrations"
 )
@@ -87,15 +87,9 @@ func run() error {
 			slog.String("configured_path", cfg.Media.FFmpegPath))
 	}
 
-	hub := realtime.NewHub(log)
-	defer hub.Close()
-
 	provider := greenapi.New(cfg.GreenAPI, log)
 	if !provider.Configured() {
 		log.Warn("green api credentials are not set: inbound and outbound messaging is disabled")
-	}
-	if cfg.GreenAPI.WebhookToken == "" {
-		log.Warn("GREEN_API_WEBHOOK_TOKEN is empty: the webhook endpoint accepts unauthenticated posts")
 	}
 
 	// ---- repositories -----------------------------------------------------
@@ -107,7 +101,7 @@ func run() error {
 	campaignRepo := campaigns.NewRepository(db)
 	jobRepo := scheduler.NewRepository(db)
 	mediaRepo := media.NewRepository(db)
-	webhookRepo := webhooks.NewRepository(db)
+	notificationRepo := inbound.NewRepository(db)
 
 	// ---- services ---------------------------------------------------------
 
@@ -116,16 +110,16 @@ func run() error {
 	mediaSvc := media.NewService(mediaStore, mediaRepo, transcoder, log)
 	templateSvc := templates.NewService(templateRepo, mediaSvc)
 	campaignSvc := campaigns.NewService(campaignRepo, jobRepo, contactRepo, log)
-	sender := messaging.NewSender(provider, messageRepo, contactRepo, mediaStore, hub, log)
+	sender := messaging.NewSender(provider, messageRepo, contactRepo, mediaStore, log)
 	analyticsSvc := analytics.NewService(db)
 	exportSvc := exports.NewService(contactRepo)
 
-	webhookProcessor := webhooks.NewProcessor(cfg.Scheduler, webhookRepo, contactRepo,
-		messageRepo, campaignSvc, templateRepo, sender, mediaStore, hub, log)
-	enricher := webhooks.NewEnricher(provider, messageRepo, contactRepo, mediaSvc, hub, log)
+	notifications := inbound.NewProcessor(cfg.Scheduler, notificationRepo, contactRepo,
+		messageRepo, campaignSvc, templateRepo, sender, mediaStore, log)
+	receiver := inbound.NewReceiver(provider, notifications, cfg.GreenAPI, log)
 
 	worker := scheduler.NewWorker(cfg.Scheduler, jobRepo, templateRepo, contactRepo,
-		sender, mediaStore, hub, log)
+		sender, mediaStore, log)
 
 	if err := authSvc.EnsureBootstrapAdmin(ctx); err != nil {
 		return fmt.Errorf("bootstrap administrator: %w", err)
@@ -133,9 +127,22 @@ func run() error {
 
 	// ---- background work --------------------------------------------------
 
+	var receiverDone chan struct{}
+
 	authSvc.StartMaintenance(ctx)
-	webhookProcessor.Start(ctx)
-	enricher.Start(ctx)
+	notifications.Start(ctx)
+
+	// Inbound messages are pulled from the provider's queue; without
+	// credentials there is nothing to poll, and the panel stays usable.
+	if cfg.WhatsAppConfigured() {
+		receiverDone = make(chan struct{})
+		go func() {
+			defer close(receiverDone)
+			receiver.Run(ctx)
+		}()
+	} else {
+		log.Warn("green api is not configured: inbound polling is disabled")
+	}
 
 	if cfg.Scheduler.Enabled {
 		worker.Start(ctx)
@@ -148,26 +155,24 @@ func run() error {
 	// ---- http -------------------------------------------------------------
 
 	server := api.NewServer(api.Dependencies{
-		Config:       cfg,
-		Log:          log,
-		DB:           db,
-		Auth:         authSvc,
-		Audit:        auditLog,
-		Contacts:     contactRepo,
-		Messages:     messageRepo,
-		Campaigns:    campaignSvc,
-		Templates:    templateSvc,
-		TemplateRepo: templateRepo,
-		Media:        mediaSvc,
-		Jobs:         jobRepo,
-		Sender:       sender,
-		Webhooks:     webhookProcessor,
-		WebhookRepo:  webhookRepo,
-		Enricher:     enricher,
-		Analytics:    analyticsSvc,
-		Exports:      exportSvc,
-		Hub:          hub,
-		Provider:     provider,
+		Config:           cfg,
+		Log:              log,
+		DB:               db,
+		Auth:             authSvc,
+		Audit:            auditLog,
+		Contacts:         contactRepo,
+		Messages:         messageRepo,
+		Campaigns:        campaignSvc,
+		Templates:        templateSvc,
+		TemplateRepo:     templateRepo,
+		Media:            mediaSvc,
+		Jobs:             jobRepo,
+		Sender:           sender,
+		Notifications:    notifications,
+		NotificationRepo: notificationRepo,
+		Analytics:        analyticsSvc,
+		Exports:          exportSvc,
+		Provider:         provider,
 	})
 
 	httpServer := &http.Server{
@@ -177,9 +182,9 @@ func run() error {
 		IdleTimeout: cfg.HTTP.IdleTimeout,
 		ErrorLog:    slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 		BaseContext: func(net.Listener) context.Context { return ctx },
-		// WriteTimeout is deliberately unset: the Server-Sent Events stream is
-		// a long-lived response and any write deadline would sever it.
-		// Per-handler timeouts bound the ordinary requests instead.
+		// WriteTimeout stays unset: media downloads stream large files and a
+		// blanket deadline would truncate them. Per-handler timeouts bound the
+		// ordinary requests instead.
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
@@ -212,8 +217,10 @@ func run() error {
 	done := make(chan struct{})
 	go func() {
 		worker.Wait()
-		webhookProcessor.Wait()
-		enricher.Wait()
+		notifications.Wait()
+		if receiverDone != nil {
+			<-receiverDone
+		}
 		close(done)
 	}()
 

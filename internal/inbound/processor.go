@@ -1,4 +1,4 @@
-package webhooks
+package inbound
 
 import (
 	"context"
@@ -18,7 +18,6 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/domain"
 	"github.com/ayran/whatsapp-automation/internal/media"
 	"github.com/ayran/whatsapp-automation/internal/messaging"
-	"github.com/ayran/whatsapp-automation/internal/realtime"
 	"github.com/ayran/whatsapp-automation/internal/templates"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
@@ -28,7 +27,8 @@ import (
 	"github.com/ayran/whatsapp-automation/pkg/timex"
 )
 
-// Processor drains the webhook queue and applies each event to the domain.
+// Processor drains the stored notification queue and applies each event to
+// the domain.
 type Processor struct {
 	cfg       config.Scheduler
 	repo      *Repository
@@ -38,7 +38,6 @@ type Processor struct {
 	templates *templates.Repository
 	sender    *messaging.Sender
 	media     *media.Store
-	hub       *realtime.Hub
 	log       *slog.Logger
 
 	wg   sync.WaitGroup
@@ -54,7 +53,6 @@ func NewProcessor(
 	templateRepo *templates.Repository,
 	sender *messaging.Sender,
 	mediaStore *media.Store,
-	hub *realtime.Hub,
 	log *slog.Logger,
 ) *Processor {
 	return &Processor{
@@ -66,17 +64,16 @@ func NewProcessor(
 		templates: templateRepo,
 		sender:    sender,
 		media:     mediaStore,
-		hub:       hub,
-		log:       log.With(slog.String("component", "webhooks")),
+		log:       log.With(slog.String("component", "notifications")),
 	}
 }
 
 // Ingest stores a raw notification and returns whether it was new.
 //
-// The HTTP handler does nothing else: parsing, contact creation and campaign
-// enrollment all happen on the background workers. A provider that times out
-// waiting for us would retry and amplify load exactly when the system is
-// already struggling, so the request path stays as short as a single insert.
+// It does nothing else: parsing, contact creation and campaign enrollment all
+// happen on the background workers. Keeping this to a single insert is what
+// lets the poller acknowledge a notification immediately and move on, instead
+// of holding the provider's queue open for the length of a campaign enrollment.
 func (p *Processor) Ingest(ctx context.Context, body []byte) (accepted bool, err error) {
 	event, err := greenapi.ParseWebhook(body)
 	if err != nil {
@@ -90,13 +87,13 @@ func (p *Processor) Ingest(ctx context.Context, body []byte) (accepted bool, err
 	}
 
 	if !inserted {
-		p.log.Debug("duplicate webhook ignored",
+		p.log.Debug("duplicate notification ignored",
 			slog.String("type", event.RawType),
 			slog.String("dedupe_key", event.DedupeKey))
 		return false, nil
 	}
 
-	p.log.Info("webhook received",
+	p.log.Info("notification stored",
 		slog.String("type", event.RawType),
 		slog.String("external_id", event.ExternalID))
 	return true, nil
@@ -108,10 +105,10 @@ func (p *Processor) Start(ctx context.Context) {
 		if released, err := p.repo.ReleaseStale(ctx, 5*time.Minute); err != nil {
 			p.log.Error("startup recovery failed", slog.String("error", err.Error()))
 		} else if released > 0 {
-			p.log.Warn("requeued webhook events from a previous run", slog.Int64("count", released))
+			p.log.Warn("requeued notifications from a previous run", slog.Int64("count", released))
 		}
 
-		workers := p.cfg.WebhookWorkers
+		workers := p.cfg.NotificationWorkers
 		if workers < 1 {
 			workers = 1
 		}
@@ -124,7 +121,7 @@ func (p *Processor) Start(ctx context.Context) {
 		p.wg.Add(1)
 		go p.maintenanceLoop(ctx)
 
-		p.log.Info("webhook processor started", slog.Int("workers", workers))
+		p.log.Info("notification processor started", slog.Int("workers", workers))
 	})
 }
 
@@ -133,7 +130,7 @@ func (p *Processor) Wait() { p.wg.Wait() }
 func (p *Processor) loop(ctx context.Context) {
 	defer p.wg.Done()
 
-	// Webhooks are latency-sensitive: a customer's trigger should start their
+	// Inbound events are latency-sensitive: a customer's trigger should start their
 	// automation within a second or two, not on a five-second tick.
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -154,9 +151,9 @@ func (p *Processor) drain(ctx context.Context) {
 			return
 		}
 
-		events, err := p.repo.Claim(ctx, p.cfg.WebhookBatchSize)
+		events, err := p.repo.Claim(ctx, p.cfg.NotificationBatchSize)
 		if err != nil {
-			p.log.Error("claiming webhook events failed", slog.String("error", err.Error()))
+			p.log.Error("claiming notifications failed", slog.String("error", err.Error()))
 			return
 		}
 		if len(events) == 0 {
@@ -184,13 +181,13 @@ func (p *Processor) maintenanceLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if _, err := p.repo.ReleaseStale(ctx, 5*time.Minute); err != nil {
-				p.log.Error("releasing stale webhook events failed", slog.String("error", err.Error()))
+				p.log.Error("releasing stale notifications failed", slog.String("error", err.Error()))
 			}
 			// Keep two weeks of processed events for debugging, then drop them.
 			if pruned, err := p.repo.Prune(ctx, 14*24*time.Hour); err != nil {
-				p.log.Error("pruning webhook events failed", slog.String("error", err.Error()))
+				p.log.Error("pruning notifications failed", slog.String("error", err.Error()))
 			} else if pruned > 0 {
-				p.log.Info("pruned old webhook events", slog.Int64("count", pruned))
+				p.log.Info("pruned old notifications", slog.Int64("count", pruned))
 			}
 		}
 	}
@@ -213,7 +210,7 @@ func (p *Processor) handle(ctx context.Context, stored StoredEvent) {
 	}
 
 	if stored.Attempts >= maxWebhookAttempts {
-		p.log.Error("webhook event failed permanently",
+		p.log.Error("notification failed permanently",
 			slog.String("type", event.RawType),
 			slog.Int("attempts", stored.Attempts),
 			slog.String("error", handlerErr.Error()))
@@ -221,18 +218,18 @@ func (p *Processor) handle(ctx context.Context, stored StoredEvent) {
 		return
 	}
 
-	p.log.Warn("webhook event will be retried",
+	p.log.Warn("notification will be retried",
 		slog.String("type", event.RawType),
 		slog.Int("attempts", stored.Attempts),
 		slog.String("error", handlerErr.Error()))
 	if err := p.repo.Requeue(ctx, stored.ID, handlerErr.Error()); err != nil {
-		p.log.Error("requeueing webhook event failed", slog.String("error", err.Error()))
+		p.log.Error("requeueing notification failed", slog.String("error", err.Error()))
 	}
 }
 
 func (p *Processor) finish(ctx context.Context, id uuid.UUID, status domain.WebhookEventStatus, errText string) {
 	if err := p.repo.MarkProcessed(ctx, id, status, errText); err != nil {
-		p.log.Error("recording webhook outcome failed", slog.String("error", err.Error()))
+		p.log.Error("recording notification outcome failed", slog.String("error", err.Error()))
 	}
 }
 
@@ -246,12 +243,6 @@ func (p *Processor) apply(ctx context.Context, event *whatsapp.Event) error {
 		return p.handleStatus(ctx, event)
 	case whatsapp.EventStateChanged:
 		p.log.Info("provider state changed", slog.String("state", event.State))
-		if p.hub != nil {
-			p.hub.Publish(realtime.Event{
-				Type: realtime.EventProviderState,
-				Data: map[string]any{"state": event.State},
-			})
-		}
 		return nil
 	case whatsapp.EventIncomingCall:
 		p.log.Info("incoming call ignored", slog.String("from", event.ChatID))
@@ -325,8 +316,6 @@ func (p *Processor) handleIncoming(ctx context.Context, event *whatsapp.Event) e
 		p.log.Warn("updating contact activity failed", slog.String("error", err.Error()))
 	}
 
-	p.publishInbound(contact, message, preview)
-
 	// Only text carries intent the automation can act on.
 	if event.Message.Type != whatsapp.TypeText || strings.TrimSpace(event.Message.Text) == "" {
 		return nil
@@ -365,13 +354,6 @@ func (p *Processor) handleUnsubscribe(ctx context.Context, contact *domain.Conta
 		slog.String("contact_id", contact.ID.String()),
 		slog.String("phone", contact.Phone))
 
-	if p.hub != nil {
-		p.hub.Publish(realtime.Event{
-			Type:      realtime.EventContactUpdated,
-			ContactID: contact.ID.String(),
-			Data:      map[string]any{"opted_out": true, "status": domain.ContactUnsubscribed},
-		})
-	}
 	return true, nil
 }
 
@@ -399,16 +381,6 @@ func (p *Processor) handleTrigger(ctx context.Context, contact *domain.Contact, 
 		}
 	}
 
-	if p.hub != nil {
-		p.hub.Publish(realtime.Event{
-			Type:      realtime.EventContactUpdated,
-			ContactID: contact.ID.String(),
-			Data: map[string]any{
-				"action":   string(result.Action),
-				"campaign": match.CampaignName,
-			},
-		})
-	}
 	return nil
 }
 
@@ -523,15 +495,6 @@ func (p *Processor) handleOutgoingEcho(ctx context.Context, event *whatsapp.Even
 		p.log.Warn("updating contact activity failed", slog.String("error", err.Error()))
 	}
 
-	if p.hub != nil {
-		p.hub.PublishMessage(contact.ID, message)
-		p.hub.PublishChat(contact.ID, map[string]any{
-			"contact_id": contact.ID,
-			"preview":    preview,
-			"direction":  string(domain.DirectionOutgoing),
-			"at":         sentAt,
-		})
-	}
 	return nil
 }
 
@@ -540,44 +503,9 @@ func (p *Processor) handleStatus(ctx context.Context, event *whatsapp.Event) err
 		return nil
 	}
 
-	changed, err := p.messages.ApplyStatus(ctx, nil,
-		event.Status.ExternalID, event.Status.Status, event.Timestamp, event.Status.Description)
-	if err != nil {
+	if _, err := p.messages.ApplyStatus(ctx, nil,
+		event.Status.ExternalID, event.Status.Status, event.Timestamp, event.Status.Description); err != nil {
 		return fmt.Errorf("apply delivery status: %w", err)
 	}
-	if !changed {
-		return nil
-	}
-
-	contactID, found, err := p.messages.ContactIDForExternalID(ctx, event.Status.ExternalID)
-	if err != nil || !found {
-		return err
-	}
-
-	if p.hub != nil {
-		p.hub.PublishStatus(contactID, map[string]any{
-			"external_id": event.Status.ExternalID,
-			"status":      string(event.Status.Status),
-			"at":          event.Timestamp,
-		})
-	}
 	return nil
-}
-
-func (p *Processor) publishInbound(contact *domain.Contact, message *domain.Message, preview string) {
-	if p.hub == nil {
-		return
-	}
-	p.hub.PublishMessage(contact.ID, message)
-	p.hub.PublishChat(contact.ID, map[string]any{
-		"contact_id":   contact.ID,
-		"name":         contact.DisplayName(),
-		"phone":        contact.Phone,
-		"avatar_url":   contact.AvatarURL,
-		"preview":      preview,
-		"direction":    string(domain.DirectionIncoming),
-		"type":         message.Type,
-		"at":           message.CreatedAt,
-		"unread_delta": 1,
-	})
 }

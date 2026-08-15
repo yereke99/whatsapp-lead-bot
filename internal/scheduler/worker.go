@@ -17,7 +17,6 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/domain"
 	"github.com/ayran/whatsapp-automation/internal/media"
 	"github.com/ayran/whatsapp-automation/internal/messaging"
-	"github.com/ayran/whatsapp-automation/internal/realtime"
 	"github.com/ayran/whatsapp-automation/internal/templates"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp"
 	"github.com/ayran/whatsapp-automation/pkg/backoff"
@@ -34,7 +33,6 @@ type Worker struct {
 	contacts   *contacts.Repository
 	sender     *messaging.Sender
 	mediaStore *media.Store
-	hub        *realtime.Hub
 	log        *slog.Logger
 
 	backoff  backoff.Policy
@@ -51,7 +49,6 @@ func NewWorker(
 	contactRepo *contacts.Repository,
 	sender *messaging.Sender,
 	mediaStore *media.Store,
-	hub *realtime.Hub,
 	log *slog.Logger,
 ) *Worker {
 	host, _ := os.Hostname()
@@ -66,7 +63,6 @@ func NewWorker(
 		contacts:   contactRepo,
 		sender:     sender,
 		mediaStore: mediaStore,
-		hub:        hub,
 		log:        log.With(slog.String("component", "scheduler")),
 		backoff:    backoff.Default(cfg.RetryBaseDelay, cfg.RetryMaxDelay),
 		workerID:   fmt.Sprintf("%s/%s", host, uuid.NewString()[:8]),
@@ -205,7 +201,6 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		if err := w.repo.Cancel(ctx, job.ID, reason); err != nil {
 			log.Error("cancelling job failed", slog.String("error", err.Error()))
 		}
-		w.publishJob(job.ID, jobCtx.Job.ContactID, string(domain.JobCancelled), reason)
 		return
 	}
 
@@ -238,7 +233,6 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 			log.Error("marking job failed", slog.String("error", failErr.Error()))
 		}
 		log.Error("job cannot be built", slog.String("error", err.Error()))
-		w.publishJob(job.ID, jobCtx.Job.ContactID, string(domain.JobFailed), err.Error())
 		return
 	}
 
@@ -250,7 +244,6 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 			if cancelErr := w.repo.Cancel(ctx, job.ID, sendErr.Error()); cancelErr != nil {
 				log.Error("cancelling job failed", slog.String("error", cancelErr.Error()))
 			}
-			w.publishJob(job.ID, jobCtx.Job.ContactID, string(domain.JobCancelled), sendErr.Error())
 			return
 		}
 		w.retryOrFail(ctx, job, jobCtx.CampaignMaxAttempts, sendErr, log)
@@ -270,7 +263,6 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		slog.String("step", jobCtx.StepName),
 		slog.String("contact_id", jobCtx.Job.ContactID.String()))
 
-	w.publishJob(job.ID, jobCtx.Job.ContactID, string(domain.JobSent), "")
 }
 
 // shouldSkip reports configuration or consent reasons to drop a job outright.
@@ -373,7 +365,6 @@ func (w *Worker) retryOrFail(ctx context.Context, job domain.ScheduledMessage, m
 			slog.Int("attempts", attempts),
 			slog.Bool("retryable", retryable),
 			slog.String("error", cause.Error()))
-		w.publishJob(job.ID, job.ContactID, string(domain.JobFailed), reason)
 		return
 	}
 
@@ -387,21 +378,6 @@ func (w *Worker) retryOrFail(ctx context.Context, job domain.ScheduledMessage, m
 		slog.Int("attempts", attempts),
 		slog.Time("next_attempt", next),
 		slog.String("error", cause.Error()))
-}
-
-func (w *Worker) publishJob(jobID, contactID uuid.UUID, status, detail string) {
-	if w.hub == nil {
-		return
-	}
-	w.hub.Publish(realtime.Event{
-		Type:      realtime.EventJobUpdated,
-		ContactID: contactID.String(),
-		Data: map[string]any{
-			"job_id": jobID,
-			"status": status,
-			"detail": detail,
-		},
-	})
 }
 
 func contactFromJob(jc *JobContext) *domain.Contact {

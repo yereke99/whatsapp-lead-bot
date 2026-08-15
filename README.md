@@ -3,9 +3,13 @@
 A reusable WhatsApp campaign automation platform built on Go and Green API.
 
 An administrator creates campaigns, defines the exact phrase that opens the
-funnel, builds a timeline of messages relative to an event, and watches the
-conversations happen live. The Turkish Ayran / Kaymak webinar is the first
-campaign loaded into it, not something the code knows about.
+funnel, and builds a timeline of messages relative to an event. The Turkish
+Ayran / Kaymak webinar is the first campaign loaded into it, not something the
+code knows about.
+
+It is an automation platform, not a WhatsApp client: there is no inbox and no
+live chat. The panel manages campaigns, and the bot only ever replies to a
+configured trigger.
 
 **The platform never messages anyone first.** A contact enters the funnel only
 by sending a configured trigger phrase, and that inbound message is the consent
@@ -34,7 +38,9 @@ record every outbound path checks.
 Customer sends the trigger phrase
         │
         ▼
-Green API webhook  ──▶  stored raw, deduplicated by event id
+Green API notification queue
+        │
+GET receiveNotification (long poll)  ──▶  stored raw, deduplicated by event id
         │
         ▼
 Background worker: create contact ─▶ record consent ─▶ match trigger
@@ -46,7 +52,7 @@ Enrol into campaign, write one job per step into SQLite
 Scheduler claims due jobs (one atomic UPDATE) ─▶ renders ─▶ sends
         │
         ▼
-Delivery webhooks update the message; the dashboard sees it over SSE
+Delivery receipts arrive on the same queue and update the message
 ```
 
 A webinar at 21:00 with the default steps produces exactly:
@@ -105,7 +111,7 @@ make run
 
 `make run` starts the whole system **in the background**: it applies
 migrations, creates the first admin account, and brings up the HTTP server, the
-scheduler workers and the webhook processor. The database file is created on
+scheduler workers and the Green API poller. The database file is created on
 first start at `DATABASE_PATH` (default `./data/whatsapp.db`).
 
 | Target | What it does |
@@ -161,7 +167,8 @@ variable. The settings that matter most:
 | `SESSION_SECRET` | ≥ 32 characters. Required. |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Creates the first owner account when none exists. |
 | `GREEN_API_INSTANCE_ID` / `GREEN_API_TOKEN` | Provider credentials. Without them the panel runs but nothing is sent or received. |
-| `GREEN_API_WEBHOOK_TOKEN` | Shared secret for the webhook endpoint. Set it. |
+| `GREEN_API_RECEIVE_TIMEOUT` | How long Green API holds a poll open. Must stay below `GREEN_API_TIMEOUT`. Default 20 s. |
+| `GREEN_API_WORKERS` | Workers applying received notifications. Default 5. |
 | `TIMEZONE` | Default zone for the panel and new campaigns. Default `Asia/Almaty`. |
 | `SECURE_COOKIES` | Must be `true` in production; the app refuses to start otherwise. |
 | `TRUSTED_PROXIES` | Proxy addresses whose `X-Forwarded-For` is honoured. Leave empty when exposed directly. |
@@ -180,17 +187,13 @@ the edges. A server running on UTC and an operator in Almaty see the same
    code with the WhatsApp account that will send the messages.
 2. Copy the instance id and API token into `GREEN_API_INSTANCE_ID` and
    `GREEN_API_TOKEN`.
-3. In the instance settings, set the webhook url to:
+3. Enable these notifications in the instance settings: incoming messages,
+   incoming file messages, outgoing message status, and outgoing API message.
 
-   ```
-   https://your-domain.example/api/webhooks/greenapi
-   ```
-
-4. Set a webhook token in the Green API console and put the same value in
-   `GREEN_API_WEBHOOK_TOKEN`. The provider sends it as
-   `Authorization: Bearer <token>`; requests without it are rejected.
-5. Enable these notifications: incoming messages, incoming file messages,
-   outgoing message status, and outgoing API message.
+**There is no webhook to configure.** Messages are pulled from Green API's
+notification queue with `receiveNotification`, so the server needs no public
+url, no TLS certificate and no inbound firewall rule. Leave the webhook url
+blank in the Green API console.
 
 Check the connection under **Баптаулар → Жүйе**; it reports the live instance
 state.
@@ -204,14 +207,13 @@ The interface is in Kazakh.
 | Page | What it does |
 |---|---|
 | **Басты бет** | Counters, contact and message trends, delivery breakdown, campaign funnel. |
-| **Чаттар** | Live inbox. All conversations, avatars, full history, and replies with text, image, video, audio, voice or documents. New messages appear without refreshing. |
 | **Клиенттер** | Filterable contact list with search, bulk actions, CSV export and a per-contact card. |
 | **Кампаниялар** | Create, edit, duplicate, activate, pause, archive. |
 | **Автоматтандыру** | Visual timeline builder inside a campaign: add, reorder, retime, enable and preview steps. |
 | **Шаблондар** | Message templates with media upload, variable insertion, preview and version history. |
 | **Триггерлер** | Every keyword across campaigns and how many contacts each brought in. |
 | **Жоспарланған** | The job queue: what is pending, sent, failed, and why. Retry or cancel individually. |
-| **Баптаулар** | Provider status, operators, audit log, webhook diagnostics, password change. |
+| **Баптаулар** | Provider status, operators, audit log, inbound event log, password change. |
 
 ### Setting up a campaign
 
@@ -250,7 +252,7 @@ reaches a customer as literal `{{...}}` text.
 
 ```
 cmd/
-  server/        HTTP API, dashboard, webhook receiver, background workers
+  server/        HTTP API, dashboard, notification poller, background workers
   migrate/       apply schema and exit
   seed/          load the example campaign
 
@@ -258,14 +260,13 @@ internal/
   api/           routing, handlers, middleware
   auth/          Argon2id hashing, sessions, CSRF, login throttling
   campaigns/     campaigns, triggers, steps, enrollment, schedule planning
-  contacts/      contact records, consent state, chat list
+  contacts/      contact records, consent state
   conversations/ message history
   templates/     templates and revision history
   scheduler/     persistent job queue and workers
   messaging/     outbound sending and the consent guard
-  webhooks/      inbound pipeline, idempotency, media capture, avatars
+  inbound/       Green API queue poller, ingest pipeline, idempotency
   media/         upload validation, storage, ffmpeg transcoding
-  realtime/      Server-Sent Events hub
   analytics/     dashboard aggregates
   exports/       CSV streaming
   audit/         administrative action log
@@ -285,7 +286,7 @@ migrations/      numbered SQL files, embedded into the binary
 
 Business logic depends on the `whatsapp.Provider` interface, never on Green API
 directly, so a second provider can be added without touching the scheduler,
-campaigns or webhook pipeline.
+campaigns or the inbound pipeline.
 
 ---
 
@@ -366,7 +367,7 @@ the earlier ones are skipped so they do not arrive out of order.
 `contacts.first_contact_at` is set exactly once, on the first inbound message.
 `Sender.Send` — the single function every outbound path goes through — refuses
 to send when it is null. There is no code path, manual or automated, that can
-open a conversation with someone who has not written to us. The chat console
+open a conversation with someone who has not written to us. The platform
 shows the reason instead of a composer.
 
 Bulk messaging is deliberately absent from the bulk actions menu.
@@ -384,7 +385,7 @@ make test-all
 
 Unit tests cover trigger normalization and matching (including Unicode,
 case folding and word boundaries), schedule computation against the reference
-webinar, timezone conversion, template rendering, webhook parsing and dedupe
+webinar, timezone conversion, template rendering, notification parsing and dedupe
 keys, password hashing, and upload validation.
 
 Integration tests run against a real SQLite database and cover the
@@ -417,14 +418,14 @@ container healthcheck uses it.
 
 ### Logs
 
-Structured JSON by default. Webhook receipt, contact creation, trigger
+Structured JSON by default. Notification receipt, contact creation, trigger
 detection, campaign start, job scheduling, sends, failures, retries, admin
 actions and authentication events are all logged. Credentials never are.
 
 ### Diagnosing a message that did not arrive
 
 1. **Жоспарланған** → filter by `Қате`. The failure reason is on the row.
-2. **Баптаулар → Webhook оқиғалары** → confirm the provider is reaching you.
+2. **Баптаулар → Кіріс оқиғалар** → confirm notifications are being drained.
 3. **Баптаулар → Жүйе** → confirm the instance is authorized.
 4. Open the contact and check whether they unsubscribed or were blocked.
 
@@ -483,10 +484,8 @@ must echo the CSRF token in an `X-CSRF-Token` header.
 | `POST` | `/api/auth/logout` | Sign out |
 | `GET` | `/api/me` | Current operator and CSRF token |
 | `GET` | `/api/dashboard` | Dashboard aggregates |
-| `GET` | `/api/chats` | Conversation list |
-| `GET` | `/api/stream` | Server-Sent Events feed |
 | `GET` | `/api/contacts` | Contacts, filterable |
-| `GET` | `/api/contacts/{id}/messages` | Conversation history |
+| `GET` | `/api/contacts/{id}/messages` | Message log for one contact (read-only) |
 | `POST` | `/api/contacts/{id}/send` | Manual reply |
 | `GET/POST/PUT/DELETE` | `/api/campaigns[/{id}]` | Campaign management |
 | `GET/POST/PUT/DELETE` | `/api/campaigns/{id}/steps[/{stepId}]` | Automation steps |
@@ -494,7 +493,6 @@ must echo the CSRF token in an `X-CSRF-Token` header.
 | `POST` | `/api/media/upload` | Upload media |
 | `GET` | `/api/scheduled-messages` | Job queue |
 | `GET` | `/api/exports/contacts` | CSV export |
-| `POST` | `/api/webhooks/greenapi` | Provider webhook |
 
 ---
 

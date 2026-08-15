@@ -21,7 +21,6 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/conversations"
 	"github.com/ayran/whatsapp-automation/internal/domain"
 	"github.com/ayran/whatsapp-automation/internal/media"
-	"github.com/ayran/whatsapp-automation/internal/realtime"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp"
 )
 
@@ -63,7 +62,6 @@ type Sender struct {
 	messages   *conversations.Repository
 	contacts   *contacts.Repository
 	mediaStore *media.Store
-	hub        *realtime.Hub
 	log        *slog.Logger
 }
 
@@ -72,7 +70,6 @@ func NewSender(
 	messages *conversations.Repository,
 	contactRepo *contacts.Repository,
 	mediaStore *media.Store,
-	hub *realtime.Hub,
 	log *slog.Logger,
 ) *Sender {
 	return &Sender{
@@ -80,7 +77,6 @@ func NewSender(
 		messages:   messages,
 		contacts:   contactRepo,
 		mediaStore: mediaStore,
-		hub:        hub,
 		log:        log.With(slog.String("component", "messaging")),
 	}
 }
@@ -143,7 +139,6 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 		}
 		record.Status = domain.MessageStatusFailed
 		record.Error = sendErr.Error()
-		s.publish(contact, record)
 		return record, sendErr
 	}
 
@@ -174,7 +169,6 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 		slog.String("external_id", result.ExternalID),
 		slog.Bool("manual", out.IsManual))
 
-	s.publish(contact, record)
 	return record, nil
 }
 
@@ -241,20 +235,6 @@ func (s *Sender) mediaMessage(chatID string, kind whatsapp.MediaKind, out Outbou
 		MimeType: out.MediaMIME,
 		FilePath: out.MediaPath,
 	}
-}
-
-func (s *Sender) publish(contact *domain.Contact, msg *domain.Message) {
-	if s.hub == nil {
-		return
-	}
-	s.hub.PublishMessage(contact.ID, msg)
-	s.hub.PublishChat(contact.ID, map[string]any{
-		"contact_id": contact.ID,
-		"preview":    previewFor(whatsapp.MessageType(msg.Type), msg.Text, msg.FileName),
-		"direction":  string(domain.DirectionOutgoing),
-		"type":       msg.Type,
-		"at":         msg.CreatedAt,
-	})
 }
 
 func validateOutbound(out Outbound, msgType whatsapp.MessageType) error {

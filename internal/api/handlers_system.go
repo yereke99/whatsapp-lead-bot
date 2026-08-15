@@ -1,7 +1,6 @@
 package api
 
 import (
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -238,7 +237,7 @@ func (s *Server) handleWebhookEvents(w http.ResponseWriter, r *http.Request) {
 	offset := httpx.QueryInt(r, "offset", 0, 0, 1_000_000)
 	status := strings.ToUpper(httpx.QueryString(r, "status"))
 
-	items, total, err := s.deps.WebhookRepo.List(r.Context(), status, limit, offset)
+	items, total, err := s.deps.NotificationRepo.List(r.Context(), status, limit, offset)
 	if err != nil {
 		httpx.Internal(w, s.log, err, "list webhook events")
 		return
@@ -288,7 +287,6 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 		"max_upload_mb":       s.cfg.Media.MaxUploadMB,
 		"scheduler_enabled":   s.cfg.Scheduler.Enabled,
 		"template_variables":  render.Catalog,
-		"realtime_clients":    s.deps.Hub.Clients(),
 	})
 }
 
@@ -307,80 +305,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.JSON(w, code, map[string]any{
-		"status":           status,
-		"database":         dbStatus,
-		"provider_ready":   s.cfg.WhatsAppConfigured(),
-		"realtime_clients": s.deps.Hub.Clients(),
-		"time":             time.Now().UTC(),
+		"status":         status,
+		"database":       dbStatus,
+		"provider_ready": s.cfg.WhatsAppConfigured(),
+		"time":           time.Now().UTC(),
 	})
-}
-
-// --------------------------------------------------------------- webhook --
-
-// handleGreenAPIWebhook receives provider notifications.
-//
-// It always answers 200 for a payload it has stored or already seen: a
-// non-2xx makes Green API retry, and retrying a message we have already
-// queued only adds load.
-func (s *Server) handleGreenAPIWebhook(w http.ResponseWriter, r *http.Request) {
-	if !s.verifyWebhookToken(r) {
-		s.log.Warn("webhook rejected: bad token",
-			"ip", httpx.ClientIP(r, s.cfg.HTTP.TrustedProxies))
-		httpx.Fail(w, http.StatusUnauthorized, httpx.CodeUnauthorized, "invalid webhook token")
-		return
-	}
-
-	// 1 MiB is far above any Green API notification.
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		httpx.Fail(w, http.StatusBadRequest, httpx.CodeBadRequest, "cannot read body")
-		return
-	}
-	if len(body) == 0 {
-		httpx.JSON(w, http.StatusOK, map[string]string{"status": "empty"})
-		return
-	}
-
-	accepted, err := s.deps.Webhooks.Ingest(r.Context(), body)
-	if err != nil {
-		// A payload we cannot parse will not parse on retry either.
-		s.log.Warn("webhook payload rejected", "error", err)
-		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ignored"})
-		return
-	}
-
-	if accepted {
-		httpx.JSON(w, http.StatusOK, map[string]string{"status": "accepted"})
-		return
-	}
-	httpx.JSON(w, http.StatusOK, map[string]string{"status": "duplicate"})
-}
-
-func (s *Server) handleWebhookProbe(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
-}
-
-// verifyWebhookToken checks Green API's configured webhook token.
-//
-// The provider sends it as "Authorization: Bearer <token>". When no token is
-// configured the endpoint stays open, which is only acceptable behind a
-// firewall, so the server logs a warning about it at startup.
-func (s *Server) verifyWebhookToken(r *http.Request) bool {
-	expected := strings.TrimSpace(s.cfg.GreenAPI.WebhookToken)
-	if expected == "" {
-		return true
-	}
-
-	provided := strings.TrimSpace(r.Header.Get("Authorization"))
-	provided = strings.TrimPrefix(provided, "Bearer ")
-	provided = strings.TrimSpace(provided)
-
-	if provided == "" {
-		// Some deployments put the token in the url instead.
-		provided = strings.TrimSpace(r.URL.Query().Get("token"))
-	}
-
-	return constantTimeEqual(provided, expected)
 }
 
 func exportsFilename(prefix, tz string) string {

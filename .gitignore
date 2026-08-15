@@ -3,12 +3,16 @@
 .env.*
 !.env.example
 
-# Build output
+# Build output.
+#
+# The leading slash matters: an unanchored "server" also matches the
+# cmd/server/ directory, which silently kept every entrypoint out of the
+# repository.
 /bin/
 /dist/
-server
-migrate
-seed
+/server
+/migrate
+/seed
 
 # Runtime data
 /storage/

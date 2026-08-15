@@ -1,0 +1,252 @@
+// Command server runs the WhatsApp campaign automation platform: the REST
+// API, the admin dashboard, the webhook receiver and the background workers.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/ayran/whatsapp-automation/internal/analytics"
+	"github.com/ayran/whatsapp-automation/internal/api"
+	"github.com/ayran/whatsapp-automation/internal/audit"
+	"github.com/ayran/whatsapp-automation/internal/auth"
+	"github.com/ayran/whatsapp-automation/internal/campaigns"
+	"github.com/ayran/whatsapp-automation/internal/config"
+	"github.com/ayran/whatsapp-automation/internal/contacts"
+	"github.com/ayran/whatsapp-automation/internal/conversations"
+	"github.com/ayran/whatsapp-automation/internal/exports"
+	"github.com/ayran/whatsapp-automation/internal/logging"
+	"github.com/ayran/whatsapp-automation/internal/media"
+	"github.com/ayran/whatsapp-automation/internal/messaging"
+	"github.com/ayran/whatsapp-automation/internal/realtime"
+	"github.com/ayran/whatsapp-automation/internal/scheduler"
+	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
+	"github.com/ayran/whatsapp-automation/internal/templates"
+	"github.com/ayran/whatsapp-automation/internal/webhooks"
+	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
+	"github.com/ayran/whatsapp-automation/migrations"
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	log := logging.New(cfg.App.LogLevel, cfg.App.LogFormat)
+	slog.SetDefault(log)
+
+	log.Info("starting whatsapp automation platform",
+		slog.String("env", cfg.App.Env),
+		slog.Int("port", cfg.HTTP.Port),
+		slog.String("timezone", cfg.App.DefaultTimezone))
+
+	// Signals cancel the root context, which every worker observes.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	db, err := sqlite.Connect(ctx, cfg.Database)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer db.Close()
+	log.Info("database connected")
+
+	if cfg.Database.AutoMigrate {
+		if err := db.Migrate(ctx, migrations.FS, log); err != nil {
+			return fmt.Errorf("run migrations: %w", err)
+		}
+		log.Info("database schema up to date")
+	}
+
+	// ---- infrastructure ---------------------------------------------------
+
+	mediaStore, err := media.NewStore(cfg.Media.StoragePath, cfg.Media.MaxUploadMB, cfg.Media.PublicURL)
+	if err != nil {
+		return fmt.Errorf("initialise media storage: %w", err)
+	}
+
+	transcoder := media.NewTranscoder(cfg.Media.FFmpegPath, cfg.Media.FFprobePath, cfg.Media.VoiceBitrate)
+	if !transcoder.Available() {
+		log.Warn("ffmpeg not found: voice messages require an OGG/Opus upload",
+			slog.String("configured_path", cfg.Media.FFmpegPath))
+	}
+
+	hub := realtime.NewHub(log)
+	defer hub.Close()
+
+	provider := greenapi.New(cfg.GreenAPI, log)
+	if !provider.Configured() {
+		log.Warn("green api credentials are not set: inbound and outbound messaging is disabled")
+	}
+	if cfg.GreenAPI.WebhookToken == "" {
+		log.Warn("GREEN_API_WEBHOOK_TOKEN is empty: the webhook endpoint accepts unauthenticated posts")
+	}
+
+	// ---- repositories -----------------------------------------------------
+
+	authRepo := auth.NewRepository(db)
+	contactRepo := contacts.NewRepository(db)
+	messageRepo := conversations.NewRepository(db)
+	templateRepo := templates.NewRepository(db)
+	campaignRepo := campaigns.NewRepository(db)
+	jobRepo := scheduler.NewRepository(db)
+	mediaRepo := media.NewRepository(db)
+	webhookRepo := webhooks.NewRepository(db)
+
+	// ---- services ---------------------------------------------------------
+
+	auditLog := audit.NewLogger(db, log)
+	authSvc := auth.NewService(cfg.Auth, authRepo, log)
+	mediaSvc := media.NewService(mediaStore, mediaRepo, transcoder, log)
+	templateSvc := templates.NewService(templateRepo, mediaSvc)
+	campaignSvc := campaigns.NewService(campaignRepo, jobRepo, contactRepo, log)
+	sender := messaging.NewSender(provider, messageRepo, contactRepo, mediaStore, hub, log)
+	analyticsSvc := analytics.NewService(db)
+	exportSvc := exports.NewService(contactRepo)
+
+	webhookProcessor := webhooks.NewProcessor(cfg.Scheduler, webhookRepo, contactRepo,
+		messageRepo, campaignSvc, templateRepo, sender, mediaStore, hub, log)
+	enricher := webhooks.NewEnricher(provider, messageRepo, contactRepo, mediaSvc, hub, log)
+
+	worker := scheduler.NewWorker(cfg.Scheduler, jobRepo, templateRepo, contactRepo,
+		sender, mediaStore, hub, log)
+
+	if err := authSvc.EnsureBootstrapAdmin(ctx); err != nil {
+		return fmt.Errorf("bootstrap administrator: %w", err)
+	}
+
+	// ---- background work --------------------------------------------------
+
+	authSvc.StartMaintenance(ctx)
+	webhookProcessor.Start(ctx)
+	enricher.Start(ctx)
+
+	if cfg.Scheduler.Enabled {
+		worker.Start(ctx)
+	} else {
+		log.Warn("scheduler is disabled: scheduled messages will not be sent")
+	}
+
+	go completeEnrollmentsLoop(ctx, campaignSvc, log)
+
+	// ---- http -------------------------------------------------------------
+
+	server := api.NewServer(api.Dependencies{
+		Config:       cfg,
+		Log:          log,
+		DB:           db,
+		Auth:         authSvc,
+		Audit:        auditLog,
+		Contacts:     contactRepo,
+		Messages:     messageRepo,
+		Campaigns:    campaignSvc,
+		Templates:    templateSvc,
+		TemplateRepo: templateRepo,
+		Media:        mediaSvc,
+		Jobs:         jobRepo,
+		Sender:       sender,
+		Webhooks:     webhookProcessor,
+		WebhookRepo:  webhookRepo,
+		Enricher:     enricher,
+		Analytics:    analyticsSvc,
+		Exports:      exportSvc,
+		Hub:          hub,
+		Provider:     provider,
+	})
+
+	httpServer := &http.Server{
+		Addr:        fmt.Sprintf(":%d", cfg.HTTP.Port),
+		Handler:     server.Handler(),
+		ReadTimeout: cfg.HTTP.ReadTimeout,
+		IdleTimeout: cfg.HTTP.IdleTimeout,
+		ErrorLog:    slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		BaseContext: func(net.Listener) context.Context { return ctx },
+		// WriteTimeout is deliberately unset: the Server-Sent Events stream is
+		// a long-lived response and any write deadline would sever it.
+		// Per-handler timeouts bound the ordinary requests instead.
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Info("http server listening", slog.String("addr", httpServer.Addr))
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
+
+	select {
+	case err := <-serverErr:
+		return fmt.Errorf("http server: %w", err)
+	case <-ctx.Done():
+		log.Info("shutdown signal received")
+	}
+
+	// Stop accepting new work, then give in-flight requests a chance to
+	// finish before the workers' contexts are already cancelled.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
+	defer cancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Error("graceful shutdown failed", slog.String("error", err.Error()))
+		_ = httpServer.Close()
+	}
+
+	// Workers observe the cancelled root context; wait for them to drain.
+	done := make(chan struct{})
+	go func() {
+		worker.Wait()
+		webhookProcessor.Wait()
+		enricher.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Info("background workers stopped")
+	case <-time.After(cfg.HTTP.ShutdownTimeout):
+		log.Warn("background workers did not stop in time; exiting anyway")
+	}
+
+	log.Info("shutdown complete")
+	return nil
+}
+
+// completeEnrollmentsLoop closes out enrollments whose jobs have all resolved,
+// which is what moves a contact to COMPLETED after a webinar finishes.
+func completeEnrollmentsLoop(ctx context.Context, svc *campaigns.Service, log *slog.Logger) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			completed, err := svc.CompleteFinishedEnrollments(ctx)
+			if err != nil {
+				log.Error("completing enrollments failed", slog.String("error", err.Error()))
+				continue
+			}
+			if completed > 0 {
+				log.Info("enrollments completed", slog.Int64("count", completed))
+			}
+		}
+	}
+}

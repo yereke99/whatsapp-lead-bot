@@ -317,8 +317,8 @@ func (r *Repository) ChatList(ctx context.Context, search string, unreadOnly boo
 func (r *Repository) RecordIncoming(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, preview, msgType string, at time.Time) error {
 	const query = `
 		UPDATE contacts SET
-			last_incoming_at       = GREATEST(COALESCE(last_incoming_at, $2), $2),
-			last_activity_at       = GREATEST(COALESCE(last_activity_at, $2), $2),
+			last_incoming_at       = max(COALESCE(last_incoming_at, $2), $2),
+			last_activity_at       = max(COALESCE(last_activity_at, $2), $2),
 			incoming_count         = incoming_count + 1,
 			unread_count           = unread_count + 1,
 			last_message_preview   = $3,
@@ -335,8 +335,8 @@ func (r *Repository) RecordIncoming(ctx context.Context, q sqlite.Querier, conta
 func (r *Repository) RecordOutgoing(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, preview, msgType string, at time.Time) error {
 	const query = `
 		UPDATE contacts SET
-			last_outgoing_at       = GREATEST(COALESCE(last_outgoing_at, $2), $2),
-			last_activity_at       = GREATEST(COALESCE(last_activity_at, $2), $2),
+			last_outgoing_at       = max(COALESCE(last_outgoing_at, $2), $2),
+			last_activity_at       = max(COALESCE(last_activity_at, $2), $2),
 			outgoing_count         = outgoing_count + 1,
 			last_message_preview   = $3,
 			last_message_type      = $4,

@@ -137,7 +137,11 @@ func (w *Worker) drain(ctx context.Context) {
 			return
 		}
 
-		jobs, err := w.repo.Claim(ctx, w.workerID, w.cfg.BatchSize, time.Now().UTC())
+		now := time.Now().UTC()
+		// A lease older than this belongs to a worker that is gone. Such a row
+		// must not hold up the rest of its contact's queue while it waits for
+		// the recovery sweep.
+		jobs, err := w.repo.Claim(ctx, w.workerID, w.cfg.BatchSize, now, now.Add(-w.cfg.LockTimeout))
 		if err != nil {
 			w.log.Error("claiming jobs failed", slog.String("error", err.Error()))
 			return

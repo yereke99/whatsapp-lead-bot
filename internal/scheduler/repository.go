@@ -108,15 +108,22 @@ func (r *Repository) Enqueue(ctx context.Context, q sqlite.Querier, jobs []NewJo
 // Selection is also serialised per contact, which is what keeps a contact's
 // messages in order and stops two of them arriving at once:
 //
-//   - a contact with a job already in flight is skipped entirely, so message 2
-//     cannot start before message 1 has finished;
+//   - a contact with a job genuinely in flight is skipped, so message 2 cannot
+//     start before message 1 has finished;
 //   - among a contact's due jobs only the earliest is eligible, so a batch
 //     that sees three overdue messages takes them one poll at a time, in
 //     schedule order.
 //
+// "In flight" means a PROCESSING row whose worker lease is still alive.
+// A lease that has expired belongs to a worker that died, and such a row must
+// not hold up the rest of the contact's queue: it is about to be requeued by
+// the recovery sweep anyway, and blocking on it would stall a customer's whole
+// funnel behind one crashed send. This is why the caller passes leaseCutoff —
+// the queue keeps moving even when a worker disappears mid-message.
+//
 // Both rules are evaluated against the pre-update snapshot of the table, so
 // they hold within a single batch as well as across concurrent workers.
-func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now time.Time) ([]domain.ScheduledMessage, error) {
+func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now time.Time, leaseCutoff time.Time) ([]domain.ScheduledMessage, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -131,7 +138,10 @@ func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now 
 			  AND (due.next_attempt_at IS NULL OR due.next_attempt_at <= $2)
 			  AND NOT EXISTS (
 				SELECT 1 FROM scheduled_messages busy
-				WHERE busy.contact_id = due.contact_id AND busy.status = 'PROCESSING'
+				WHERE busy.contact_id = due.contact_id
+				  AND busy.status = 'PROCESSING'
+				  AND busy.locked_at IS NOT NULL
+				  AND busy.locked_at > $4
 			  )
 			  AND NOT EXISTS (
 				SELECT 1 FROM scheduled_messages earlier
@@ -148,7 +158,7 @@ func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now 
 		WHERE sm.id = due.id
 		RETURNING ` + jobColumnsUnqualified
 
-	rows, err := r.db.Query(ctx, query, workerID, now, limit)
+	rows, err := r.db.Query(ctx, query, workerID, now, limit, leaseCutoff)
 	if err != nil {
 		return nil, fmt.Errorf("claim jobs: %w", err)
 	}

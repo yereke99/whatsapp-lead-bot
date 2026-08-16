@@ -276,6 +276,22 @@ func (f *fixture) createContact(t *testing.T, phone string) *domain.Contact {
 
 // ----------------------------------------------------------- queue helpers --
 
+// claim takes due jobs the way the worker does, with a live worker lease.
+func (f *fixture) claim(t *testing.T, worker string, limit int) []domain.ScheduledMessage {
+	t.Helper()
+
+	now := time.Now().UTC()
+	jobs, err := f.jobRepo.Claim(context.Background(), worker, limit, now, now.Add(-defaultLease))
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	return jobs
+}
+
+// defaultLease mirrors SCHEDULER_LOCK_TIMEOUT: how long a claimed job may stay
+// in flight before its worker is presumed dead.
+const defaultLease = 2 * time.Minute
+
 func (f *fixture) setResumePolicy(t *testing.T, campaignID uuid.UUID, policy domain.ResumePolicy) {
 	t.Helper()
 

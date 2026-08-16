@@ -57,7 +57,7 @@ func TestClaimSerialisesPerContact(t *testing.T) {
 	// per-contact rule, not from the batch.
 	var order []time.Time
 	for i := 0; i < len(steps); i++ {
-		claimed, err := f.jobRepo.Claim(ctx, "worker-1", 50, time.Now().UTC())
+		claimed, err := f.jobRepo.Claim(ctx, "worker-1", 50, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 		if err != nil {
 			t.Fatalf("claim %d: %v", i, err)
 		}
@@ -80,7 +80,7 @@ func TestClaimSerialisesPerContact(t *testing.T) {
 	}
 
 	// Nothing is left, and nothing was skipped.
-	remaining, err := f.jobRepo.Claim(ctx, "worker-1", 50, time.Now().UTC())
+	remaining, err := f.jobRepo.Claim(ctx, "worker-1", 50, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 	if err != nil {
 		t.Fatalf("final claim: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestClaimSkipsContactsWithWorkInFlight(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 
-	eventStart := time.Now().UTC().Add(-time.Hour)
+	eventStart := time.Now().UTC().Add(-10 * time.Second)
 	campaign := f.createCampaign(t, "Webinar", eventStart, []int{0})
 	f.addTrigger(t, campaign.ID, "Айран")
 
@@ -109,7 +109,7 @@ func TestClaimSkipsContactsWithWorkInFlight(t *testing.T) {
 		}
 	}
 
-	first, err := f.jobRepo.Claim(ctx, "worker-1", 1, time.Now().UTC())
+	first, err := f.jobRepo.Claim(ctx, "worker-1", 1, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 	if err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestClaimSkipsContactsWithWorkInFlight(t *testing.T) {
 
 	// A second worker may still serve the other contact, but must not touch
 	// the one already being sent to.
-	second, err := f.jobRepo.Claim(ctx, "worker-2", 10, time.Now().UTC())
+	second, err := f.jobRepo.Claim(ctx, "worker-2", 10, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
@@ -127,6 +127,79 @@ func TestClaimSkipsContactsWithWorkInFlight(t *testing.T) {
 		if job.ContactID == first[0].ContactID {
 			t.Errorf("claimed a second job for a contact already in flight")
 		}
+	}
+}
+
+// TestStuckJobDoesNotStallTheContactsQueue is the guarantee that a single
+// message which never completes cannot silence the rest of a customer's
+// funnel.
+//
+// Serialising per contact means a job in flight holds back the next one. If a
+// worker dies mid-send, its row stays PROCESSING; without a lease check the
+// contact's remaining messages would wait behind a worker that is never coming
+// back, and a message scheduled a minute later would simply never arrive.
+func TestStuckJobDoesNotStallTheContactsQueue(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	eventStart := time.Now().UTC().Add(-time.Hour)
+	campaign := f.createCampaign(t, "Webinar", eventStart, []int{-1800, -600, -300})
+	f.addTrigger(t, campaign.ID, "Айран")
+
+	contact := f.createContact(t, "77011234567")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
+		t.Fatalf("HandleTrigger: %v", err)
+	}
+
+	// Queue three due messages for this contact.
+	f.cancelAll(t, campaign.ID)
+	enrollmentID := f.enrollmentID(t, campaign.ID, contact.ID)
+	base := time.Now().UTC().Add(-10 * time.Minute)
+
+	jobs := make([]scheduler.NewJob, 0, 3)
+	for i, stepID := range f.stepIDs(t, campaign.ID) {
+		jobs = append(jobs, scheduler.NewJob{
+			CampaignID: campaign.ID, ContactID: contact.ID, EnrollmentID: enrollmentID,
+			StepID: stepID, RunNumber: 2,
+			ScheduledAt: base.Add(time.Duration(i) * time.Minute),
+		})
+	}
+	if _, err := f.jobRepo.Enqueue(ctx, nil, jobs); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// The first message is claimed and then its worker dies: the row stays
+	// PROCESSING and is never resolved.
+	stuck := f.claim(t, "worker-that-dies", 10)
+	if len(stuck) != 1 {
+		t.Fatalf("claimed %d jobs, want 1", len(stuck))
+	}
+
+	// While the lease is alive the contact is correctly held: message 2 must
+	// not overtake message 1.
+	if held := f.claim(t, "worker-2", 10); len(held) != 0 {
+		t.Errorf("claimed %d jobs while one was legitimately in flight, want 0", len(held))
+	}
+
+	// The lease now expires, as it would for a crashed worker.
+	if _, err := testDB.Exec(ctx,
+		`UPDATE scheduled_messages SET locked_at = $2 WHERE id = $1`,
+		stuck[0].ID, time.Now().UTC().Add(-10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The queue must move again rather than waiting on a dead worker.
+	resumed := f.claim(t, "worker-3", 10)
+	if len(resumed) == 0 {
+		t.Fatal("the contact's queue is stalled behind an abandoned job: no messages could be claimed")
+	}
+	if resumed[0].ID == stuck[0].ID {
+		// Recovery may hand back the orphan itself, which is also fine.
+		return
+	}
+	if resumed[0].ContactID != contact.ID {
+		t.Errorf("claimed a job for the wrong contact")
 	}
 }
 
@@ -293,7 +366,7 @@ func TestRestartLosesNothing(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 
-	eventStart := time.Now().UTC().Add(-time.Hour)
+	eventStart := time.Now().UTC().Add(-10 * time.Second)
 	campaign := f.createCampaign(t, "Webinar", eventStart, []int{0})
 	f.addTrigger(t, campaign.ID, "Айран")
 
@@ -306,7 +379,7 @@ func TestRestartLosesNothing(t *testing.T) {
 	}
 
 	// Two go out, two are mid-flight when the process dies, two are untouched.
-	sent, err := f.jobRepo.Claim(ctx, "dying-worker", 4, time.Now().UTC())
+	sent, err := f.jobRepo.Claim(ctx, "dying-worker", 4, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -338,7 +411,7 @@ func TestRestartLosesNothing(t *testing.T) {
 	// delivered ones are not.
 	var reclaimed int
 	for {
-		batch, err := f.jobRepo.Claim(ctx, "new-worker", 10, time.Now().UTC())
+		batch, err := f.jobRepo.Claim(ctx, "new-worker", 10, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 		if err != nil {
 			t.Fatalf("reclaim: %v", err)
 		}

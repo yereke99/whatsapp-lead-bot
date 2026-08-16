@@ -121,8 +121,16 @@ func BuildPlan(eventStart *time.Time, steps []domain.CampaignStep, opts PlanOpti
 		}
 
 		if opts.CatchUp && i == lastMissed {
-			// Send it now rather than at its original, already-past time.
-			e.RunAt = opts.Now
+			// Send it now rather than at its original, already-past time —
+			// but never ahead of the greeting. The queue is drained in
+			// schedule order, so a catch-up placed at "now" would reach a
+			// contact who has just written in before the reply that
+			// acknowledges them, which reads as the funnel talking over
+			// itself.
+			e.RunAt = triggerAnchor.Add(opts.TriggerDelay + time.Second)
+			if e.RunAt.Before(opts.Now) {
+				e.RunAt = opts.Now
+			}
 			e.Reason = "уақыты өтіп кеткен, бірден жіберіледі"
 			continue
 		}

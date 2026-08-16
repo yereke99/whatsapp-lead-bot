@@ -144,7 +144,9 @@ func TestClaimIsExclusive(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 
-	eventStart := time.Now().UTC().Add(-time.Hour) // everything is already due
+	// Just inside the planner's grace window, so the step is due right now
+	// rather than being treated as missed and caught up.
+	eventStart := time.Now().UTC().Add(-10 * time.Second)
 	campaign := f.createCampaign(t, "Webinar", eventStart, []int{0})
 	f.addTrigger(t, campaign.ID, "Айран")
 
@@ -167,7 +169,7 @@ func TestClaimIsExclusive(t *testing.T) {
 		go func(workerID int) {
 			defer wg.Done()
 			for {
-				jobs, err := f.jobRepo.Claim(ctx, workerName(workerID), 3, time.Now().UTC())
+				jobs, err := f.jobRepo.Claim(ctx, workerName(workerID), 3, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 				if err != nil {
 					t.Errorf("claim: %v", err)
 					return
@@ -200,7 +202,7 @@ func TestReleaseStaleRequeuesOrphanedJobs(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 
-	eventStart := time.Now().UTC().Add(-time.Hour)
+	eventStart := time.Now().UTC().Add(-10 * time.Second)
 	campaign := f.createCampaign(t, "Webinar", eventStart, []int{0})
 	f.addTrigger(t, campaign.ID, "Айран")
 
@@ -210,7 +212,7 @@ func TestReleaseStaleRequeuesOrphanedJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	claimed, err := f.jobRepo.Claim(ctx, "worker-that-will-die", 10, time.Now().UTC())
+	claimed, err := f.jobRepo.Claim(ctx, "worker-that-will-die", 10, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +221,7 @@ func TestReleaseStaleRequeuesOrphanedJobs(t *testing.T) {
 	}
 
 	// Nothing is due while the lock is held.
-	again, err := f.jobRepo.Claim(ctx, "another-worker", 10, time.Now().UTC())
+	again, err := f.jobRepo.Claim(ctx, "another-worker", 10, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +244,7 @@ func TestReleaseStaleRequeuesOrphanedJobs(t *testing.T) {
 		t.Errorf("released %d jobs, want 1", released)
 	}
 
-	recovered, err := f.jobRepo.Claim(ctx, "replacement-worker", 10, time.Now().UTC())
+	recovered, err := f.jobRepo.Claim(ctx, "replacement-worker", 10, time.Now().UTC(), time.Now().UTC().Add(-defaultLease))
 	if err != nil {
 		t.Fatal(err)
 	}

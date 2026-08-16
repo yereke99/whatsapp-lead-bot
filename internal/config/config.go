@@ -195,9 +195,12 @@ func Load() (*Config, error) {
 			MaxAttempts:  envInt("SCHEDULER_MAX_ATTEMPTS", 4),
 			// 5s, 15s, 30s, 60s in the same spirit as the documented policy;
 			// the backoff adds jitter around each step.
-			RetryBaseDelay:        envDuration("SCHEDULER_RETRY_BASE_DELAY", 10*time.Second),
-			RetryMaxDelay:         envDuration("SCHEDULER_RETRY_MAX_DELAY", 30*time.Minute),
-			LockTimeout:           envDuration("SCHEDULER_LOCK_TIMEOUT", 5*time.Minute),
+			RetryBaseDelay: envDuration("SCHEDULER_RETRY_BASE_DELAY", 10*time.Second),
+			RetryMaxDelay:  envDuration("SCHEDULER_RETRY_MAX_DELAY", 30*time.Minute),
+			// A send cannot legitimately outlive the provider timeout by much,
+			// and this lease is also how long one stuck message may hold up the
+			// rest of that contact's queue. Keep it tight.
+			LockTimeout:           envDuration("SCHEDULER_LOCK_TIMEOUT", 2*time.Minute),
 			StaleJobTTL:           envDuration("SCHEDULER_STALE_JOB_TTL", 2*time.Hour),
 			TriggerDelay:          time.Duration(envInt("TRIGGER_GREETING_DELAY_MS", 2000)) * time.Millisecond,
 			NotificationWorkers:   envInt("GREEN_API_WORKERS", 5),

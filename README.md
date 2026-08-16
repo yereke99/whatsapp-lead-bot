@@ -434,6 +434,15 @@ never hands out a later message before an earlier one. A contact with three
 overdue messages therefore receives them one at a time, in order — the gate
 only has to care about the global pace.
 
+"In flight" means a worker lease that is still alive. This matters more than it
+sounds: serialising per contact would otherwise let one message that never
+completes silence that customer's entire funnel. A `PROCESSING` row whose lease
+has expired belongs to a worker that is gone, so the queue steps over it and
+keeps moving while the recovery sweep requeues it. `SCHEDULER_LOCK_TIMEOUT` is
+therefore both the recovery deadline and the worst case for how long one stuck
+message can delay the next one — which is why its default is minutes, not
+hours.
+
 The point is reliability, not evasion. There is no account rotation, no proxy
 juggling and no attempt to disguise automated traffic; the queue simply refuses
 to go faster than configured, and holds work rather than dropping it when a
@@ -530,12 +539,44 @@ actions and authentication events are all logged. Credentials never are.
 
 ### Diagnosing a message that did not arrive
 
-1. **Жоспарланған** → filter by `Қате`. The failure reason is on the row.
+Every queued message carries its own verdict, so the question is always
+answerable from the row itself.
+
+1. **Жоспарланған** → filter by the campaign. Read `status` first:
+
+   | Status | Meaning |
+   |---|---|
+   | `PENDING`, `next_attempt_at` in the future | Waiting out a retry backoff, or held because the campaign is paused or at a sending limit. `last_error` says which. |
+   | `PENDING`, due, not moving | An earlier message for the same contact has not finished. Check that contact's other rows. |
+   | `PROCESSING` with an old `locked_at` | The worker holding it died. Recovery requeues it within `SCHEDULER_LOCK_TIMEOUT`. |
+   | `FAILED` | Gave up after `max_send_attempts`; `last_error` has the provider's reason. |
+   | `CANCELLED` | `cancel_reason` says why — unsubscribed, step disabled, campaign archived, or the send window expired. |
+   | no row at all | It was never queued. The step's time had already passed when the contact enrolled, which is the late-joiner rule. |
+
 2. **Баптаулар → Кіріс оқиғалар** → confirm notifications are being drained.
 3. **Баптаулар → Жүйе** → confirm the instance is authorized.
 4. Open the contact and check whether they unsubscribed or were blocked.
 
+Straight from the database, for one campaign:
+
+```sql
+SELECT cs.order_index, COALESCE(NULLIF(cs.name,''), t.name) AS step,
+       sm.scheduled_at, sm.status, sm.attempt_count,
+       COALESCE(NULLIF(sm.last_error,''), sm.cancel_reason, '') AS problem
+FROM scheduled_messages sm
+JOIN campaign_steps cs   ON cs.id = sm.campaign_step_id
+JOIN message_templates t ON t.id = cs.message_template_id
+JOIN contacts c          ON c.id = sm.contact_id
+WHERE c.phone = '77011234567'
+ORDER BY sm.scheduled_at;
+```
+
 Failed jobs can be retried individually from the queue page.
+
+**Sending is serialised per contact**, so one message that cannot complete
+delays that contact's later messages until its worker lease expires. If a whole
+funnel goes quiet after one particular step, look at that step's row first —
+its `last_error` is usually the answer for everything behind it.
 
 ### The bot does not react to an inbound message
 

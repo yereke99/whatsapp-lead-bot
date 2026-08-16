@@ -169,10 +169,16 @@ func TestBuildPlanCatchUpSendsOnlyTheLatestMissedStep(t *testing.T) {
 		if entry.Step.ScheduleKind == domain.ScheduleOnTrigger {
 			continue
 		}
-		switch {
-		case entry.Skipped:
+		if entry.Skipped {
 			skipped = append(skipped, entry.Step.Name)
-		case entry.RunAt.Equal(now):
+			continue
+		}
+		// A caught-up step is one that no longer sits at its configured time:
+		// it was in the past, so it has been pulled forward to the present.
+		// It lands just after the greeting rather than exactly at `now`, so
+		// the test allows the whole first minute.
+		natural := eventStart.Add(time.Duration(entry.Step.OffsetSeconds) * time.Second)
+		if !entry.RunAt.Equal(natural) && entry.RunAt.Sub(now) < time.Minute {
 			caughtUp = append(caughtUp, entry.Step.Name)
 		}
 	}
@@ -393,6 +399,47 @@ func TestBuildPlanExplicitTriggerDelayBeatsTheFloor(t *testing.T) {
 
 	if got := plan[0].RunAt.Sub(now); got != 10*time.Minute {
 		t.Errorf("step scheduled %v after the trigger, want 10m", got)
+	}
+}
+
+// TestBuildPlanCatchUpNeverPreemptsTheGreeting checks the order a late joiner
+// actually experiences: the reply to their message must arrive before the
+// campaign starts catching them up.
+func TestBuildPlanCatchUpNeverPreemptsTheGreeting(t *testing.T) {
+	loc := almaty(t)
+	eventStart := time.Date(2026, 8, 16, 21, 0, 0, 0, loc).UTC()
+	now := time.Date(2026, 8, 16, 19, 30, 0, 0, loc).UTC()
+
+	steps := []domain.CampaignStep{
+		triggerStep("Сәлемдесу", 0, 1),
+		step("5 сағат бұрын", -5*3600, 2, true),
+		step("2 сағат бұрын", -2*3600, 3, true),
+		step("1 сағат бұрын", -3600, 4, true),
+	}
+
+	plan := BuildPlan(&eventStart, steps, PlanOptions{
+		EnrolledAt: now, Now: now, CatchUp: true, TriggerDelay: 2 * time.Second,
+	})
+
+	var greeting, caughtUp time.Time
+	for _, entry := range plan {
+		if entry.Skipped {
+			continue
+		}
+		if entry.Step.ScheduleKind == domain.ScheduleOnTrigger {
+			greeting = entry.RunAt
+		}
+		if entry.Step.Name == "2 сағат бұрын" {
+			caughtUp = entry.RunAt
+		}
+	}
+
+	if greeting.IsZero() || caughtUp.IsZero() {
+		t.Fatal("expected both a greeting and a caught-up step")
+	}
+	if !caughtUp.After(greeting) {
+		t.Errorf("catch-up scheduled at %v, greeting at %v: the catch-up would arrive first",
+			caughtUp, greeting)
 	}
 }
 

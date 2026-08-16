@@ -156,6 +156,39 @@ func (r *Repository) ResolveForSend(ctx context.Context, q sqlite.Querier, id uu
 	return &spec, nil
 }
 
+// ResolveVersionForSend loads a specific revision instead of the live one.
+//
+// It backs the campaign setting that pins queued messages to the template as
+// it stood when they were queued, so editing a template does not silently
+// rewrite what contacts already in the funnel are about to receive.
+//
+// link_preview is deliberately read from the live template: it is a display
+// hint rather than content, and the versions table does not carry it.
+func (r *Repository) ResolveVersionForSend(ctx context.Context, q sqlite.Querier, id uuid.UUID, version int) (*SendSpec, error) {
+	const query = `
+		SELECT v.template_id, v.version, v.name, v.type, v.body, t.link_preview, v.file_name,
+		       v.media_file_id, COALESCE(mf.relative_path, ''), COALESCE(mf.mime_type, ''),
+		       COALESCE(mf.original_name, '')
+		FROM message_template_versions v
+		JOIN message_templates t ON t.id = v.template_id
+		LEFT JOIN media_files mf ON mf.id = v.media_file_id
+		WHERE v.template_id = $1 AND v.version = $2`
+
+	var spec SendSpec
+	err := r.querier(q).QueryRow(ctx, query, id, version).Scan(
+		&spec.TemplateID, &spec.Version, &spec.Name, &spec.Type, &spec.Body,
+		&spec.LinkPreview, &spec.FileName, &spec.MediaID, &spec.MediaPath,
+		&spec.MediaMIME, &spec.MediaName,
+	)
+	if err != nil {
+		if sqlite.IsNoRows(err) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &spec, nil
+}
+
 func (r *Repository) Create(ctx context.Context, t *domain.MessageTemplate) error {
 	return r.db.InTx(ctx, func(tx sqlite.Querier) error {
 		const query = `

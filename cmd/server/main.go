@@ -28,6 +28,7 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/logging"
 	"github.com/ayran/whatsapp-automation/internal/media"
 	"github.com/ayran/whatsapp-automation/internal/messaging"
+	"github.com/ayran/whatsapp-automation/internal/outbound"
 	"github.com/ayran/whatsapp-automation/internal/scheduler"
 	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/internal/templates"
@@ -109,17 +110,23 @@ func run() error {
 	authSvc := auth.NewService(cfg.Auth, authRepo, log)
 	mediaSvc := media.NewService(mediaStore, mediaRepo, transcoder, log)
 	templateSvc := templates.NewService(templateRepo, mediaSvc)
-	campaignSvc := campaigns.NewService(campaignRepo, jobRepo, contactRepo, log)
+	campaignSvc := campaigns.NewService(campaignRepo, jobRepo, contactRepo, log).
+		WithTriggerDelay(cfg.Scheduler.TriggerDelay)
 	sender := messaging.NewSender(provider, messageRepo, contactRepo, mediaStore, log)
 	analyticsSvc := analytics.NewService(db)
 	exportSvc := exports.NewService(contactRepo)
+
+	// Every automated message leaves through this one gate, which bounds how
+	// many sends run at once and how closely together they go out. Scheduler
+	// workers hand messages to it rather than calling the provider themselves.
+	outboundGate := outbound.New(cfg.Outbound, sender, log)
 
 	notifications := inbound.NewProcessor(cfg.Scheduler, notificationRepo, contactRepo,
 		messageRepo, campaignSvc, templateRepo, sender, mediaStore, log)
 	receiver := inbound.NewReceiver(provider, notifications, cfg.GreenAPI, log)
 
 	worker := scheduler.NewWorker(cfg.Scheduler, jobRepo, templateRepo, contactRepo,
-		sender, mediaStore, log)
+		outboundGate, mediaStore, log)
 
 	if err := authSvc.EnsureBootstrapAdmin(ctx); err != nil {
 		return fmt.Errorf("bootstrap administrator: %w", err)

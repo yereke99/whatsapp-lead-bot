@@ -27,11 +27,25 @@ const campaignColumns = `
 	c.id, c.name, c.description, c.event_type, c.event_start_at, c.timezone,
 	c.webinar_link, c.status, c.existing_contact_behavior, c.existing_contact_template_id,
 	c.unsubscribe_keywords, c.catch_up_missed_steps, c.max_send_attempts,
+	c.resume_policy, c.pin_template_version, c.max_messages_per_hour,
+	c.max_messages_per_day, c.max_active_contacts,
 	c.archived_at, c.created_by, c.created_at, c.updated_at`
 
 const stepColumns = `
 	s.id, s.campaign_id, s.name, s.offset_seconds, s.message_template_id,
 	s.enabled, s.order_index, s.schedule_kind, s.created_at, s.updated_at`
+
+// Aggregates every campaign query reports alongside the row itself. The
+// hourly and daily counters back the optional sending caps, so the panel can
+// show how close a campaign is to its own limit.
+const campaignAggregates = `
+	COALESCE((SELECT count(*) FROM campaign_contacts cc WHERE cc.campaign_id = c.id), 0),
+	COALESCE((SELECT count(*) FROM scheduled_messages sm WHERE sm.campaign_id = c.id AND sm.status = 'PENDING'), 0),
+	COALESCE((SELECT count(*) FROM scheduled_messages sm WHERE sm.campaign_id = c.id AND sm.status = 'SENT'), 0),
+	COALESCE((SELECT count(*) FROM scheduled_messages sm WHERE sm.campaign_id = c.id AND sm.status = 'SENT'
+		AND sm.sent_at >= ts_add(now(), -3600)), 0),
+	COALESCE((SELECT count(*) FROM scheduled_messages sm WHERE sm.campaign_id = c.id AND sm.status = 'SENT'
+		AND sm.sent_at >= ts_add(now(), -86400)), 0)`
 
 type Repository struct {
 	db *sqlite.DB
@@ -78,10 +92,7 @@ func (r *Repository) List(ctx context.Context, f ListFilter) ([]domain.Campaign,
 		where = strings.Join(clauses, " AND ")
 	}
 
-	query := `SELECT ` + campaignColumns + `,
-			COALESCE((SELECT count(*) FROM campaign_contacts cc WHERE cc.campaign_id = c.id), 0),
-			COALESCE((SELECT count(*) FROM scheduled_messages sm WHERE sm.campaign_id = c.id AND sm.status = 'PENDING'), 0),
-			COALESCE((SELECT count(*) FROM scheduled_messages sm WHERE sm.campaign_id = c.id AND sm.status = 'SENT'), 0)
+	query := `SELECT ` + campaignColumns + `,` + campaignAggregates + `
 		FROM campaigns c
 		WHERE ` + where + `
 		ORDER BY
@@ -99,7 +110,7 @@ func (r *Repository) List(ctx context.Context, f ListFilter) ([]domain.Campaign,
 	for rows.Next() {
 		var c domain.Campaign
 		dest := campaignScanDest(&c)
-		dest = append(dest, &c.ContactCount, &c.PendingJobs, &c.SentCount)
+		dest = append(dest, &c.ContactCount, &c.PendingJobs, &c.SentCount, &c.SentLastHour, &c.SentLastDay)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
@@ -155,15 +166,12 @@ func (r *Repository) attachTriggers(ctx context.Context, list []domain.Campaign)
 }
 
 func (r *Repository) GetByID(ctx context.Context, q sqlite.Querier, id uuid.UUID) (*domain.Campaign, error) {
-	query := `SELECT ` + campaignColumns + `,
-			COALESCE((SELECT count(*) FROM campaign_contacts cc WHERE cc.campaign_id = c.id), 0),
-			COALESCE((SELECT count(*) FROM scheduled_messages sm WHERE sm.campaign_id = c.id AND sm.status = 'PENDING'), 0),
-			COALESCE((SELECT count(*) FROM scheduled_messages sm WHERE sm.campaign_id = c.id AND sm.status = 'SENT'), 0)
+	query := `SELECT ` + campaignColumns + `,` + campaignAggregates + `
 		FROM campaigns c WHERE c.id = $1`
 
 	var c domain.Campaign
 	dest := campaignScanDest(&c)
-	dest = append(dest, &c.ContactCount, &c.PendingJobs, &c.SentCount)
+	dest = append(dest, &c.ContactCount, &c.PendingJobs, &c.SentCount, &c.SentLastHour, &c.SentLastDay)
 
 	if err := r.querier(q).QueryRow(ctx, query, id).Scan(dest...); err != nil {
 		if sqlite.IsNoRows(err) {
@@ -200,14 +208,18 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, c *domain.Cam
 		INSERT INTO campaigns (
 			name, description, event_type, event_start_at, timezone, webinar_link,
 			status, existing_contact_behavior, existing_contact_template_id,
-			unsubscribe_keywords, catch_up_missed_steps, max_send_attempts, created_by
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			unsubscribe_keywords, catch_up_missed_steps, max_send_attempts,
+			resume_policy, pin_template_version, max_messages_per_hour,
+			max_messages_per_day, max_active_contacts, created_by
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 		RETURNING id, created_at, updated_at`
 
 	err := r.querier(q).QueryRow(ctx, query,
 		c.Name, c.Description, c.EventType, c.EventStartAt, c.Timezone, c.WebinarLink,
 		c.Status, c.ExistingContactBehavior, c.ExistingContactTemplate,
-		c.UnsubscribeKeywords, c.CatchUpMissedSteps, c.MaxSendAttempts, c.CreatedBy,
+		c.UnsubscribeKeywords, c.CatchUpMissedSteps, c.MaxSendAttempts,
+		c.ResumePolicy, c.PinTemplateVersion, c.MaxMessagesPerHour,
+		c.MaxMessagesPerDay, c.MaxActiveContacts, c.CreatedBy,
 	).Scan(&c.ID, &c.CreatedAt, &c.UpdatedAt)
 
 	if err != nil {
@@ -225,7 +237,10 @@ func (r *Repository) Update(ctx context.Context, q sqlite.Querier, c *domain.Cam
 			name = $2, description = $3, event_type = $4, event_start_at = $5,
 			timezone = $6, webinar_link = $7, existing_contact_behavior = $8,
 			existing_contact_template_id = $9, unsubscribe_keywords = $10,
-			catch_up_missed_steps = $11, max_send_attempts = $12
+			catch_up_missed_steps = $11, max_send_attempts = $12,
+			resume_policy = $13, pin_template_version = $14,
+			max_messages_per_hour = $15, max_messages_per_day = $16,
+			max_active_contacts = $17
 		WHERE id = $1
 		RETURNING updated_at`
 
@@ -233,6 +248,8 @@ func (r *Repository) Update(ctx context.Context, q sqlite.Querier, c *domain.Cam
 		c.ID, c.Name, c.Description, c.EventType, c.EventStartAt, c.Timezone,
 		c.WebinarLink, c.ExistingContactBehavior, c.ExistingContactTemplate,
 		c.UnsubscribeKeywords, c.CatchUpMissedSteps, c.MaxSendAttempts,
+		c.ResumePolicy, c.PinTemplateVersion, c.MaxMessagesPerHour,
+		c.MaxMessagesPerDay, c.MaxActiveContacts,
 	).Scan(&c.UpdatedAt)
 
 	if err != nil {
@@ -446,7 +463,8 @@ func (r *Repository) DeleteTrigger(ctx context.Context, id uuid.UUID) error {
 
 func (r *Repository) ListSteps(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID) ([]domain.CampaignStep, error) {
 	query := `SELECT ` + stepColumns + `, t.name, t.type,
-			CASE WHEN length(t.body) > 120 THEN substr(t.body, 1, 120) || '…' ELSE t.body END
+			CASE WHEN length(t.body) > 120 THEN substr(t.body, 1, 120) || '…' ELSE t.body END,
+			t.version, (t.media_file_id IS NOT NULL), (t.archived_at IS NOT NULL)
 		FROM campaign_steps s
 		JOIN message_templates t ON t.id = s.message_template_id
 		WHERE s.campaign_id = $1
@@ -464,7 +482,8 @@ func (r *Repository) ListSteps(ctx context.Context, q sqlite.Querier, campaignID
 		if err := rows.Scan(&s.ID, &s.CampaignID, &s.Name, &s.OffsetSeconds,
 			&s.TemplateID, &s.Enabled, &s.OrderIndex, &s.ScheduleKind,
 			&s.CreatedAt, &s.UpdatedAt,
-			&s.TemplateName, &s.TemplateType, &s.TemplatePreview); err != nil {
+			&s.TemplateName, &s.TemplateType, &s.TemplatePreview,
+			&s.TemplateVersion, &s.TemplateHasMedia, &s.TemplateArchived); err != nil {
 			return nil, err
 		}
 		out = append(out, s)
@@ -758,12 +777,27 @@ func campaignScanDest(c *domain.Campaign) []any {
 		&c.ID, &c.Name, &c.Description, &c.EventType, &c.EventStartAt, &c.Timezone,
 		&c.WebinarLink, &c.Status, &c.ExistingContactBehavior, &c.ExistingContactTemplate,
 		&c.UnsubscribeKeywords, &c.CatchUpMissedSteps, &c.MaxSendAttempts,
+		&c.ResumePolicy, &c.PinTemplateVersion, &c.MaxMessagesPerHour,
+		&c.MaxMessagesPerDay, &c.MaxActiveContacts,
 		&c.ArchivedAt, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
 	}
 }
 
 // UnsubscribeKeywordsFor returns every configured stop word, normalized by the
 // caller, across the campaigns a contact belongs to plus the global defaults.
+// ActiveEnrollmentCount backs the optional cap on how many contacts a
+// campaign may be running at the same time.
+func (r *Repository) ActiveEnrollmentCount(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID) (int, error) {
+	var count int
+	err := r.querier(q).QueryRow(ctx,
+		`SELECT count(*) FROM campaign_contacts WHERE campaign_id = $1 AND status = 'ACTIVE'`,
+		campaignID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count active enrollments: %w", err)
+	}
+	return count, nil
+}
+
 func (r *Repository) UnsubscribeKeywordsFor(ctx context.Context, q sqlite.Querier, contactID uuid.UUID) ([]string, error) {
 	// unsubscribe_keywords is a JSON array; json_each expands it into rows the
 	// same way unnest did.

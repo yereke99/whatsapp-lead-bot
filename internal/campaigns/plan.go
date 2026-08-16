@@ -27,9 +27,22 @@ type PlanOptions struct {
 	// Grace treats a step scheduled slightly in the past as still on time,
 	// which absorbs clock skew and short scheduler delays.
 	Grace time.Duration
+	// TriggerDelay is the shortest gap allowed between the customer's trigger
+	// and a step anchored to it. It stops the greeting landing in the same
+	// instant as the message that asked for it.
+	TriggerDelay time.Duration
 }
 
 // BuildPlan resolves a campaign's steps into absolute send times.
+//
+// Two anchors are in play, and they answer different questions:
+//
+//   - RELATIVE_TO_EVENT measures from the campaign's event start, so every
+//     contact receives the step at the same wall-clock moment. A webinar at
+//     21:00 with an offset of -3h is the 18:00 message, for everyone.
+//   - ON_TRIGGER measures from the moment this contact entered the campaign,
+//     so the offset is a personal delay. A contact who triggers at 17:30 and
+//     one who triggers at 18:10 each get their own timetable.
 //
 // This function is deliberately pure: no database, no clock of its own. All
 // scheduling behaviour is therefore directly testable, and the same logic
@@ -48,6 +61,15 @@ func BuildPlan(eventStart *time.Time, steps []domain.CampaignStep, opts PlanOpti
 	entries := make([]PlanEntry, 0, len(steps))
 	cutoff := opts.Now.Add(-opts.Grace)
 
+	// The trigger anchor never runs behind the current time: the provider
+	// timestamp on the inbound message can be seconds old by the time it is
+	// processed, and a delay measured from a stale instant would collapse to
+	// nothing.
+	triggerAnchor := opts.EnrolledAt
+	if triggerAnchor.Before(opts.Now) {
+		triggerAnchor = opts.Now
+	}
+
 	// First pass: resolve times and mark everything that is disabled or
 	// impossible to schedule.
 	for _, step := range steps {
@@ -59,7 +81,11 @@ func BuildPlan(eventStart *time.Time, steps []domain.CampaignStep, opts PlanOpti
 			entry.Reason = "қадам өшірілген"
 
 		case step.ScheduleKind == domain.ScheduleOnTrigger:
-			entry.RunAt = opts.EnrolledAt
+			delay := time.Duration(step.OffsetSeconds) * time.Second
+			if delay < opts.TriggerDelay {
+				delay = opts.TriggerDelay
+			}
+			entry.RunAt = triggerAnchor.Add(delay)
 
 		case eventStart == nil:
 			entry.Skipped = true
@@ -120,13 +146,21 @@ func Scheduled(entries []PlanEntry) []PlanEntry {
 }
 
 // PreviewEntry is one row of the campaign timeline shown before activation.
+//
+// It carries both the stored configuration (offset, schedule kind) and the
+// resolved wall-clock time in the campaign's own timezone, because the
+// operator reasons in "18:00" while the database reasons in offsets.
 type PreviewEntry struct {
 	StepID       string `json:"step_id"`
+	OrderIndex   int    `json:"order_index"`
 	Name         string `json:"name"`
+	ScheduleKind string `json:"schedule_kind"`
 	OffsetLabel  string `json:"offset_label"`
 	Offset       int    `json:"offset_seconds"`
+	LocalDate    string `json:"local_date"`
 	LocalTime    string `json:"local_time"`
 	UTCTime      string `json:"utc_time"`
+	TemplateID   string `json:"message_template_id"`
 	TemplateName string `json:"template_name"`
 	TemplateType string `json:"template_type"`
 	Enabled      bool   `json:"enabled"`

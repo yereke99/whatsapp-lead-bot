@@ -5,7 +5,7 @@ import {
 } from '../ui.js';
 import {
   formatDateTime, formatNumber, dateInputValue, timeInputValue,
-  CAMPAIGN_STATUS, EXISTING_BEHAVIOR, timezone,
+  CAMPAIGN_STATUS, EXISTING_BEHAVIOR, RESUME_POLICY, timezone,
 } from '../format.js';
 
 const TIMEZONES = [
@@ -216,6 +216,31 @@ export async function openCampaignForm(campaign, onSaved) {
     value: String(campaign?.max_send_attempts || 5),
   });
 
+  // What to do with messages whose moment passed while the campaign was off.
+  const resumeSelect = select(
+    Object.entries(RESUME_POLICY).map(([value, label]) => ({ value, label })),
+    { value: campaign?.resume_policy || 'SKIP_EXPIRED' },
+  );
+
+  const pinVersion = checkbox('Кезектегі хабарламалар шаблонның ағымдағы нұсқасында қалсын', {
+    checked: campaign?.pin_template_version ?? false,
+    hint: 'Өшірулі болса, шаблонды өңдегенде әлі жіберілмеген хабарламалар жаңа нұсқамен кетеді',
+  });
+
+  // Optional safety caps. Empty means no limit.
+  const perHourInput = input({
+    type: 'number', min: '1', placeholder: 'шектеусіз',
+    value: campaign?.max_messages_per_hour ? String(campaign.max_messages_per_hour) : '',
+  });
+  const perDayInput = input({
+    type: 'number', min: '1', placeholder: 'шектеусіз',
+    value: campaign?.max_messages_per_day ? String(campaign.max_messages_per_day) : '',
+  });
+  const maxContactsInput = input({
+    type: 'number', min: '1', placeholder: 'шектеусіз',
+    value: campaign?.max_active_contacts ? String(campaign.max_active_contacts) : '',
+  });
+
   const errorBox = el('div', { class: 'alert alert--danger hidden' });
 
   const body = el('div', {},
@@ -237,6 +262,18 @@ export async function openCampaignForm(campaign, onSaved) {
       hint: 'Үтір арқылы бөліңіз. Клиент осы сөздердің бірін жазса, автоматтандыру тоқтайды.',
     }),
     el('div', { class: 'field' }, catchUp),
+    field('Тоқтатудан кейін жалғастыру', resumeSelect, {
+      hint: 'Кампания тоқтап тұрғанда уақыты өтіп кеткен хабарламалармен не істеу керек',
+    }),
+    el('div', { class: 'field' }, pinVersion),
+    el('div', { class: 'label mt-3' }, 'Қауіпсіздік шектеулері'),
+    el('div', { class: 'form-grid form-grid--3' },
+      field('Сағатына', perHourInput),
+      field('Тәулігіне', perDayInput),
+      field('Белсенді клиент', maxContactsInput)),
+    el('p', { class: 'muted small' },
+      'Бос қалдырсаңыз — шектеу жоқ. Шекке жеткенде кезек тоқтап, әкімші панелінде ескерту көрсетіледі; '
+      + 'хабарламалар жоғалмайды.'),
   );
 
   const saveButton = button(isEdit ? 'Сақтау' : 'Құру', { variant: 'primary' });
@@ -264,6 +301,11 @@ export async function openCampaignForm(campaign, onSaved) {
       unsubscribe_keywords: keywordsInput.value.split(',').map((k) => k.trim()).filter(Boolean),
       catch_up_missed_steps: catchUp.input.checked,
       max_send_attempts: Number(attemptsInput.value) || 5,
+      resume_policy: resumeSelect.value,
+      pin_template_version: pinVersion.input.checked,
+      max_messages_per_hour: optionalLimit(perHourInput.value),
+      max_messages_per_day: optionalLimit(perDayInput.value),
+      max_active_contacts: optionalLimit(maxContactsInput.value),
     };
 
     if (!payload.name) {
@@ -297,4 +339,13 @@ export async function openCampaignForm(campaign, onSaved) {
     errorBox.textContent = message;
     errorBox.classList.remove('hidden');
   }
+}
+
+// optionalLimit turns an empty safety-limit field into "no limit" rather than
+// zero, which would mean "allow nothing".
+function optionalLimit(value) {
+  const trimmed = String(value ?? '').trim();
+  if (trimmed === '') return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
 }

@@ -134,6 +134,33 @@ func Offset(base time.Time, seconds int) time.Time {
 	return base.Add(time.Duration(seconds) * time.Second)
 }
 
+// HumanDuration renders a positive duration as Kazakh text, used for delays
+// measured from a customer's trigger rather than from a fixed clock time.
+//
+// Examples: 2s -> "2 секунд", 10m -> "10 минут", 90m -> "1 сағат 30 минут".
+func HumanDuration(d time.Duration) string {
+	if d <= 0 {
+		return "бірден"
+	}
+
+	d = d.Round(time.Second)
+	h := int(d / time.Hour)
+	m := int((d % time.Hour) / time.Minute)
+	s := int((d % time.Minute) / time.Second)
+
+	parts := make([]string, 0, 3)
+	if h > 0 {
+		parts = append(parts, fmt.Sprintf("%d сағат", h))
+	}
+	if m > 0 {
+		parts = append(parts, fmt.Sprintf("%d минут", m))
+	}
+	if s > 0 {
+		parts = append(parts, fmt.Sprintf("%d секунд", s))
+	}
+	return strings.Join(parts, " ")
+}
+
 // RemainingLabel renders the gap between now and target as Kazakh text used by
 // the {{remaining_time}} template variable.
 func RemainingLabel(now, target time.Time) string {

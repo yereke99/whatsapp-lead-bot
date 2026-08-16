@@ -178,6 +178,27 @@ func ValidExistingBehavior(s string) bool {
 	return false
 }
 
+// ResumePolicy decides what happens to jobs whose time passed while the
+// campaign was paused.
+type ResumePolicy string
+
+const (
+	// ResumeSkipExpired cancels everything already overdue. Resuming at 20:00
+	// after a pause at 18:00 does not dump both missed messages on the contact.
+	ResumeSkipExpired ResumePolicy = "SKIP_EXPIRED"
+	// ResumeSendNextValid keeps the most recent overdue step per contact and
+	// sends it immediately, dropping the older ones.
+	ResumeSendNextValid ResumePolicy = "SEND_NEXT_VALID"
+)
+
+func ValidResumePolicy(s string) bool {
+	switch ResumePolicy(s) {
+	case ResumeSkipExpired, ResumeSendNextValid:
+		return true
+	}
+	return false
+}
+
 type Campaign struct {
 	ID                      uuid.UUID               `json:"id"`
 	Name                    string                  `json:"name"`
@@ -192,10 +213,18 @@ type Campaign struct {
 	UnsubscribeKeywords     []string                `json:"unsubscribe_keywords"`
 	CatchUpMissedSteps      bool                    `json:"catch_up_missed_steps"`
 	MaxSendAttempts         int                     `json:"max_send_attempts"`
-	ArchivedAt              *time.Time              `json:"archived_at"`
-	CreatedBy               *uuid.UUID              `json:"created_by"`
-	CreatedAt               time.Time               `json:"created_at"`
-	UpdatedAt               time.Time               `json:"updated_at"`
+	ResumePolicy            ResumePolicy            `json:"resume_policy"`
+	// PinTemplateVersion freezes queued jobs to the template revision that was
+	// current when they were queued. Off by default, which keeps the
+	// long-standing behaviour of unsent messages picking up template edits.
+	PinTemplateVersion bool       `json:"pin_template_version"`
+	MaxMessagesPerHour *int       `json:"max_messages_per_hour"`
+	MaxMessagesPerDay  *int       `json:"max_messages_per_day"`
+	MaxActiveContacts  *int       `json:"max_active_contacts"`
+	ArchivedAt         *time.Time `json:"archived_at"`
+	CreatedBy          *uuid.UUID `json:"created_by"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 
 	// Aggregates filled in by list queries.
 	Triggers     []CampaignTrigger `json:"triggers,omitempty"`
@@ -203,6 +232,8 @@ type Campaign struct {
 	ContactCount int               `json:"contact_count"`
 	PendingJobs  int               `json:"pending_jobs"`
 	SentCount    int               `json:"sent_count"`
+	SentLastHour int               `json:"sent_last_hour"`
+	SentLastDay  int               `json:"sent_last_day"`
 }
 
 // AcceptsEnrollments reports whether new contacts may join right now.
@@ -222,27 +253,51 @@ type CampaignTrigger struct {
 	CampaignRef string    `json:"campaign_name,omitempty"`
 }
 
+// ScheduleKind selects which anchor a step's offset is measured from.
 type ScheduleKind string
 
 const (
+	// ScheduleRelativeToEvent anchors the step to campaign.event_start_at, so
+	// every enrolled contact receives it at the same wall-clock moment. This is
+	// how an exact campaign time such as "18:00 on 16.08.2026" is expressed:
+	// the admin picks a date and time, and the panel stores the resulting
+	// signed offset from the event. Moving the event then moves the whole
+	// queue coherently.
 	ScheduleRelativeToEvent ScheduleKind = "RELATIVE_TO_EVENT"
-	ScheduleOnTrigger       ScheduleKind = "ON_TRIGGER"
+	// ScheduleOnTrigger anchors the step to the moment the contact entered the
+	// campaign, so the offset is a per-contact delay: +2s, +10m, +2h. Each
+	// contact therefore gets their own timetable.
+	ScheduleOnTrigger ScheduleKind = "ON_TRIGGER"
 )
 
+func ValidScheduleKind(s string) bool {
+	switch ScheduleKind(s) {
+	case ScheduleRelativeToEvent, ScheduleOnTrigger:
+		return true
+	}
+	return false
+}
+
 type CampaignStep struct {
-	ID              uuid.UUID    `json:"id"`
-	CampaignID      uuid.UUID    `json:"campaign_id"`
-	Name            string       `json:"name"`
-	OffsetSeconds   int          `json:"offset_seconds"`
-	TemplateID      uuid.UUID    `json:"message_template_id"`
-	Enabled         bool         `json:"enabled"`
-	OrderIndex      int          `json:"order_index"`
-	ScheduleKind    ScheduleKind `json:"schedule_kind"`
-	CreatedAt       time.Time    `json:"created_at"`
-	UpdatedAt       time.Time    `json:"updated_at"`
-	TemplateName    string       `json:"template_name,omitempty"`
-	TemplateType    TemplateType `json:"template_type,omitempty"`
-	TemplatePreview string       `json:"template_preview,omitempty"`
+	ID            uuid.UUID    `json:"id"`
+	CampaignID    uuid.UUID    `json:"campaign_id"`
+	Name          string       `json:"name"`
+	OffsetSeconds int          `json:"offset_seconds"`
+	TemplateID    uuid.UUID    `json:"message_template_id"`
+	Enabled       bool         `json:"enabled"`
+	OrderIndex    int          `json:"order_index"`
+	ScheduleKind  ScheduleKind `json:"schedule_kind"`
+	CreatedAt     time.Time    `json:"created_at"`
+	UpdatedAt     time.Time    `json:"updated_at"`
+
+	// Template details joined in by list queries, so the queue can be rendered
+	// and validated without a second round trip per row.
+	TemplateName     string       `json:"template_name,omitempty"`
+	TemplateType     TemplateType `json:"template_type,omitempty"`
+	TemplatePreview  string       `json:"template_preview,omitempty"`
+	TemplateVersion  int          `json:"template_version,omitempty"`
+	TemplateHasMedia bool         `json:"template_has_media"`
+	TemplateArchived bool         `json:"template_archived"`
 }
 
 // --------------------------------------------------------------- templates --
@@ -454,25 +509,28 @@ const (
 )
 
 type ScheduledMessage struct {
-	ID            uuid.UUID  `json:"id"`
-	CampaignID    uuid.UUID  `json:"campaign_id"`
-	ContactID     uuid.UUID  `json:"contact_id"`
-	EnrollmentID  uuid.UUID  `json:"enrollment_id"`
-	StepID        uuid.UUID  `json:"campaign_step_id"`
-	RunNumber     int        `json:"run_number"`
-	ScheduledAt   time.Time  `json:"scheduled_at"`
-	Status        JobStatus  `json:"status"`
-	AttemptCount  int        `json:"attempt_count"`
-	NextAttemptAt *time.Time `json:"next_attempt_at"`
-	LockedBy      *string    `json:"-"`
-	LockedAt      *time.Time `json:"-"`
-	SentAt        *time.Time `json:"sent_at"`
-	CancelledAt   *time.Time `json:"cancelled_at"`
-	CancelReason  string     `json:"cancel_reason"`
-	LastError     string     `json:"last_error"`
-	MessageID     *uuid.UUID `json:"message_id"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID           uuid.UUID `json:"id"`
+	CampaignID   uuid.UUID `json:"campaign_id"`
+	ContactID    uuid.UUID `json:"contact_id"`
+	EnrollmentID uuid.UUID `json:"enrollment_id"`
+	StepID       uuid.UUID `json:"campaign_step_id"`
+	RunNumber    int       `json:"run_number"`
+	ScheduledAt  time.Time `json:"scheduled_at"`
+	Status       JobStatus `json:"status"`
+	// TemplateVersion is the revision that was current when the job was queued.
+	// The campaign decides whether it is used for rendering or only reported.
+	TemplateVersion *int       `json:"template_version"`
+	AttemptCount    int        `json:"attempt_count"`
+	NextAttemptAt   *time.Time `json:"next_attempt_at"`
+	LockedBy        *string    `json:"-"`
+	LockedAt        *time.Time `json:"-"`
+	SentAt          *time.Time `json:"sent_at"`
+	CancelledAt     *time.Time `json:"cancelled_at"`
+	CancelReason    string     `json:"cancel_reason"`
+	LastError       string     `json:"last_error"`
+	MessageID       *uuid.UUID `json:"message_id"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 
 	CampaignName string `json:"campaign_name,omitempty"`
 	StepName     string `json:"step_name,omitempty"`

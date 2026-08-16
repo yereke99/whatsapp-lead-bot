@@ -25,13 +25,20 @@ import (
 	"github.com/ayran/whatsapp-automation/pkg/timex"
 )
 
+// Dispatcher delivers one message. In production it is the outbound gate,
+// which bounds concurrency and paces sending; the interface keeps the
+// scheduler independent of that policy.
+type Dispatcher interface {
+	Send(ctx context.Context, contact *domain.Contact, out messaging.Outbound) (*domain.Message, error)
+}
+
 // Worker drains the persistent job queue.
 type Worker struct {
 	cfg        config.Scheduler
 	repo       *Repository
 	templates  *templates.Repository
 	contacts   *contacts.Repository
-	sender     *messaging.Sender
+	sender     Dispatcher
 	mediaStore *media.Store
 	log        *slog.Logger
 
@@ -47,7 +54,7 @@ func NewWorker(
 	repo *Repository,
 	templateRepo *templates.Repository,
 	contactRepo *contacts.Repository,
-	sender *messaging.Sender,
+	sender Dispatcher,
 	mediaStore *media.Store,
 	log *slog.Logger,
 ) *Worker {
@@ -204,17 +211,32 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		return
 	}
 
-	// A paused campaign holds its schedule rather than losing it: the job goes
-	// back to PENDING and is retried once the operator resumes.
+	// A paused campaign holds its schedule rather than losing it. This is a
+	// hold, not a failure, so it must not consume an attempt: a campaign paused
+	// for an afternoon would otherwise come back with its whole queue marked
+	// FAILED. What happens to jobs that expire during the pause is decided by
+	// the campaign's resume policy when the operator resumes it.
 	if jobCtx.CampaignStatus == domain.CampaignPaused {
 		next := time.Now().UTC().Add(2 * time.Minute)
-		if err := w.repo.Retry(ctx, job.ID, next, "campaign is paused"); err != nil {
+		if err := w.repo.Defer(ctx, job.ID, next, "кампания кідіртілген"); err != nil {
 			log.Error("deferring paused job failed", slog.String("error", err.Error()))
 		}
 		return
 	}
 
-	spec, err := w.templates.ResolveForSend(ctx, nil, jobCtx.TemplateID)
+	// Sending caps hold the queue rather than dropping messages, so an
+	// operator who set a conservative limit finds work waiting, not lost.
+	if held, until, reason := w.overSendingLimit(ctx, jobCtx); held {
+		if err := w.repo.Defer(ctx, job.ID, until, reason); err != nil {
+			log.Error("deferring rate-limited job failed", slog.String("error", err.Error()))
+		}
+		log.Warn("campaign sending limit reached; queue is holding",
+			slog.String("campaign", jobCtx.CampaignName),
+			slog.String("reason", reason))
+		return
+	}
+
+	spec, err := w.resolveTemplate(ctx, jobCtx, job)
 	if err != nil {
 		// A deleted template is a configuration fault, not a transient one.
 		if errors.Is(err, templates.ErrNotFound) {
@@ -263,6 +285,61 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		slog.String("step", jobCtx.StepName),
 		slog.String("contact_id", jobCtx.Job.ContactID.String()))
 
+}
+
+// resolveTemplate loads the content this job should render.
+//
+// A campaign that pins template versions renders the revision recorded when
+// the job was queued, so an edit never rewrites what a contact already in the
+// funnel is about to receive. Left off — the default, and the behaviour the
+// platform has always had — the live template is read at send time, so an edit
+// reaches every message not yet sent.
+func (w *Worker) resolveTemplate(ctx context.Context, jc *JobContext, job domain.ScheduledMessage) (*templates.SendSpec, error) {
+	if jc.CampaignPinVersion && job.TemplateVersion != nil {
+		spec, err := w.templates.ResolveVersionForSend(ctx, nil, jc.TemplateID, *job.TemplateVersion)
+		if err == nil {
+			return spec, nil
+		}
+		// A pinned revision that is missing is not worth failing a send over;
+		// the live template is the honest fallback.
+		if !errors.Is(err, templates.ErrNotFound) {
+			return nil, err
+		}
+		w.log.Warn("pinned template version is missing; sending the current one",
+			slog.String("template_id", jc.TemplateID.String()),
+			slog.Int("version", *job.TemplateVersion))
+	}
+	return w.templates.ResolveForSend(ctx, nil, jc.TemplateID)
+}
+
+// overSendingLimit checks the campaign's optional hourly and daily caps.
+//
+// A cap that is reached holds the queue: the job is deferred to the point the
+// window rolls over, which is the earliest moment it could legitimately go
+// out. Nothing is discarded and nothing is sent silently past the limit.
+func (w *Worker) overSendingLimit(ctx context.Context, jc *JobContext) (bool, time.Time, string) {
+	if jc.CampaignMaxPerHour == nil && jc.CampaignMaxPerDay == nil {
+		return false, time.Time{}, ""
+	}
+
+	now := time.Now().UTC()
+	lastHour, lastDay, err := w.repo.CampaignSendCounts(ctx, jc.Job.CampaignID, now)
+	if err != nil {
+		// Counting failed: let the send proceed rather than stalling a campaign
+		// on a transient read error.
+		w.log.Error("reading campaign send counters failed", slog.String("error", err.Error()))
+		return false, time.Time{}, ""
+	}
+
+	if jc.CampaignMaxPerHour != nil && lastHour >= *jc.CampaignMaxPerHour {
+		return true, now.Add(5 * time.Minute),
+			fmt.Sprintf("сағаттық шек толды (%d/%d)", lastHour, *jc.CampaignMaxPerHour)
+	}
+	if jc.CampaignMaxPerDay != nil && lastDay >= *jc.CampaignMaxPerDay {
+		return true, now.Add(15 * time.Minute),
+			fmt.Sprintf("тәуліктік шек толды (%d/%d)", lastDay, *jc.CampaignMaxPerDay)
+	}
+	return false, time.Time{}, ""
 }
 
 // shouldSkip reports configuration or consent reasons to drop a job outright.

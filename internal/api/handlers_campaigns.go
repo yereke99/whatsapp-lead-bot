@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/campaigns"
 	"github.com/ayran/whatsapp-automation/internal/domain"
 	"github.com/ayran/whatsapp-automation/internal/httpx"
+	"github.com/ayran/whatsapp-automation/internal/scheduler"
 	"github.com/ayran/whatsapp-automation/pkg/timex"
 )
 
@@ -68,6 +70,13 @@ type campaignRequest struct {
 	UnsubscribeKeywords     []string `json:"unsubscribe_keywords"`
 	CatchUpMissedSteps      bool     `json:"catch_up_missed_steps"`
 	MaxSendAttempts         int      `json:"max_send_attempts"`
+	ResumePolicy            string   `json:"resume_policy"`
+	PinTemplateVersion      bool     `json:"pin_template_version"`
+	// Nil means "no limit", which is why these are pointers rather than a
+	// zero value that would be indistinguishable from "allow nothing".
+	MaxMessagesPerHour *int `json:"max_messages_per_hour"`
+	MaxMessagesPerDay  *int `json:"max_messages_per_day"`
+	MaxActiveContacts  *int `json:"max_active_contacts"`
 }
 
 func (req campaignRequest) toInput() (campaigns.SaveInput, error) {
@@ -83,6 +92,11 @@ func (req campaignRequest) toInput() (campaigns.SaveInput, error) {
 		UnsubscribeKeywords:     req.UnsubscribeKeywords,
 		CatchUpMissedSteps:      req.CatchUpMissedSteps,
 		MaxSendAttempts:         req.MaxSendAttempts,
+		ResumePolicy:            req.ResumePolicy,
+		PinTemplateVersion:      req.PinTemplateVersion,
+		MaxMessagesPerHour:      req.MaxMessagesPerHour,
+		MaxMessagesPerDay:       req.MaxMessagesPerDay,
+		MaxActiveContacts:       req.MaxActiveContacts,
 	}
 
 	if strings.TrimSpace(req.ExistingContactTemplate) != "" {
@@ -258,15 +272,15 @@ func (s *Server) handleCampaignStatus(w http.ResponseWriter, r *http.Request) {
 
 	campaign, err := s.deps.Campaigns.SetStatus(r.Context(), id, status)
 	if err != nil {
+		var invalid campaigns.ValidationError
 		switch {
 		case errors.Is(err, campaigns.ErrNotFound):
 			httpx.Fail(w, http.StatusNotFound, httpx.CodeNotFound, "Кампания табылмады")
-		case errors.Is(err, campaigns.ErrNoEventStart):
-			httpx.Fail(w, http.StatusBadRequest, httpx.CodeValidation,
-				"Кампанияны іске қосу үшін іс-шара күні мен уақытын көрсетіңіз")
-		case errors.Is(err, campaigns.ErrNoEnabledSteps):
-			httpx.Fail(w, http.StatusBadRequest, httpx.CodeValidation,
-				"Кампанияда кемінде бір қосулы қадам болуы керек")
+		case errors.As(err, &invalid):
+			// Every blocking problem at once, so the operator fixes the
+			// campaign in one pass instead of one error per attempt.
+			httpx.FailWithDetails(w, http.StatusBadRequest, httpx.CodeValidation,
+				"Кампанияны іске қосу мүмкін емес", map[string]any{"problems": invalid.Problems})
 		default:
 			httpx.Fail(w, http.StatusBadRequest, httpx.CodeValidation, err.Error())
 		}
@@ -375,6 +389,64 @@ func (s *Server) handleCampaignPreview(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, entries)
 }
 
+// handleCampaignValidate reports everything standing between a campaign and
+// activation, so the panel can show the checklist while it is still a draft
+// rather than only when the operator presses the button.
+func (s *Server) handleCampaignValidate(w http.ResponseWriter, r *http.Request) {
+	id, err := httpx.PathUUID(r, "id")
+	if err != nil {
+		httpx.Fail(w, http.StatusBadRequest, httpx.CodeBadRequest, err.Error())
+		return
+	}
+
+	campaign, problems, err := s.deps.Campaigns.Validate(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, campaigns.ErrNotFound) {
+			httpx.Fail(w, http.StatusNotFound, httpx.CodeNotFound, "Кампания табылмады")
+			return
+		}
+		httpx.Internal(w, s.log, err, "validate campaign")
+		return
+	}
+	if problems == nil {
+		problems = []campaigns.Problem{}
+	}
+
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"can_activate": len(campaigns.Blocking(problems)) == 0,
+		"status":       campaign.Status,
+		"problems":     problems,
+	})
+}
+
+// handleCampaignScheduled lists the real queued messages for one campaign, as
+// opposed to the plan: what is actually waiting, for whom, and at what time.
+func (s *Server) handleCampaignScheduled(w http.ResponseWriter, r *http.Request) {
+	id, err := httpx.PathUUID(r, "id")
+	if err != nil {
+		httpx.Fail(w, http.StatusBadRequest, httpx.CodeBadRequest, err.Error())
+		return
+	}
+
+	filter := scheduler.ListFilter{
+		CampaignID: &id,
+		Status:     strings.ToUpper(httpx.QueryString(r, "status")),
+		Limit:      httpx.QueryInt(r, "limit", 50, 1, 200),
+		Offset:     httpx.QueryInt(r, "offset", 0, 0, 100000),
+	}
+
+	items, total, err := s.deps.Jobs.List(r.Context(), filter)
+	if err != nil {
+		httpx.Internal(w, s.log, err, "list campaign scheduled messages")
+		return
+	}
+	if items == nil {
+		items = []domain.ScheduledMessage{}
+	}
+
+	httpx.Paged(w, items, total, filter.Limit, filter.Offset)
+}
+
 // ----------------------------------------------------------------- steps --
 
 func (s *Server) handleListSteps(w http.ResponseWriter, r *http.Request) {
@@ -395,15 +467,29 @@ func (s *Server) handleListSteps(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, steps)
 }
 
+// stepRequest accepts a step in either of the two ways the panel offers it.
+//
+// For an event-anchored step the operator picks a wall-clock date and time
+// ("18:00 on 16.08.2026"); the panel may send that directly as scheduled_date
+// and scheduled_time, and the server converts it into the signed offset from
+// the campaign's event start that the queue actually stores. Sending
+// offset_seconds instead is equally valid and is what the drag-free editor
+// does. Storing the offset rather than the timestamp is what lets moving a
+// webinar carry its whole queue with it.
+//
+// For a trigger-anchored step offset_seconds is the delay after the customer
+// wrote in, and the date and time fields are ignored.
 type stepRequest struct {
 	Name          string `json:"name"`
 	OffsetSeconds int    `json:"offset_seconds"`
+	ScheduledDate string `json:"scheduled_date"`
+	ScheduledTime string `json:"scheduled_time"`
 	TemplateID    string `json:"message_template_id"`
 	Enabled       bool   `json:"enabled"`
 	ScheduleKind  string `json:"schedule_kind"`
 }
 
-func (req stepRequest) toInput() (campaigns.StepInput, error) {
+func (req stepRequest) toInput(campaign *domain.Campaign) (campaigns.StepInput, error) {
 	in := campaigns.StepInput{
 		Name:          req.Name,
 		OffsetSeconds: req.OffsetSeconds,
@@ -416,6 +502,24 @@ func (req stepRequest) toInput() (campaigns.StepInput, error) {
 		return in, errors.New("шаблон таңдалуы керек")
 	}
 	in.TemplateID = id
+
+	kind := strings.TrimSpace(req.ScheduleKind)
+	if kind == "" || kind == string(domain.ScheduleRelativeToEvent) {
+		if date := strings.TrimSpace(req.ScheduledDate); date != "" {
+			if campaign == nil {
+				return in, errors.New("кампания табылмады")
+			}
+			if campaign.EventStartAt == nil {
+				return in, errors.New("нақты уақыт қою үшін алдымен іс-шара күні мен уақытын белгілеңіз")
+			}
+			at, err := timex.ParseInLocation(date, req.ScheduledTime, campaign.Timezone)
+			if err != nil {
+				return in, err
+			}
+			in.OffsetSeconds = int(at.Sub(*campaign.EventStartAt).Round(time.Second) / time.Second)
+		}
+	}
+
 	return in, nil
 }
 
@@ -436,7 +540,17 @@ func (s *Server) handleCreateStep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	in, err := req.toInput()
+	campaign, err := s.deps.Campaigns.Repo().GetByID(r.Context(), nil, campaignID)
+	if err != nil {
+		httpx.Internal(w, s.log, err, "load campaign")
+		return
+	}
+	if campaign == nil {
+		httpx.Fail(w, http.StatusNotFound, httpx.CodeNotFound, "Кампания табылмады")
+		return
+	}
+
+	in, err := req.toInput(campaign)
 	if err != nil {
 		httpx.Fail(w, http.StatusBadRequest, httpx.CodeValidation, err.Error())
 		return
@@ -465,6 +579,12 @@ func (s *Server) handleUpdateStep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	campaignID, err := httpx.PathUUID(r, "id")
+	if err != nil {
+		httpx.Fail(w, http.StatusBadRequest, httpx.CodeBadRequest, err.Error())
+		return
+	}
+
 	stepID, err := httpx.PathUUID(r, "stepId")
 	if err != nil {
 		httpx.Fail(w, http.StatusBadRequest, httpx.CodeBadRequest, err.Error())
@@ -477,7 +597,17 @@ func (s *Server) handleUpdateStep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	in, err := req.toInput()
+	campaign, err := s.deps.Campaigns.Repo().GetByID(r.Context(), nil, campaignID)
+	if err != nil {
+		httpx.Internal(w, s.log, err, "load campaign")
+		return
+	}
+	if campaign == nil {
+		httpx.Fail(w, http.StatusNotFound, httpx.CodeNotFound, "Кампания табылмады")
+		return
+	}
+
+	in, err := req.toInput(campaign)
 	if err != nil {
 		httpx.Fail(w, http.StatusBadRequest, httpx.CodeValidation, err.Error())
 		return

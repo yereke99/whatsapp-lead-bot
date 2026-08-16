@@ -167,6 +167,9 @@ export const api = {
   setCampaignStatus: (id, status) => post(`/api/campaigns/${id}/status`, { status }),
   duplicateCampaign: (id) => post(`/api/campaigns/${id}/duplicate`),
   campaignPreview: (id) => get(`/api/campaigns/${id}/preview`),
+  campaignTimeline: (id) => get(`/api/campaigns/${id}/timeline`),
+  campaignValidate: (id) => get(`/api/campaigns/${id}/validate`),
+  campaignScheduled: (id, query) => get(`/api/campaigns/${id}/scheduled-messages`, query),
 
   // steps
   steps: (campaignId) => get(`/api/campaigns/${campaignId}/steps`),

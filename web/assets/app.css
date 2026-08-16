@@ -1038,6 +1038,148 @@ button, input, select, textarea { font: inherit; color: inherit; }
   overflow: hidden;
 }
 
+/* ------------------------------------------------------------------ help -- */
+
+/* A collapsible explainer that teaches the campaign model once and then stays
+   out of the way. Built on <details> so the open state needs no scripting. */
+
+.help {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.help__summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--text);
+  user-select: none;
+  list-style: none;
+}
+
+.help__summary::-webkit-details-marker { display: none; }
+.help__summary:hover { background: var(--surface-muted); }
+
+/* A chevron that rotates when the section opens. */
+.help__summary::after {
+  content: '';
+  margin-left: auto;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--text-subtle);
+  border-bottom: 2px solid var(--text-subtle);
+  transform: rotate(45deg) translate(-2px, -2px);
+  transition: transform .15s ease;
+}
+
+.help[open] .help__summary::after { transform: rotate(-135deg) translate(-2px, -2px); }
+.help[open] .help__summary { border-bottom: 1px solid var(--border); }
+
+.help__body { padding: 16px; font-size: 13px; line-height: 1.6; }
+.help__divider { height: 1px; background: var(--border); margin: 18px 0; }
+
+.help__title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 10px;
+  color: var(--text);
+}
+
+.help__steps {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.help__step-title { font-weight: 600; }
+.help__step-text { color: var(--text-muted); }
+
+.help__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.help__card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+  padding: 12px 14px;
+}
+
+.help__card-title { font-weight: 600; margin-bottom: 6px; }
+.help__card-text { color: var(--text-muted); }
+
+.help__card-example {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  font-size: 12px;
+  color: var(--text-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+.help__list {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--text-muted);
+}
+
+.help__list b { color: var(--text); }
+
+/* ----------------------------------------------------------- message queue -- */
+
+/* The campaign queue is a table whose rows can be dragged to reorder. The
+   grab affordance lives on the number column so the rest of the row stays
+   clickable. */
+
+.queue tbody tr { cursor: default; }
+.queue tbody tr.is-off td { opacity: .55; }
+
+.queue__handle {
+  cursor: grab;
+  user-select: none;
+  color: var(--text-subtle);
+  font-variant-numeric: tabular-nums;
+  position: relative;
+  padding-left: 22px !important;
+}
+
+/* A six-dot grip, drawn rather than shipped as an asset. */
+.queue__handle::before {
+  content: '⠿';
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 14px;
+  line-height: 1;
+  opacity: .5;
+}
+
+.queue tbody tr:hover .queue__handle::before { opacity: 1; }
+.queue__handle:active { cursor: grabbing; }
+
+.queue tbody tr.is-dragging {
+  opacity: .45;
+  background: var(--surface-muted);
+}
+
+@media (max-width: 720px) {
+  .queue__handle { padding-left: 20px !important; }
+}
+
 /* ---------------------------------------------------------------- charts -- */
 
 .chart { width: 100%; height: 220px; display: block; }

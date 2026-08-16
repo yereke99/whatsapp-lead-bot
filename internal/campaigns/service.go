@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,20 +19,38 @@ import (
 	"github.com/ayran/whatsapp-automation/pkg/timex"
 )
 
+// defaultTriggerDelay keeps the first reply from landing in the same instant
+// as the customer's own message when no delay is configured.
+const defaultTriggerDelay = 2 * time.Second
+
 type Service struct {
 	repo     *Repository
 	jobs     *scheduler.Repository
 	contacts *contacts.Repository
 	log      *slog.Logger
+
+	// triggerDelay is the floor for steps anchored to the trigger.
+	triggerDelay time.Duration
 }
 
 func NewService(repo *Repository, jobs *scheduler.Repository, contactRepo *contacts.Repository, log *slog.Logger) *Service {
 	return &Service{
-		repo:     repo,
-		jobs:     jobs,
-		contacts: contactRepo,
-		log:      log.With(slog.String("component", "campaigns")),
+		repo:         repo,
+		jobs:         jobs,
+		contacts:     contactRepo,
+		log:          log.With(slog.String("component", "campaigns")),
+		triggerDelay: defaultTriggerDelay,
 	}
+}
+
+// WithTriggerDelay sets the minimum gap between a trigger and the first
+// message it schedules. Values outside 1–5 seconds are ignored: an instant
+// reply reads as a bot, and a long one reads as a broken funnel.
+func (s *Service) WithTriggerDelay(d time.Duration) *Service {
+	if d >= time.Second && d <= 5*time.Second {
+		s.triggerDelay = d
+	}
+	return s
 }
 
 func (s *Service) Repo() *Repository { return s.repo }
@@ -150,6 +169,24 @@ func (s *Service) HandleTrigger(ctx context.Context, contact *domain.Contact, ma
 			return s.applyExistingBehavior(ctx, tx, campaign, contact, existing, match, at, result)
 		}
 
+		// An optional cap on how many contacts one campaign may be running at
+		// once. New entries stop; contacts already in the funnel finish.
+		if campaign.MaxActiveContacts != nil {
+			active, err := s.repo.ActiveEnrollmentCount(ctx, tx, campaign.ID)
+			if err != nil {
+				return err
+			}
+			if active >= *campaign.MaxActiveContacts {
+				result.Action = ActionIgnored
+				result.Reason = fmt.Sprintf("белсенді клиент шегі толды (%d)", *campaign.MaxActiveContacts)
+				s.log.Warn("campaign contact limit reached; enrollment refused",
+					slog.String("campaign_id", campaign.ID.String()),
+					slog.Int("active", active),
+					slog.Int("limit", *campaign.MaxActiveContacts))
+				return nil
+			}
+		}
+
 		enrollment := &domain.Enrollment{
 			CampaignID:     campaign.ID,
 			ContactID:      contact.ID,
@@ -255,6 +292,11 @@ func (s *Service) applyExistingBehavior(
 }
 
 // scheduleEnrollment turns the campaign's steps into persisted jobs.
+//
+// This is the whole of "send the campaign to this contact": the plan is
+// computed once, written to the queue, and from then on the database is the
+// only thing that decides when anything is sent. Nothing is delivered inline,
+// and nothing depends on this process staying alive.
 func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, campaign *domain.Campaign, enrollment *domain.Enrollment, at time.Time) (int, error) {
 	steps, err := s.repo.ListSteps(ctx, tx, campaign.ID)
 	if err != nil {
@@ -262,9 +304,10 @@ func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, cam
 	}
 
 	plan := BuildPlan(campaign.EventStartAt, steps, PlanOptions{
-		EnrolledAt: at,
-		Now:        at,
-		CatchUp:    campaign.CatchUpMissedSteps,
+		EnrolledAt:   at,
+		Now:          time.Now().UTC(),
+		CatchUp:      campaign.CatchUpMissedSteps,
+		TriggerDelay: s.triggerDelay,
 	})
 
 	jobs := make([]scheduler.NewJob, 0, len(plan))
@@ -298,6 +341,11 @@ type SaveInput struct {
 	UnsubscribeKeywords     []string
 	CatchUpMissedSteps      bool
 	MaxSendAttempts         int
+	ResumePolicy            string
+	PinTemplateVersion      bool
+	MaxMessagesPerHour      *int
+	MaxMessagesPerDay       *int
+	MaxActiveContacts       *int
 }
 
 func (in SaveInput) toCampaign() (*domain.Campaign, error) {
@@ -324,13 +372,33 @@ func (in SaveInput) toCampaign() (*domain.Campaign, error) {
 		ExistingContactTemplate: in.ExistingContactTemplate,
 		CatchUpMissedSteps:      in.CatchUpMissedSteps,
 		MaxSendAttempts:         in.MaxSendAttempts,
+		ResumePolicy:            domain.ResumePolicy(defaultIfEmpty(in.ResumePolicy, string(domain.ResumeSkipExpired))),
+		PinTemplateVersion:      in.PinTemplateVersion,
+		MaxMessagesPerHour:      in.MaxMessagesPerHour,
+		MaxMessagesPerDay:       in.MaxMessagesPerDay,
+		MaxActiveContacts:       in.MaxActiveContacts,
 	}
 
 	if !domain.ValidExistingBehavior(string(c.ExistingContactBehavior)) {
 		return nil, fmt.Errorf("қайталанған триггер режимі жарамсыз: %s", c.ExistingContactBehavior)
 	}
+	if !domain.ValidResumePolicy(string(c.ResumePolicy)) {
+		return nil, fmt.Errorf("жалғастыру саясаты жарамсыз: %s", c.ResumePolicy)
+	}
 	if c.MaxSendAttempts < 1 || c.MaxSendAttempts > 20 {
 		c.MaxSendAttempts = 5
+	}
+	for _, limit := range []struct {
+		value *int
+		name  string
+	}{
+		{in.MaxMessagesPerHour, "сағаттық шек"},
+		{in.MaxMessagesPerDay, "тәуліктік шек"},
+		{in.MaxActiveContacts, "белсенді клиент шегі"},
+	} {
+		if limit.value != nil && *limit.value < 1 {
+			return nil, fmt.Errorf("%s кемінде 1 болуы керек", limit.name)
+		}
 	}
 
 	if strings.TrimSpace(in.EventDate) != "" {
@@ -443,6 +511,10 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*Upda
 }
 
 // Activate validates that a campaign is fit to go live before flipping it on.
+//
+// Resuming from PAUSED also settles the backlog that built up while it was
+// off, according to the campaign's resume policy: a campaign paused at 18:00
+// and resumed at 20:00 must not release the 18:00 and 19:00 messages at once.
 func (s *Service) Activate(ctx context.Context, id uuid.UUID) (*domain.Campaign, error) {
 	campaign, err := s.repo.GetFull(ctx, id)
 	if err != nil {
@@ -451,27 +523,65 @@ func (s *Service) Activate(ctx context.Context, id uuid.UUID) (*domain.Campaign,
 	if campaign == nil {
 		return nil, ErrNotFound
 	}
-	if campaign.EventStartAt == nil {
-		return nil, ErrNoEventStart
+
+	// Warnings are reported to the panel but never block: an operator who
+	// wants to activate a campaign whose event time has passed is allowed to.
+	if blocking := Blocking(Validate(campaign)); len(blocking) > 0 {
+		return nil, ValidationError{Problems: blocking}
 	}
 
-	enabled := 0
-	for _, step := range campaign.Steps {
-		if step.Enabled {
-			enabled++
+	wasPaused := campaign.Status == domain.CampaignPaused
+
+	err = s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
+		if err := s.repo.SetStatus(ctx, tx, id, domain.CampaignActive); err != nil {
+			return err
 		}
-	}
-	if enabled == 0 {
-		return nil, ErrNoEnabledSteps
-	}
-	if len(campaign.Triggers) == 0 {
-		return nil, errors.New("кампанияда белсенді триггер жоқ")
-	}
-
-	if err := s.repo.SetStatus(ctx, nil, id, domain.CampaignActive); err != nil {
+		if !wasPaused {
+			return nil
+		}
+		return s.applyResumePolicy(ctx, tx, campaign)
+	})
+	if err != nil {
 		return nil, err
 	}
+
 	return s.repo.GetFull(ctx, id)
+}
+
+// applyResumePolicy decides what to do with jobs whose moment passed during a
+// pause.
+//
+// The grace window matches the planner's, so a job that came due seconds
+// before the operator hit resume is still treated as on time.
+func (s *Service) applyResumePolicy(ctx context.Context, tx sqlite.Querier, campaign *domain.Campaign) error {
+	now := time.Now().UTC()
+	cutoff := now.Add(-time.Minute)
+
+	var forwarded int64
+	if campaign.ResumePolicy == domain.ResumeSendNextValid {
+		// Keep one message of context per contact: their most recent overdue
+		// step is moved to now, and the cancel below clears the rest.
+		n, err := s.jobs.PullForwardLatestExpired(ctx, tx, campaign.ID, cutoff, now)
+		if err != nil {
+			return err
+		}
+		forwarded = n
+	}
+
+	skipped, err := s.jobs.ExpirePendingForCampaign(ctx, tx, campaign.ID, cutoff,
+		"кампания кідіртілген кезде уақыты өтіп кетті")
+	if err != nil {
+		return err
+	}
+
+	if skipped > 0 || forwarded > 0 {
+		s.log.Info("resume policy applied",
+			slog.String("campaign_id", campaign.ID.String()),
+			slog.String("policy", string(campaign.ResumePolicy)),
+			slog.Int64("expired_cancelled", skipped),
+			slog.Int64("pulled_forward", forwarded))
+	}
+	return nil
 }
 
 // SetStatus applies a lifecycle transition other than activation.
@@ -565,13 +675,19 @@ func (in StepInput) validate() error {
 		return errors.New("шаблон таңдалуы керек")
 	}
 	kind := domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent)))
-	if kind != domain.ScheduleRelativeToEvent && kind != domain.ScheduleOnTrigger {
+	if !domain.ValidScheduleKind(string(kind)) {
 		return fmt.Errorf("қадам түрі жарамсыз: %s", kind)
 	}
 	// One year either side of the event covers every realistic drip campaign
 	// and matches the database constraint.
 	if in.OffsetSeconds < -31536000 || in.OffsetSeconds > 31536000 {
 		return errors.New("уақыт ығысуы шектен тыс")
+	}
+	// A trigger-anchored offset is a delay after the customer wrote to us.
+	// Time does not run backwards from that anchor, so a negative value is a
+	// configuration mistake rather than a schedule.
+	if kind == domain.ScheduleOnTrigger && in.OffsetSeconds < 0 {
+		return errors.New("триггерден кейінгі кідіріс теріс болмауы керек")
 	}
 	return nil
 }
@@ -635,16 +751,22 @@ func (s *Service) UpdateStep(ctx context.Context, stepID uuid.UUID, in StepInput
 			return err
 		}
 
+		// Only queued messages are reconciled. Anything already sent is
+		// history, and anything in flight belongs to the worker holding it.
 		switch {
 		case previous.Enabled && !step.Enabled:
-			_, err = s.jobs.CancelPendingForStep(ctx, tx, stepID, "step disabled")
+			_, err = s.jobs.CancelPendingForStep(ctx, tx, stepID, "қадам өшірілді")
 			return err
 
 		case !previous.Enabled && step.Enabled:
 			return s.backfillStep(ctx, tx, step.CampaignID, step)
 
-		case previous.OffsetSeconds != step.OffsetSeconds:
-			_, err = s.jobs.RescheduleStep(ctx, tx, stepID)
+		case previous.OffsetSeconds != step.OffsetSeconds || previous.ScheduleKind != step.ScheduleKind:
+			if step.ScheduleKind == domain.ScheduleOnTrigger {
+				_, err = s.jobs.RescheduleTriggerStep(ctx, tx, stepID)
+			} else {
+				_, err = s.jobs.RescheduleStep(ctx, tx, stepID)
+			}
 			return err
 		}
 		return nil
@@ -787,6 +909,10 @@ func (s *Service) DeleteTrigger(ctx context.Context, id uuid.UUID) error {
 
 // Preview renders the full automation timeline in the campaign's own timezone
 // so the operator can verify it before activating.
+//
+// Rows come back in send order, which is what the operator is reasoning about.
+// Trigger-anchored steps have no shared wall-clock time — each contact gets
+// their own — so they are described by their delay and listed first.
 func (s *Service) Preview(ctx context.Context, id uuid.UUID) ([]PreviewEntry, error) {
 	campaign, err := s.repo.GetFull(ctx, id)
 	if err != nil {
@@ -796,33 +922,98 @@ func (s *Service) Preview(ctx context.Context, id uuid.UUID) ([]PreviewEntry, er
 		return nil, ErrNotFound
 	}
 
+	warnings := map[string]string{}
+	for _, problem := range Validate(campaign) {
+		if problem.StepID != "" {
+			if _, seen := warnings[problem.StepID]; !seen {
+				warnings[problem.StepID] = problem.Message
+			}
+		}
+	}
+
 	entries := make([]PreviewEntry, 0, len(campaign.Steps))
 	for _, step := range campaign.Steps {
 		entry := PreviewEntry{
 			StepID:       step.ID.String(),
+			OrderIndex:   step.OrderIndex,
 			Name:         step.Name,
+			ScheduleKind: string(step.ScheduleKind),
 			Offset:       step.OffsetSeconds,
 			OffsetLabel:  timex.HumanOffset(step.OffsetSeconds),
+			TemplateID:   step.TemplateID.String(),
 			TemplateName: step.TemplateName,
 			TemplateType: string(step.TemplateType),
 			Enabled:      step.Enabled,
+			Warning:      warnings[step.ID.String()],
 		}
 
 		switch {
 		case step.ScheduleKind == domain.ScheduleOnTrigger:
-			entry.LocalTime = "триггер кезінде"
-			entry.OffsetLabel = "бірден"
+			delay := time.Duration(step.OffsetSeconds) * time.Second
+			if delay < s.triggerDelay {
+				delay = s.triggerDelay
+			}
+			entry.LocalTime = "триггерден кейін " + timex.HumanDuration(delay)
+			entry.OffsetLabel = "+" + timex.HumanDuration(delay)
 		case campaign.EventStartAt == nil:
-			entry.Warning = "іс-шара уақыты белгіленбеген"
+			if entry.Warning == "" {
+				entry.Warning = "іс-шара уақыты белгіленбеген"
+			}
 		default:
-			runAt := campaign.EventStartAt.Add(time.Duration(step.OffsetSeconds) * time.Second)
-			entry.LocalTime = timex.FormatIn(runAt, campaign.Timezone, "2006-01-02 15:04:05")
+			runAt := timex.Offset(*campaign.EventStartAt, step.OffsetSeconds)
+			entry.LocalDate = timex.FormatIn(runAt, campaign.Timezone, "02.01.2006")
+			entry.LocalTime = timex.FormatIn(runAt, campaign.Timezone, "15:04:05")
 			entry.UTCTime = runAt.UTC().Format(time.RFC3339)
 		}
 
 		entries = append(entries, entry)
 	}
+
+	sortPreview(entries)
 	return entries, nil
+}
+
+// sortPreview orders the timeline the way it will actually run: trigger-time
+// steps first, then everything anchored to the event in chronological order.
+// Steps that cannot be placed keep their configured position at the end.
+func sortPreview(entries []PreviewEntry) {
+	rank := func(e PreviewEntry) int {
+		switch {
+		case e.ScheduleKind == string(domain.ScheduleOnTrigger):
+			return 0
+		case e.UTCTime != "":
+			return 1
+		default:
+			return 2
+		}
+	}
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		ri, rj := rank(entries[i]), rank(entries[j])
+		if ri != rj {
+			return ri < rj
+		}
+		switch ri {
+		case 0:
+			return entries[i].Offset < entries[j].Offset
+		case 1:
+			return entries[i].UTCTime < entries[j].UTCTime
+		default:
+			return entries[i].OrderIndex < entries[j].OrderIndex
+		}
+	})
+}
+
+// Validate reports everything standing between a campaign and activation.
+func (s *Service) Validate(ctx context.Context, id uuid.UUID) (*domain.Campaign, []Problem, error) {
+	campaign, err := s.repo.GetFull(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if campaign == nil {
+		return nil, nil, ErrNotFound
+	}
+	return campaign, Validate(campaign), nil
 }
 
 // StopForContact ends every active enrollment and cancels pending jobs, used

@@ -49,6 +49,17 @@ export async function renderTemplates(root) {
           'Мәтін, сурет, бейне, аудио және дауыстық хабарламалар. Кампаниялар арасында қайта қолданылады.')),
       el('div', { class: 'page-head__actions' },
         button('Жаңа шаблон', { iconName: 'plus', variant: 'primary', onClick: () => openForm(null) }))),
+    // The one thing worth saying on this page: a template has no time of its
+    // own. Operators otherwise look for a date field here and do not find one.
+    el('div', { class: 'alert alert--info' },
+      icon('clock', 16),
+      el('div', {},
+        el('div', { class: 'alert__title' }, 'Шаблонда уақыт болмайды'),
+        el('div', { class: 'small' },
+          'Мұнда тек хабарламаның мазмұны сақталады. Қашан жіберілетінін кампанияның '
+          + '«Хабарламалар кезегі» бөлімінде белгілейсіз — сол жерде әр шаблонға күн мен уақыт '
+          + 'немесе триггерден кейінгі кідіріс қойылады. Сондықтан бір шаблонды бірнеше '
+          + 'кампанияда әртүрлі уақытта қолдануға болады.'))),
     el('div', { class: 'card' },
       el('div', { class: 'toolbar' }, searchInput, typeFilter),
       el('div', { class: 'card__body' }, listHolder)),

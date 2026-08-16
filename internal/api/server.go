@@ -111,7 +111,13 @@ func (s *Server) routes() {
 	protected.HandleFunc("DELETE /api/campaigns/{id}", s.handleDeleteCampaign)
 	protected.HandleFunc("POST /api/campaigns/{id}/status", s.handleCampaignStatus)
 	protected.HandleFunc("POST /api/campaigns/{id}/duplicate", s.handleDuplicateCampaign)
+	// preview and timeline are the same projection: the campaign's steps
+	// resolved to real times, in send order. Both names are served because the
+	// panel reads it as a timeline and the API has always called it a preview.
 	protected.HandleFunc("GET /api/campaigns/{id}/preview", s.handleCampaignPreview)
+	protected.HandleFunc("GET /api/campaigns/{id}/timeline", s.handleCampaignPreview)
+	protected.HandleFunc("GET /api/campaigns/{id}/validate", s.handleCampaignValidate)
+	protected.HandleFunc("GET /api/campaigns/{id}/scheduled-messages", s.handleCampaignScheduled)
 
 	protected.HandleFunc("GET /api/campaigns/{id}/steps", s.handleListSteps)
 	protected.HandleFunc("POST /api/campaigns/{id}/steps", s.handleCreateStep)

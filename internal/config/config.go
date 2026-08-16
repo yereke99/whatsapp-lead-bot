@@ -17,6 +17,7 @@ type Config struct {
 	GreenAPI  GreenAPI
 	Media     Media
 	Scheduler Scheduler
+	Outbound  Outbound
 }
 
 type App struct {
@@ -98,10 +99,29 @@ type Scheduler struct {
 	RetryMaxDelay  time.Duration
 	LockTimeout    time.Duration
 	StaleJobTTL    time.Duration
+	// TriggerDelay is the floor applied to a step scheduled at trigger time, so
+	// the first reply never lands in the same instant as the customer's own
+	// message. It is a scheduled job, not a sleep: the queue holds the message
+	// and a worker picks it up when it comes due.
+	TriggerDelay time.Duration
 	// Inbound provider notifications: how many workers apply them and how
 	// many are claimed per batch.
 	NotificationWorkers   int
 	NotificationBatchSize int
+}
+
+// Outbound paces everything the platform sends. One WhatsApp account is one
+// conversation partner as far as the provider is concerned, so the defaults
+// serialise sending and space it out rather than pushing for throughput.
+type Outbound struct {
+	// Workers is how many messages may be in flight at once. Keep at 1 for a
+	// single account.
+	Workers int
+	// MinDelay and MaxDelay bound the pause between two consecutive sends. The
+	// actual pause is drawn from that range so a long queue does not go out on
+	// a metronome.
+	MinDelay time.Duration
+	MaxDelay time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults and
@@ -168,17 +188,25 @@ func Load() (*Config, error) {
 			VoiceBitrate: envStr("VOICE_BITRATE", "32k"),
 		},
 		Scheduler: Scheduler{
-			Enabled:               envBool("SCHEDULER_ENABLED", true),
-			Workers:               envInt("SCHEDULER_WORKERS", 4),
-			PollInterval:          envDuration("SCHEDULER_POLL_INTERVAL", 5*time.Second),
-			BatchSize:             envInt("SCHEDULER_BATCH_SIZE", 25),
-			MaxAttempts:           envInt("SCHEDULER_MAX_ATTEMPTS", 5),
-			RetryBaseDelay:        envDuration("SCHEDULER_RETRY_BASE_DELAY", 30*time.Second),
+			Enabled:      envBool("SCHEDULER_ENABLED", true),
+			Workers:      envInt("SCHEDULER_WORKERS", 2),
+			PollInterval: envDuration("SCHEDULER_POLL_INTERVAL", time.Second),
+			BatchSize:    envInt("SCHEDULER_BATCH_SIZE", 25),
+			MaxAttempts:  envInt("SCHEDULER_MAX_ATTEMPTS", 4),
+			// 5s, 15s, 30s, 60s in the same spirit as the documented policy;
+			// the backoff adds jitter around each step.
+			RetryBaseDelay:        envDuration("SCHEDULER_RETRY_BASE_DELAY", 10*time.Second),
 			RetryMaxDelay:         envDuration("SCHEDULER_RETRY_MAX_DELAY", 30*time.Minute),
 			LockTimeout:           envDuration("SCHEDULER_LOCK_TIMEOUT", 5*time.Minute),
 			StaleJobTTL:           envDuration("SCHEDULER_STALE_JOB_TTL", 2*time.Hour),
+			TriggerDelay:          time.Duration(envInt("TRIGGER_GREETING_DELAY_MS", 2000)) * time.Millisecond,
 			NotificationWorkers:   envInt("GREEN_API_WORKERS", 5),
 			NotificationBatchSize: envInt("GREEN_API_BATCH_SIZE", 50),
+		},
+		Outbound: Outbound{
+			Workers:  envInt("WHATSAPP_SEND_WORKERS", 1),
+			MinDelay: time.Duration(envInt("WHATSAPP_MIN_SEND_DELAY_MS", 2000)) * time.Millisecond,
+			MaxDelay: time.Duration(envInt("WHATSAPP_MAX_SEND_DELAY_MS", 5000)) * time.Millisecond,
 		},
 	}
 
@@ -214,6 +242,21 @@ func (c *Config) validate() error {
 	}
 	if c.Scheduler.NotificationWorkers < 1 {
 		problems = append(problems, "GREEN_API_WORKERS must be at least 1")
+	}
+	// The outbound limits exist to keep automated sending calm and predictable.
+	// A misconfiguration here is the one that gets a WhatsApp account into
+	// trouble, so the bounds are enforced rather than clamped silently.
+	if c.Outbound.Workers < 1 || c.Outbound.Workers > 4 {
+		problems = append(problems, "WHATSAPP_SEND_WORKERS must be between 1 and 4; prefer 1 for a single account")
+	}
+	if c.Outbound.MinDelay < time.Second {
+		problems = append(problems, "WHATSAPP_MIN_SEND_DELAY_MS must be at least 1000")
+	}
+	if c.Outbound.MaxDelay < c.Outbound.MinDelay {
+		problems = append(problems, "WHATSAPP_MAX_SEND_DELAY_MS must be greater than or equal to WHATSAPP_MIN_SEND_DELAY_MS")
+	}
+	if c.Scheduler.TriggerDelay < time.Second || c.Scheduler.TriggerDelay > 5*time.Second {
+		problems = append(problems, "TRIGGER_GREETING_DELAY_MS must be between 1000 and 5000")
 	}
 	// Inbound polling holds the connection open for ReceiveTimeout. A client
 	// timeout below that aborts every poll before the provider can answer,

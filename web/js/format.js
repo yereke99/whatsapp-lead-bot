@@ -168,6 +168,82 @@ export function splitOffset(seconds) {
   return { direction, hours, minutes, seconds: rest - minutes * 60 };
 }
 
+// delayLabel renders a trigger-relative delay, where the offset counts forward
+// from the customer's own message rather than from a fixed clock time.
+export function delayLabel(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  if (total === 0) return 'бірден';
+
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+
+  const parts = [];
+  if (hours) parts.push(`${hours} сағат`);
+  if (minutes) parts.push(`${minutes} минут`);
+  if (secs) parts.push(`${secs} секунд`);
+  return parts.join(' ');
+}
+
+export function splitDelay(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  return { hours, minutes, seconds: total % 60 };
+}
+
+export function buildDelaySeconds(hours, minutes, seconds) {
+  return (Number(hours) || 0) * 3600 + (Number(minutes) || 0) * 60 + (Number(seconds) || 0);
+}
+
+// stepRunAt resolves an event-anchored step to the instant it will be sent.
+// Trigger-anchored steps have no single answer — each contact gets their own —
+// so they return null and are described by their delay instead.
+export function stepRunAt(campaign, step) {
+  if (!campaign?.event_start_at) return null;
+  if (step.schedule_kind === 'ON_TRIGGER') return null;
+  return new Date(new Date(campaign.event_start_at).getTime() + (step.offset_seconds || 0) * 1000);
+}
+
+// formatInZone renders an instant in the campaign's own timezone. The server
+// may run anywhere, so the browser's local zone is never used for campaign
+// times.
+export function formatInZone(instant, timeZone, options) {
+  if (!instant) return '';
+  return new Intl.DateTimeFormat('kk-KZ', { timeZone, hour12: false, ...options }).format(instant);
+}
+
+// dayInZone renders a calendar day as dd.MM.yyyy, which is the form used
+// throughout the panel. It is assembled from parts rather than left to a
+// locale, whose date order varies by runtime.
+export function dayInZone(instant, timeZone) {
+  if (!instant) return '';
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(instant);
+  const at = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return `${at.day}.${at.month}.${at.year}`;
+}
+
+// dateInZone and timeInZone produce the values an <input type="date"> and
+// <input type="time"> expect, in the campaign's timezone rather than the
+// browser's.
+export function dateInZone(instant, timeZone) {
+  if (!instant) return '';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(instant);
+  const lookup = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return `${lookup.year}-${lookup.month}-${lookup.day}`;
+}
+
+export function timeInZone(instant, timeZone) {
+  if (!instant) return '';
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).format(instant);
+}
+
 // ------------------------------------------------------------- vocabulary --
 
 export const CONTACT_STATUS = {
@@ -227,6 +303,19 @@ export const MATCH_MODE = {
   EXACT:       'Дәл сәйкестік',
   STARTS_WITH: 'Осыдан басталады',
   CONTAINS:    'Құрамында бар',
+};
+
+// How a queued message finds its moment. RELATIVE_TO_EVENT is a fixed point on
+// the calendar shared by every contact; ON_TRIGGER is a delay counted from
+// each contact's own message.
+export const SCHEDULE_KIND = {
+  RELATIVE_TO_EVENT: 'Нақты күн мен уақыт',
+  ON_TRIGGER:        'Триггерден кейінгі кідіріс',
+};
+
+export const RESUME_POLICY = {
+  SKIP_EXPIRED:    'Өтіп кеткендерді жіберме',
+  SEND_NEXT_VALID: 'Соңғы өтіп кеткенін жібер',
 };
 
 export const EXISTING_BEHAVIOR = {

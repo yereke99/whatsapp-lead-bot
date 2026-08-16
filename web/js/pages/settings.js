@@ -109,8 +109,28 @@ async function renderSystem(panel) {
               : badge('ffmpeg жоқ — тек OGG/Opus', 'warn')),
           el('dt', {}, 'Планировщик'), el('dd', {},
             settings.scheduler_enabled ? badge('Қосулы', 'success') : badge('Өшірулі', 'danger')),
-          el('dt', {}, 'Файл шегі'), el('dd', {}, `${settings.max_upload_mb} МБ`),
-          el('dt', {}, 'Нақты уақыт'), el('dd', {}, `${settings.realtime_clients} қосылым`)),
+          el('dt', {}, 'Файл шегі'), el('dd', {}, `${settings.max_upload_mb} МБ`)),
+      })),
+    el('div', { class: 'mt-3' },
+      card('Жіберу жылдамдығы', {
+        subtitle: 'Барлық автоматты хабарламалар осы шектеулер арқылы өтеді',
+        body: el('div', {},
+          el('dl', { class: 'kv' },
+            el('dt', {}, 'Қатар жіберу'), el('dd', {},
+              `${settings.outbound?.workers ?? 1} хабарлама`),
+            el('dt', {}, 'Минимал кідіріс'), el('dd', {},
+              `${((settings.outbound?.min_delay_ms ?? 0) / 1000).toFixed(1)} сек`),
+            el('dt', {}, 'Максимал кідіріс'), el('dd', {},
+              `${((settings.outbound?.max_delay_ms ?? 0) / 1000).toFixed(1)} сек`),
+            el('dt', {}, 'Максимум әрекет'), el('dd', {},
+              `${settings.outbound?.max_attempts ?? 4} рет`),
+            el('dt', {}, 'Триггер кідірісі'), el('dd', {},
+              `${((settings.outbound?.trigger_delay_ms ?? 0) / 1000).toFixed(1)} сек`)),
+          el('p', { class: 'muted small mt-3' },
+            'Хабарламалар бірінен соң бірі, аралығы кездейсоқ таңдалған кідіріспен жіберіледі. '
+            + 'Бір клиентке екі хабарлама бір уақытта кетпейді. '
+            + 'Бұл мәндер серверді іске қосу кезінде орнатылады (WHATSAPP_MIN_SEND_DELAY_MS, '
+            + 'WHATSAPP_MAX_SEND_DELAY_MS, WHATSAPP_SEND_WORKERS).')),
       })),
     el('div', { class: 'mt-3' },
       card('Шаблон айнымалылары', {

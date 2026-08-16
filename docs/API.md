@@ -166,19 +166,11 @@ How many contacts each keyword brought into the funnel.
 
 ---
 
-## Chats and messaging
+## Conversation history
 
-### GET /api/chats
-
-| Parameter | Description |
-|---|---|
-| `search` | Name or phone |
-| `unread` | `true` to show only unread conversations |
-| `limit`, `offset` | Pagination |
-
-Returns contacts ordered by most recent activity, with `avatar_url`,
-`unread_count`, `last_message_preview`, `last_message_direction` and
-`active_campaign`.
+The panel shows the conversation with each contact, but never composes into it:
+the platform only sends what a campaign scheduled. There is no chat-send
+endpoint, no unread/read tracking and no event stream.
 
 ### GET /api/contacts/{id}/messages
 
@@ -192,58 +184,9 @@ Returns messages oldest-first. Locally stored attachments carry
 `media_access_url`. Inbound attachments still being fetched have
 `media_download_status: "PENDING"`.
 
-### POST /api/contacts/{id}/send
-
-Sends a one-to-one reply. The contact must already exist and must have written
-to us first.
-
-```json
-{
-  "type": "IMAGE_WITH_CAPTION",
-  "text": "Сабақ 21:00-де басталады",
-  "media_file_id": "…",
-  "file_name": "webinar.jpg",
-  "link_preview": true
-}
-```
-
-| `type` | Requires media | Carries text |
-|---|---|---|
-| `TEXT` | no | yes |
-| `IMAGE` | yes | no |
-| `IMAGE_WITH_CAPTION` | yes | yes |
-| `VIDEO` | yes | no |
-| `VIDEO_WITH_CAPTION` | yes | yes |
-| `AUDIO` | yes | no |
-| `VOICE` | yes | no |
-| `DOCUMENT` | yes | yes |
-
-A caption travels inside the same WhatsApp message; it is never sent as a
-separate follow-up.
-
-Responses: `201` with the message, `403` when the contact has not opted in or
-has unsubscribed, `503` when the provider is unconfigured, `502` when the
-provider rejected the send.
-
-### POST /api/contacts/{id}/read
-
-Clears the unread counter.
-
-### GET /api/stream
-
-Server-Sent Events. Event types:
-
-| Event | Payload |
-|---|---|
-| `message.created` | The new message |
-| `message.status` | `{ external_id, status, at }` |
-| `chat.updated` | Preview, direction, timestamp, `unread_delta` |
-| `contact.updated` | Changed contact fields |
-| `job.updated` | `{ job_id, status, detail }` |
-| `provider.state` | `{ state }` |
-
-Each frame carries `contact_id` where relevant. The browser reconnects
-automatically; reconcile any gap with `GET /api/contacts/{id}/messages?after=…`.
+Outbound rows record which template and which revision produced them
+(`template_id`, `template_version`), and which queued job sent them
+(`scheduled_message_id`).
 
 ---
 
@@ -286,10 +229,6 @@ Blocking also cancels every pending job for the contact.
 { "opted_out": true }
 ```
 
-### POST /api/contacts/{id}/refresh-profile
-
-Re-fetches the display name and avatar from the provider.
-
 ### POST /api/contacts/bulk
 
 ```json
@@ -330,12 +269,34 @@ aggregate counts.
   "existing_contact_template_id": "",
   "unsubscribe_keywords": ["STOP", "ТОҚТАТУ"],
   "catch_up_missed_steps": true,
-  "max_send_attempts": 5
+  "max_send_attempts": 4,
+  "resume_policy": "SKIP_EXPIRED",
+  "pin_template_version": false,
+  "max_messages_per_hour": null,
+  "max_messages_per_day": null,
+  "max_active_contacts": null
 }
 ```
 
 `event_date` and `event_time` are wall-clock values in `timezone`; the server
 converts them to a UTC instant.
+
+`resume_policy` decides what happens to messages whose moment passed while the
+campaign was paused:
+
+| Value | Effect |
+|---|---|
+| `SKIP_EXPIRED` | Cancels everything overdue (default). Resuming at 20:00 after pausing at 18:00 does not dump both missed messages on the contact |
+| `SEND_NEXT_VALID` | Keeps each contact's most recent overdue step and sends it immediately, dropping the older ones |
+
+`pin_template_version` freezes queued messages to the template revision current
+when they were queued. Off by default, which preserves the long-standing
+behaviour that editing a template updates every message not yet sent.
+
+The three limits are optional; `null` means no limit. When a limit is reached
+the queue holds — messages are deferred, never dropped — and the panel shows a
+warning. `max_active_contacts` refuses new enrollments; contacts already in the
+funnel finish normally.
 
 `existing_contact_behavior` controls repeat triggers:
 
@@ -367,33 +328,86 @@ never rewritten.
 { "status": "ACTIVE" }
 ```
 
-Activation is refused unless the campaign has an event start time, at least one
-enabled step, and at least one trigger.
+Activation runs the full validation below. When it fails, every blocking
+problem comes back at once so the campaign can be fixed in one pass:
+
+```json
+{
+  "error": {
+    "code": "validation_failed",
+    "message": "Кампанияны іске қосу мүмкін емес",
+    "details": {
+      "problems": [
+        { "field": "triggers", "message": "Кампанияда белсенді триггер жоқ — клиенттер воронкаға кіре алмайды", "blocking": true }
+      ]
+    }
+  }
+}
+```
+
+Resuming a `PAUSED` campaign also applies its `resume_policy` to the backlog.
 
 ### POST /api/campaigns/{id}/duplicate
 
 Copies the campaign and its steps as a `DRAFT`. Triggers are not copied,
 because one keyword may route to only one active campaign.
 
-### GET /api/campaigns/{id}/preview
+### GET /api/campaigns/{id}/preview · GET /api/campaigns/{id}/timeline
 
-Every step resolved to an absolute time in the campaign's timezone:
+The same projection under both names: every step resolved to a real time in the
+campaign's timezone, returned in send order. Trigger-anchored steps come first
+and are described by their delay, because they have no single wall-clock time —
+each contact gets their own.
 
 ```json
 {
   "data": [{
     "step_id": "…",
-    "name": "5 сағат бұрын",
+    "order_index": 2,
+    "name": "5 сағат қалды",
+    "schedule_kind": "RELATIVE_TO_EVENT",
     "offset_seconds": -18000,
     "offset_label": "-5h",
-    "local_time": "2026-08-16 16:00:00",
+    "local_date": "16.08.2026",
+    "local_time": "16:00:00",
     "utc_time": "2026-08-16T11:00:00Z",
+    "message_template_id": "…",
     "template_name": "…",
     "template_type": "IMAGE_WITH_CAPTION",
-    "enabled": true
+    "enabled": true,
+    "warning": ""
   }]
 }
 ```
+
+### GET /api/campaigns/{id}/validate
+
+Everything standing between the campaign and activation, so the panel can show
+the checklist while it is still a draft:
+
+```json
+{
+  "data": {
+    "can_activate": false,
+    "status": "DRAFT",
+    "problems": [
+      { "field": "steps", "message": "…", "blocking": true, "step_id": "…" },
+      { "field": "webinar_link", "message": "…", "blocking": false }
+    ]
+  }
+}
+```
+
+Blocking problems prevent activation. Warnings do not: an operator who wants to
+activate a campaign whose event time has passed is allowed to. Checks cover the
+trigger, at least one enabled step, each step's template and media, the
+timezone, the event anchor, non-negative trigger delays, and steps that either
+collide or contradict their listed order.
+
+### GET /api/campaigns/{id}/scheduled-messages
+
+The campaign's real queue rather than its plan: what is waiting, for whom, and
+when. Accepts `status`, `limit` and `offset`, and returns the paginated shape.
 
 ---
 
@@ -401,27 +415,53 @@ Every step resolved to an absolute time in the campaign's timezone:
 
 ### POST /api/campaigns/{id}/steps · PUT /api/campaigns/{id}/steps/{stepId}
 
+A step is one entry of the campaign's message queue: a reusable template, plus
+the moment it should go out. The template holds the content and never holds a
+time; the step holds the time and never holds content.
+
+**Mode A — an exact date and time.** The panel sends the wall-clock moment and
+the server converts it into the stored offset from the campaign's event start,
+using the campaign's own timezone:
+
 ```json
 {
-  "name": "1 сағат бұрын",
+  "name": "1 сағат қалды",
   "schedule_kind": "RELATIVE_TO_EVENT",
-  "offset_seconds": -3600,
+  "scheduled_date": "2026-08-16",
+  "scheduled_time": "20:00:00",
   "message_template_id": "…",
   "enabled": true
 }
 ```
 
-`schedule_kind` is `RELATIVE_TO_EVENT` or `ON_TRIGGER` (fires the moment a
-contact enrols, ignoring the event anchor).
+Sending `offset_seconds` directly is equally valid and skips the conversion.
+The offset is signed — negative is before the event — and is stored in seconds,
+so 20:52:30 against a 21:00 event is `-450`. Storing the offset rather than a
+timestamp is what lets moving a webinar carry its whole queue with it.
 
-`offset_seconds` is signed: negative is before the event. Seconds allow
-fractional-minute steps — 7.5 minutes is `-450`.
+**Mode B — a delay after the trigger.** `offset_seconds` counts forward from
+the moment the contact wrote in, so every contact gets their own timetable:
 
-Side effects on update:
+```json
+{
+  "name": "Сәлемдесу",
+  "schedule_kind": "ON_TRIGGER",
+  "offset_seconds": 600,
+  "message_template_id": "…",
+  "enabled": true
+}
+```
+
+A trigger delay may not be negative. A delay shorter than
+`TRIGGER_GREETING_DELAY_MS` is lifted to it, so the first reply never lands in
+the same instant as the customer's own message.
+
+Side effects on update — only queued messages are reconciled, never sent ones:
 
 - disabling a step cancels its pending jobs
 - enabling a step back-fills it for active enrollments whose time has not passed
-- changing the offset reschedules its pending jobs
+- changing the offset or the mode reschedules its pending jobs, per contact for
+  trigger-anchored steps and from the event anchor for the rest
 
 ### POST /api/campaigns/{id}/steps/reorder
 

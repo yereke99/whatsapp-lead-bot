@@ -21,17 +21,17 @@ import (
 
 const jobColumns = `
 	sm.id, sm.campaign_id, sm.contact_id, sm.enrollment_id, sm.campaign_step_id,
-	sm.run_number, sm.scheduled_at, sm.status, sm.attempt_count, sm.next_attempt_at,
-	sm.locked_by, sm.locked_at, sm.sent_at, sm.cancelled_at, sm.cancel_reason,
-	sm.last_error, sm.message_id, sm.created_at, sm.updated_at`
+	sm.run_number, sm.scheduled_at, sm.status, sm.template_version, sm.attempt_count,
+	sm.next_attempt_at, sm.locked_by, sm.locked_at, sm.sent_at, sm.cancelled_at,
+	sm.cancel_reason, sm.last_error, sm.message_id, sm.created_at, sm.updated_at`
 
 // SQLite's RETURNING clause names columns of the updated table directly and
 // rejects a table alias, so the claim query needs its own unprefixed list.
 const jobColumnsUnqualified = `
 	id, campaign_id, contact_id, enrollment_id, campaign_step_id,
-	run_number, scheduled_at, status, attempt_count, next_attempt_at,
-	locked_by, locked_at, sent_at, cancelled_at, cancel_reason,
-	last_error, message_id, created_at, updated_at`
+	run_number, scheduled_at, status, template_version, attempt_count,
+	next_attempt_at, locked_by, locked_at, sent_at, cancelled_at,
+	cancel_reason, last_error, message_id, created_at, updated_at`
 
 type Repository struct {
 	db *sqlite.DB
@@ -67,10 +67,19 @@ func (r *Repository) Enqueue(ctx context.Context, q sqlite.Querier, jobs []NewJo
 		return 0, nil
 	}
 
+	// The template revision is captured at queue time from the step's template.
+	// It is recorded for every job so the panel can tell the operator which
+	// version a contact is going to receive; whether it is also used to render
+	// is the campaign's pin_template_version decision.
 	const query = `
 		INSERT INTO scheduled_messages (
-			campaign_id, contact_id, enrollment_id, campaign_step_id, run_number, scheduled_at
-		) VALUES ($1,$2,$3,$4,$5,$6)
+			campaign_id, contact_id, enrollment_id, campaign_step_id, run_number,
+			scheduled_at, template_version
+		) VALUES ($1,$2,$3,$4,$5,$6, (
+			SELECT t.version FROM message_templates t
+			JOIN campaign_steps cs ON cs.message_template_id = t.id
+			WHERE cs.id = $4
+		))
 		ON CONFLICT (enrollment_id, campaign_step_id, run_number) DO NOTHING`
 
 	querier := r.querier(q)
@@ -95,6 +104,18 @@ func (r *Repository) Enqueue(ctx context.Context, q sqlite.Querier, jobs []NewJo
 // crash between "found" and "claimed" is impossible. The statement runs under
 // SQLite's write lock, so a second worker polling at the same moment sees the
 // rows already in PROCESSING and picks up the next batch instead.
+//
+// Selection is also serialised per contact, which is what keeps a contact's
+// messages in order and stops two of them arriving at once:
+//
+//   - a contact with a job already in flight is skipped entirely, so message 2
+//     cannot start before message 1 has finished;
+//   - among a contact's due jobs only the earliest is eligible, so a batch
+//     that sees three overdue messages takes them one poll at a time, in
+//     schedule order.
+//
+// Both rules are evaluated against the pre-update snapshot of the table, so
+// they hold within a single batch as well as across concurrent workers.
 func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now time.Time) ([]domain.ScheduledMessage, error) {
 	if limit <= 0 {
 		limit = 20
@@ -104,11 +125,24 @@ func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now 
 		UPDATE scheduled_messages AS sm
 		SET status = 'PROCESSING', locked_by = $1, locked_at = $2, updated_at = now()
 		FROM (
-			SELECT id FROM scheduled_messages
-			WHERE status = 'PENDING'
-			  AND scheduled_at <= $2
-			  AND (next_attempt_at IS NULL OR next_attempt_at <= $2)
-			ORDER BY scheduled_at
+			SELECT due.id FROM scheduled_messages due
+			WHERE due.status = 'PENDING'
+			  AND due.scheduled_at <= $2
+			  AND (due.next_attempt_at IS NULL OR due.next_attempt_at <= $2)
+			  AND NOT EXISTS (
+				SELECT 1 FROM scheduled_messages busy
+				WHERE busy.contact_id = due.contact_id AND busy.status = 'PROCESSING'
+			  )
+			  AND NOT EXISTS (
+				SELECT 1 FROM scheduled_messages earlier
+				WHERE earlier.contact_id = due.contact_id
+				  AND earlier.status = 'PENDING'
+				  AND earlier.scheduled_at <= $2
+				  AND (earlier.next_attempt_at IS NULL OR earlier.next_attempt_at <= $2)
+				  AND (earlier.scheduled_at < due.scheduled_at
+				       OR (earlier.scheduled_at = due.scheduled_at AND earlier.id < due.id))
+			  )
+			ORDER BY due.scheduled_at
 			LIMIT $3
 		) due
 		WHERE sm.id = due.id
@@ -142,6 +176,9 @@ type JobContext struct {
 	CampaignLink        string
 	CampaignEventStart  *time.Time
 	CampaignMaxAttempts int
+	CampaignPinVersion  bool
+	CampaignMaxPerHour  *int
+	CampaignMaxPerDay   *int
 
 	StepName   string
 	StepOffset int
@@ -163,7 +200,9 @@ type JobContext struct {
 func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobContext, error) {
 	query := `
 		SELECT ` + jobColumns + `,
-			camp.name, camp.status, camp.timezone, camp.webinar_link, camp.event_start_at, camp.max_send_attempts,
+			camp.name, camp.status, camp.timezone, camp.webinar_link, camp.event_start_at,
+			camp.max_send_attempts, camp.pin_template_version,
+			camp.max_messages_per_hour, camp.max_messages_per_day,
 			cs.name, cs.offset_seconds, cs.message_template_id, cs.enabled,
 			c.phone, c.chat_id, c.name, c.push_name, c.opted_out, (c.blocked_at IS NOT NULL), c.status, c.first_contact_at,
 			cc.status
@@ -180,7 +219,8 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 	dest := jobScanDest(&jc.Job)
 	dest = append(dest,
 		&jc.CampaignName, &jc.CampaignStatus, &jc.CampaignTimezone, &jc.CampaignLink,
-		&jc.CampaignEventStart, &jc.CampaignMaxAttempts,
+		&jc.CampaignEventStart, &jc.CampaignMaxAttempts, &jc.CampaignPinVersion,
+		&jc.CampaignMaxPerHour, &jc.CampaignMaxPerDay,
 		&jc.StepName, &jc.StepOffset, &jc.TemplateID, &jc.StepEnabled,
 		&jc.ContactPhone, &jc.ContactChatID, &jc.ContactName, &jc.ContactPushName,
 		&jc.ContactOptedOut, &jc.ContactBlocked, &jc.ContactStatus, &jc.ContactConsentAt,
@@ -204,6 +244,23 @@ func (r *Repository) MarkSent(ctx context.Context, q sqlite.Querier, jobID, mess
 		WHERE id = $1`
 
 	_, err := r.querier(q).Exec(ctx, query, jobID, sentAt, messageID)
+	return err
+}
+
+// Defer puts a job back in the queue without counting an attempt.
+//
+// It is for holds that are not failures: the campaign is paused, or a sending
+// limit has been reached. Using Retry for these would burn the job's attempt
+// budget while nothing was wrong with the job, and a campaign paused for an
+// afternoon would come back with its queue already marked FAILED.
+func (r *Repository) Defer(ctx context.Context, jobID uuid.UUID, until time.Time, reason string) error {
+	const query = `
+		UPDATE scheduled_messages SET
+			status = 'PENDING', next_attempt_at = $2, last_error = $3,
+			locked_by = NULL, locked_at = NULL, updated_at = now()
+		WHERE id = $1`
+
+	_, err := r.db.Exec(ctx, query, jobID, until, truncate(reason, 2000))
 	return err
 }
 
@@ -318,6 +375,32 @@ func (r *Repository) RescheduleStep(ctx context.Context, q sqlite.Querier, stepI
 	tag, err := r.querier(q).Exec(ctx, query, stepID)
 	if err != nil {
 		return 0, fmt.Errorf("reschedule step: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// RescheduleTriggerStep recomputes pending jobs for a trigger-anchored step.
+//
+// Each contact has their own anchor — the moment they entered the campaign —
+// so the new time is derived per enrollment rather than from a shared event
+// start. Changing +30m to +5m for a contact who enrolled ten minutes ago
+// therefore makes their message due now, which is the literal meaning of the
+// edit. Only PENDING rows move; anything sent stays sent.
+func (r *Repository) RescheduleTriggerStep(ctx context.Context, q sqlite.Querier, stepID uuid.UUID) (int64, error) {
+	const query = `
+		UPDATE scheduled_messages AS sm SET
+			scheduled_at = ts_add(cc.enrolled_at, cs.offset_seconds),
+			updated_at = now()
+		FROM campaign_steps cs, campaign_contacts cc
+		WHERE cs.id = sm.campaign_step_id
+		  AND cc.id = sm.enrollment_id
+		  AND sm.campaign_step_id = $1
+		  AND sm.status = 'PENDING'
+		  AND cs.schedule_kind = 'ON_TRIGGER'`
+
+	tag, err := r.querier(q).Exec(ctx, query, stepID)
+	if err != nil {
+		return 0, fmt.Errorf("reschedule trigger step: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }
@@ -498,6 +581,67 @@ func (r *Repository) Stats(ctx context.Context) (*Stats, error) {
 	return &s, nil
 }
 
+// CampaignSendCounts reports how much a campaign has sent recently, which is
+// what the optional hourly and daily caps are checked against.
+func (r *Repository) CampaignSendCounts(ctx context.Context, campaignID uuid.UUID, now time.Time) (lastHour, lastDay int, err error) {
+	const query = `
+		SELECT
+			count(*) FILTER (WHERE sent_at >= $2),
+			count(*) FILTER (WHERE sent_at >= $3)
+		FROM scheduled_messages
+		WHERE campaign_id = $1 AND status = 'SENT' AND sent_at IS NOT NULL`
+
+	err = r.db.QueryRow(ctx, query, campaignID, now.Add(-time.Hour), now.Add(-24*time.Hour)).
+		Scan(&lastHour, &lastDay)
+	return lastHour, lastDay, err
+}
+
+// ExpirePendingForCampaign cancels queued jobs whose moment has passed, which
+// is how SKIP_EXPIRED resolves a backlog when a campaign is resumed.
+func (r *Repository) ExpirePendingForCampaign(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID, before time.Time, reason string) (int64, error) {
+	const query = `
+		UPDATE scheduled_messages SET
+			status = 'CANCELLED', cancelled_at = now(), cancel_reason = $3, updated_at = now()
+		WHERE campaign_id = $1 AND status = 'PENDING' AND scheduled_at < $2`
+
+	tag, err := r.querier(q).Exec(ctx, query, campaignID, before, truncate(reason, 500))
+	if err != nil {
+		return 0, fmt.Errorf("expire pending jobs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// PullForwardLatestExpired moves each contact's most recent overdue job to
+// runAt, which is how SEND_NEXT_VALID keeps one message of context instead of
+// releasing the whole backlog at once.
+//
+// It must run before ExpirePendingForCampaign cancels the rest.
+func (r *Repository) PullForwardLatestExpired(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID, before, runAt time.Time) (int64, error) {
+	const query = `
+		UPDATE scheduled_messages SET
+			scheduled_at = $3, next_attempt_at = NULL, updated_at = now()
+		WHERE id IN (
+			SELECT latest.id FROM scheduled_messages latest
+			WHERE latest.campaign_id = $1
+			  AND latest.status = 'PENDING'
+			  AND latest.scheduled_at < $2
+			  AND NOT EXISTS (
+				SELECT 1 FROM scheduled_messages newer
+				WHERE newer.enrollment_id = latest.enrollment_id
+				  AND newer.status = 'PENDING'
+				  AND newer.scheduled_at < $2
+				  AND (newer.scheduled_at > latest.scheduled_at
+				       OR (newer.scheduled_at = latest.scheduled_at AND newer.id > latest.id))
+			  )
+		)`
+
+	tag, err := r.querier(q).Exec(ctx, query, campaignID, before, runAt)
+	if err != nil {
+		return 0, fmt.Errorf("pull forward expired jobs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // EnrollmentProgress reports how far a contact is through a campaign, used to
 // close out enrollments once every step has resolved.
 func (r *Repository) EnrollmentProgress(ctx context.Context, q sqlite.Querier, enrollmentID uuid.UUID) (pending, total int, err error) {
@@ -512,9 +656,9 @@ func (r *Repository) EnrollmentProgress(ctx context.Context, q sqlite.Querier, e
 func jobScanDest(job *domain.ScheduledMessage) []any {
 	return []any{
 		&job.ID, &job.CampaignID, &job.ContactID, &job.EnrollmentID, &job.StepID,
-		&job.RunNumber, &job.ScheduledAt, &job.Status, &job.AttemptCount, &job.NextAttemptAt,
-		&job.LockedBy, &job.LockedAt, &job.SentAt, &job.CancelledAt, &job.CancelReason,
-		&job.LastError, &job.MessageID, &job.CreatedAt, &job.UpdatedAt,
+		&job.RunNumber, &job.ScheduledAt, &job.Status, &job.TemplateVersion, &job.AttemptCount,
+		&job.NextAttemptAt, &job.LockedBy, &job.LockedAt, &job.SentAt, &job.CancelledAt,
+		&job.CancelReason, &job.LastError, &job.MessageID, &job.CreatedAt, &job.UpdatedAt,
 	}
 }
 

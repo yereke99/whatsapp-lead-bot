@@ -287,6 +287,16 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 		"max_upload_mb":       s.cfg.Media.MaxUploadMB,
 		"scheduler_enabled":   s.cfg.Scheduler.Enabled,
 		"template_variables":  render.Catalog,
+		// The sending pace is process configuration rather than per-campaign
+		// data: it is validated at startup and applies to every campaign, so
+		// the panel reports it instead of offering it as an editable field.
+		"outbound": map[string]any{
+			"workers":          s.cfg.Outbound.Workers,
+			"min_delay_ms":     s.cfg.Outbound.MinDelay.Milliseconds(),
+			"max_delay_ms":     s.cfg.Outbound.MaxDelay.Milliseconds(),
+			"max_attempts":     s.cfg.Scheduler.MaxAttempts,
+			"trigger_delay_ms": s.cfg.Scheduler.TriggerDelay.Milliseconds(),
+		},
 	})
 }
 

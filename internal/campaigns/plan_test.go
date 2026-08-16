@@ -275,6 +275,178 @@ func TestBuildPlanAcrossDSTBoundary(t *testing.T) {
 	}
 }
 
+// triggerStep builds a step anchored to the contact's own entry into the
+// campaign, where the offset is a delay rather than a position on a clock.
+func triggerStep(name string, delaySeconds, order int) domain.CampaignStep {
+	return domain.CampaignStep{
+		ID:            uuid.New(),
+		Name:          name,
+		OffsetSeconds: delaySeconds,
+		Enabled:       true,
+		OrderIndex:    order,
+		ScheduleKind:  domain.ScheduleOnTrigger,
+		TemplateID:    uuid.New(),
+	}
+}
+
+// TestBuildPlanTriggerDelaysAreRelativeToEachContact is the drip-campaign case:
+// two contacts who trigger at different times must each get their own
+// timetable, offset from their own message rather than from a shared clock.
+func TestBuildPlanTriggerDelaysAreRelativeToEachContact(t *testing.T) {
+	loc := almaty(t)
+
+	steps := []domain.CampaignStep{
+		triggerStep("Сәлемдесу", 2, 1),
+		triggerStep("2-хабарлама", 10*60, 2),
+		triggerStep("3-хабарлама", 30*60, 3),
+		triggerStep("4-хабарлама", 3600, 4),
+	}
+
+	cases := []struct {
+		name    string
+		trigger time.Time
+		want    []string
+	}{
+		{
+			name:    "user A",
+			trigger: time.Date(2026, 8, 16, 17, 30, 0, 0, loc).UTC(),
+			want:    []string{"17:30:02", "17:40:00", "18:00:00", "18:30:00"},
+		},
+		{
+			name:    "user B",
+			trigger: time.Date(2026, 8, 16, 18, 10, 0, 0, loc).UTC(),
+			want:    []string{"18:10:02", "18:20:00", "18:40:00", "19:10:00"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := BuildPlan(nil, steps, PlanOptions{
+				EnrolledAt:   tc.trigger,
+				Now:          tc.trigger,
+				TriggerDelay: 2 * time.Second,
+			})
+
+			if len(plan) != len(tc.want) {
+				t.Fatalf("plan has %d entries, want %d", len(plan), len(tc.want))
+			}
+			for i, entry := range plan {
+				if entry.Skipped {
+					t.Fatalf("step %q was skipped: %s", entry.Step.Name, entry.Reason)
+				}
+				if got := entry.RunAt.In(loc).Format("15:04:05"); got != tc.want[i] {
+					t.Errorf("step %q scheduled at %s, want %s", entry.Step.Name, got, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestBuildPlanTriggerDelayFloor covers the greeting: a step configured with no
+// delay must still be queued a moment later rather than in the same instant as
+// the customer's own message.
+func TestBuildPlanTriggerDelayFloor(t *testing.T) {
+	now := time.Date(2026, 8, 16, 17, 30, 0, 0, time.UTC)
+
+	plan := BuildPlan(nil, []domain.CampaignStep{triggerStep("Сәлемдесу", 0, 1)}, PlanOptions{
+		EnrolledAt:   now,
+		Now:          now,
+		TriggerDelay: 2 * time.Second,
+	})
+
+	if got := plan[0].RunAt.Sub(now); got != 2*time.Second {
+		t.Errorf("greeting scheduled %v after the trigger, want 2s", got)
+	}
+}
+
+// TestBuildPlanTriggerAnchorNeverRunsBehind guards the case where the provider
+// timestamp on the inbound message is already old by the time it is processed:
+// the delay must be measured forward from now, not from a stale instant.
+func TestBuildPlanTriggerAnchorNeverRunsBehind(t *testing.T) {
+	now := time.Date(2026, 8, 16, 17, 30, 0, 0, time.UTC)
+	stale := now.Add(-90 * time.Second)
+
+	plan := BuildPlan(nil, []domain.CampaignStep{triggerStep("Сәлемдесу", 0, 1)}, PlanOptions{
+		EnrolledAt:   stale,
+		Now:          now,
+		TriggerDelay: 2 * time.Second,
+	})
+
+	if plan[0].RunAt.Before(now) {
+		t.Errorf("greeting scheduled in the past at %v, now is %v", plan[0].RunAt, now)
+	}
+	if got := plan[0].RunAt.Sub(now); got != 2*time.Second {
+		t.Errorf("greeting scheduled %v after now, want 2s", got)
+	}
+}
+
+// TestBuildPlanExplicitTriggerDelayBeatsTheFloor confirms the floor only lifts
+// a step that has no delay of its own.
+func TestBuildPlanExplicitTriggerDelayBeatsTheFloor(t *testing.T) {
+	now := time.Date(2026, 8, 16, 17, 30, 0, 0, time.UTC)
+
+	plan := BuildPlan(nil, []domain.CampaignStep{triggerStep("10 минуттан кейін", 600, 1)}, PlanOptions{
+		EnrolledAt:   now,
+		Now:          now,
+		TriggerDelay: 2 * time.Second,
+	})
+
+	if got := plan[0].RunAt.Sub(now); got != 10*time.Minute {
+		t.Errorf("step scheduled %v after the trigger, want 10m", got)
+	}
+}
+
+// TestBuildPlanLateJoinerSkipsObsoleteSteps is the 20:40 case: someone who
+// triggers twenty minutes before a 21:00 webinar must not receive the 18:00,
+// 19:00 and 20:00 messages after the fact.
+func TestBuildPlanLateJoinerSkipsObsoleteSteps(t *testing.T) {
+	loc := almaty(t)
+	eventStart := time.Date(2026, 8, 16, 21, 0, 0, 0, loc).UTC()
+	now := time.Date(2026, 8, 16, 20, 40, 0, 0, loc).UTC()
+
+	steps := []domain.CampaignStep{
+		step("18:00", -3*3600, 1, true),
+		step("19:00", -2*3600, 2, true),
+		step("20:00", -3600, 3, true),
+		step("20:45", -15*60, 4, true),
+		step("20:52:30", -450, 5, true),
+		step("21:00", 0, 6, true),
+	}
+
+	plan := BuildPlan(&eventStart, steps, PlanOptions{EnrolledAt: now, Now: now, CatchUp: false})
+
+	var scheduled []string
+	for _, entry := range Scheduled(plan) {
+		scheduled = append(scheduled, entry.RunAt.In(loc).Format("15:04:05"))
+	}
+
+	want := []string{"20:45:00", "20:52:30", "21:00:00"}
+	if len(scheduled) != len(want) {
+		t.Fatalf("scheduled %v, want %v", scheduled, want)
+	}
+	for i := range want {
+		if scheduled[i] != want[i] {
+			t.Errorf("entry %d is %s, want %s", i, scheduled[i], want[i])
+		}
+	}
+}
+
+func TestHumanDurationFormatting(t *testing.T) {
+	cases := map[time.Duration]string{
+		0:                "бірден",
+		2 * time.Second:  "2 секунд",
+		10 * time.Minute: "10 минут",
+		90 * time.Minute: "1 сағат 30 минут",
+		2 * time.Hour:    "2 сағат",
+	}
+
+	for d, want := range cases {
+		if got := timex.HumanDuration(d); got != want {
+			t.Errorf("HumanDuration(%v) = %q, want %q", d, got, want)
+		}
+	}
+}
+
 func TestHumanOffsetFormatting(t *testing.T) {
 	cases := map[int]string{
 		0:         "0",

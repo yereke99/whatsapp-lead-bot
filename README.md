@@ -49,17 +49,48 @@ Background worker: create contact ─▶ record consent ─▶ match trigger
 Enrol into campaign, write one job per step into SQLite
         │
         ▼
-Scheduler claims due jobs (one atomic UPDATE) ─▶ renders ─▶ sends
+Scheduler claims due jobs (one atomic UPDATE, serialised per contact)
+        │
+        ▼
+Outbound queue: bounded concurrency, spaced-out sending
+        │
+        ▼
+Render template ─▶ Green API ─▶ WhatsApp
         │
         ▼
 Delivery receipts arrive on the same queue and update the message
 ```
 
-A webinar at 21:00 with the default steps produces exactly:
+Nothing is ever sent inline. A trigger produces database rows; a worker turns
+those rows into messages later. That is what makes the whole funnel survive a
+restart, and why there is no `time.Sleep` anywhere in the scheduling path.
+
+### The message queue
+
+A campaign is an ordered list of messages. Each one pairs a reusable template
+with the moment it should go out:
+
+```
+Template          =  WHAT to send   (text, image, video, voice, document)
+Campaign step     =  WHEN + WHAT    (a template plus its schedule)
+Campaign          =  WHO + trigger  (who enters, and on what phrase)
+Scheduler         =  executes it
+Outbound queue    =  sends it safely
+```
+
+A template never carries a time. The same "one hour to go" template can sit in
+three different campaigns at three different times.
+
+### Two ways to schedule a message
+
+**An exact date and time** — every contact receives it at the same moment. The
+admin picks a wall-clock time and the panel stores the offset from the
+campaign's event start, so moving the webinar moves the whole queue with it.
+
+A webinar at 21:00 produces exactly:
 
 | Offset | Send time | Type |
 |---|---|---|
-| on trigger | immediately | voice |
 | −5 h | 16:00 | image + text |
 | −3 h | 18:00 | voice |
 | −2 h | 19:00 | image + text |
@@ -71,6 +102,25 @@ A webinar at 21:00 with the default steps produces exactly:
 
 Offsets are stored in **seconds**, which is why the 7.5-minute step lands on
 20:52:30 rather than being rounded to a whole minute.
+
+**A delay after the trigger** — the offset counts forward from the customer's
+own message, so each contact gets a personal timetable:
+
+```
+Contact A writes at 17:30      Contact B writes at 18:10
+  17:30:02  greeting             18:10:02  greeting
+  17:40     message 2            18:20     message 2
+  18:00     message 3            18:40     message 3
+  18:30     message 4            19:10     message 4
+```
+
+The greeting is a queued job like any other, scheduled a couple of seconds out
+(`TRIGGER_GREETING_DELAY_MS`) so the first reply does not land in the same
+instant as the message that asked for it.
+
+A contact who joins late does not receive messages whose moment has passed:
+someone triggering at 20:40 gets the 20:45 message onwards, not a burst of
+"5 hours to go" arriving after the fact.
 
 ---
 
@@ -173,6 +223,9 @@ variable. The settings that matter most:
 | `SECURE_COOKIES` | Must be `true` in production; the app refuses to start otherwise. |
 | `TRUSTED_PROXIES` | Proxy addresses whose `X-Forwarded-For` is honoured. Leave empty when exposed directly. |
 | `SCHEDULER_STALE_JOB_TTL` | Pending jobs older than this are cancelled instead of sent late. Default 2 h. |
+| `TRIGGER_GREETING_DELAY_MS` | Pause between a trigger and the first reply, as a queued job rather than a sleep. Range 1000–5000, default 2000. |
+| `WHATSAPP_SEND_WORKERS` | Messages in flight at once. Default 1 — for a single account, keep it there. Max 4. |
+| `WHATSAPP_MIN_SEND_DELAY_MS` / `WHATSAPP_MAX_SEND_DELAY_MS` | Pause between two sends, drawn at random from this range. Defaults 2000 / 5000; the minimum may not go below 1000. |
 
 **The server's own clock zone is irrelevant.** Every timestamp is stored in
 UTC, each campaign carries an explicit IANA timezone, and conversions happen at
@@ -238,7 +291,7 @@ The interface is in Kazakh.
 | **Басты бет** | Counters, contact and message trends, delivery breakdown, campaign funnel. |
 | **Клиенттер** | Filterable contact list with search, bulk actions, CSV export and a per-contact card. |
 | **Кампаниялар** | Create, edit, duplicate, activate, pause, archive. |
-| **Автоматтандыру** | Visual timeline builder inside a campaign: add, reorder, retime, enable and preview steps. |
+| **Хабарламалар кезегі** | The message queue inside a campaign: add, drag to reorder, retime, enable, duplicate, preview and delete each message. |
 | **Шаблондар** | Message templates with media upload, variable insertion, preview and version history. |
 | **Триггерлер** | Every keyword across campaigns and how many contacts each brought in. |
 | **Жоспарланған** | The job queue: what is pending, sent, failed, and why. Retry or cancel individually. |
@@ -253,8 +306,12 @@ The interface is in Kazakh.
 2. **Кампаниялар** → create a campaign with the date, time, timezone and
    webinar link.
 3. Open the campaign → add the trigger phrase (`Дәл сәйкестік` is the safe
-   default) and build the steps.
-4. Press **Алдын ала қарау** to see every send time in the campaign's timezone.
+   default), then build the message queue. For each message pick a template and
+   either an exact date and time, or a delay counted from the customer's own
+   trigger.
+4. Press **Хронология** to see every send time in the campaign's timezone
+   before going live. The page also shows a checklist of anything that would
+   block activation.
 5. Activate.
 
 ### Template variables
@@ -293,6 +350,7 @@ internal/
   conversations/ message history
   templates/     templates and revision history
   scheduler/     persistent job queue and workers
+  outbound/      the single controlled path to WhatsApp: concurrency and pacing
   messaging/     outbound sending and the consent guard
   inbound/       Green API queue poller, ingest pipeline, idempotency
   media/         upload validation, storage, ffmpeg transcoding
@@ -361,6 +419,25 @@ skipping. A `PROCESSING` row whose lock has aged past
 **No Redis.** SQLite provides the locking, durability and ordering this queue
 needs; a second datastore would add an availability dependency and a
 consistency boundary for no benefit at this scale.
+
+### Sending is deliberately slow
+
+Every automated message leaves through one gate (`internal/outbound`), which
+bounds how many sends run at once and how far apart they go out. Without it,
+each scheduler worker would call the provider the moment it claimed a job, and
+a hundred contacts due at 21:00 would become a hundred near-simultaneous API
+calls from a single WhatsApp account.
+
+Ordering within a conversation is handled one level down, in the claim query,
+which never hands out a second job for a contact while one is in flight and
+never hands out a later message before an earlier one. A contact with three
+overdue messages therefore receives them one at a time, in order — the gate
+only has to care about the global pace.
+
+The point is reliability, not evasion. There is no account rotation, no proxy
+juggling and no attempt to disguise automated traffic; the queue simply refuses
+to go faster than configured, and holds work rather than dropping it when a
+campaign hits its own hourly or daily limit.
 
 ### Duplicates cannot happen
 

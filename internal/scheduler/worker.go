@@ -378,10 +378,23 @@ func (w *Worker) overSendingLimit(ctx context.Context, jc *JobContext) (bool, ti
 }
 
 // shouldSkip reports configuration or consent reasons to drop a job outright.
+//
+// The audience check here is deliberately redundant. Queue creation already
+// refuses to make a live job for a contact outside the step's audience, so in
+// normal operation this never fires. It exists because the row can outlive the
+// decision that created it: a step can gain a cutoff after its jobs were
+// queued, a deploy can land mid-schedule, a row can be edited by hand. The
+// consequence of getting it wrong is a message reaching someone it was
+// explicitly meant to spare, which is not recoverable once WhatsApp has
+// delivered it — so it is re-derived from the enrolment one last time, against
+// the same rule the planner used.
 func shouldSkip(jc *JobContext) (string, bool) {
 	switch {
 	case !jc.StepEnabled:
 		return "step is disabled", true
+
+	case !audienceEligible(jc):
+		return domain.SkipNotEligible, true
 	case jc.EnrollmentStatus != domain.EnrollmentActive:
 		return "enrollment is no longer active", true
 	case jc.ContactOptedOut:
@@ -394,6 +407,17 @@ func shouldSkip(jc *JobContext) (string, bool) {
 		return "campaign is closed", true
 	}
 	return "", false
+}
+
+// audienceEligible re-applies the step's audience cutoff to this job's
+// enrolment, using the same inclusive rule the planner uses so the two can
+// never disagree about who a message is for.
+func audienceEligible(jc *JobContext) bool {
+	step := domain.CampaignStep{
+		AudienceFilterEnabled: jc.StepAudienceFilter,
+		AudienceMinJoinedAt:   jc.StepAudienceMinJoinedAt,
+	}
+	return step.EligibleFor(jc.EnrollmentJoinedAt)
 }
 
 func (w *Worker) buildOutbound(jc *JobContext, spec *templates.SendSpec, job domain.ScheduledMessage) (messaging.Outbound, error) {

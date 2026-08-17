@@ -463,7 +463,19 @@ export async function renderCampaignDetail(root, { params, navigate }) {
       el('td', { 'data-label': 'Түрі' },
         badge(TEMPLATE_TYPE[step.template_type] || step.template_type, 'neutral')),
       el('td', { 'data-label': 'Статус' },
-        step.enabled ? badge('Қосулы', 'success') : badge('Өшірулі', 'neutral')),
+        step.enabled ? badge('Қосулы', 'success') : badge('Өшірулі', 'neutral'),
+        // A restricted step reaches only part of the audience, which is the
+        // kind of thing an operator must be able to see without opening the
+        // form -- otherwise "why did only some people get this?" has no answer
+        // on the screen where the question comes up.
+        step.audience_filter_enabled && step.audience_min_joined_at
+          ? el('div', { class: 'small subtle nowrap', title:
+              'Тек ' + formatInZone(new Date(step.audience_min_joined_at), campaign.timezone, {
+                day: '2-digit', month: '2-digit', year: 'numeric',
+                hour: '2-digit', minute: '2-digit',
+              }) + ' немесе одан кейін қосылған клиенттерге жіберіледі' },
+              'тек жаңа қосылғандарға')
+          : null),
       el('td', {},
         el('div', { class: 'table__actions' },
           button('', { iconName: 'eye', size: 'sm', title: 'Алдын ала қарау', onClick: () => openStepPreview(step) }),
@@ -609,6 +621,45 @@ export async function renderCampaignDetail(root, { params, navigate }) {
 
     const enabledBox = checkbox('Хабарлама қосулы', { checked: step?.enabled ?? true });
 
+    // Audience cutoff. The case this exists for is the last message before an
+    // event: "we are gathering, come in" is a welcome to somebody who signed up
+    // two minutes ago and a repetition to somebody who has been getting
+    // reminders since morning. Restricting one step lets both be true.
+    const audienceCutoff = step?.audience_min_joined_at
+      ? new Date(step.audience_min_joined_at)
+      : (runAt || eventStart);
+
+    const audienceBox = checkbox('Тек белгілі уақыттан кейін қосылғандарға жіберу', {
+      checked: step?.audience_filter_enabled ?? false,
+    });
+    const audienceDate = input({
+      type: 'date',
+      value: dateInZone(audienceCutoff, campaign.timezone),
+    });
+    const audienceTime = input({
+      type: 'time',
+      step: '1',
+      value: timeInZone(audienceCutoff, campaign.timezone) || '20:55:00',
+    });
+
+    const audienceFields = el('div', {},
+      el('p', { class: 'muted small' },
+        'Осы хабарламаны тек көрсетілген күн мен уақытта немесе одан кейін кампанияға '
+        + 'қосылған клиенттер алады. Бұрын қосылғандарға бұл хабарлама жіберілмейді.'),
+      el('div', { class: 'form-grid' },
+        field('Күні', audienceDate),
+        field('Уақыты', audienceTime, { hint: `${campaign.timezone} белдеуі бойынша, осы сәтті қоса` })));
+
+    const syncAudience = () => {
+      audienceFields.classList.toggle('hidden', !audienceBox.input.checked);
+    };
+    audienceBox.input.addEventListener('change', syncAudience);
+    syncAudience();
+
+    const audienceBlock = el('div', { class: 'field' },
+      audienceBox,
+      audienceFields);
+
     const exactBlock = el('div', {},
       el('p', { class: 'muted small' },
         'Хабарлама күнтізбедегі осы нақты сәтте жіберіледі. Барлық клиент оны бір уақытта алады. '
@@ -661,6 +712,7 @@ export async function renderCampaignDetail(root, { params, navigate }) {
         }),
         exactBlock,
         delayBlock,
+        audienceBlock,
         el('div', { class: 'field' }, enabledBox)),
       footer: [
         button('Болдырмау', { onClick: () => handle.close() }),
@@ -677,7 +729,20 @@ export async function renderCampaignDetail(root, { params, navigate }) {
         message_template_id: templateSelect.value,
         enabled: enabledBox.input.checked,
         offset_seconds: 0,
+        audience_filter_enabled: audienceBox.input.checked,
       };
+
+      if (audienceBox.input.checked) {
+        if (!audienceDate.value) {
+          showError('Аудитория шектеуі үшін күнді таңдаңыз');
+          return;
+        }
+        // Sent as a local wall-clock moment plus a zone; the server converts to
+        // UTC exactly as it does for the step's own send time.
+        payload.audience_joined_date = audienceDate.value;
+        payload.audience_joined_time = audienceTime.value || '00:00:00';
+        payload.audience_timezone = campaign.timezone;
+      }
 
       if (kindSelect.value === 'ON_TRIGGER') {
         payload.offset_seconds = buildDelaySeconds(

@@ -287,8 +287,16 @@ type CampaignStep struct {
 	Enabled       bool         `json:"enabled"`
 	OrderIndex    int          `json:"order_index"`
 	ScheduleKind  ScheduleKind `json:"schedule_kind"`
-	CreatedAt     time.Time    `json:"created_at"`
-	UpdatedAt     time.Time    `json:"updated_at"`
+	// AudienceFilterEnabled restricts this one step to contacts who entered the
+	// campaign at or after AudienceMinJoinedAt. Off by default, and evaluated
+	// per step: a campaign can send its 20:00 reminder to everyone and its
+	// 20:55 welcome only to people who arrived in the last few minutes.
+	AudienceFilterEnabled bool `json:"audience_filter_enabled"`
+	// AudienceMinJoinedAt is the inclusive cutoff, in UTC. A contact who
+	// enrolled exactly at this instant is eligible.
+	AudienceMinJoinedAt *time.Time `json:"audience_min_joined_at"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
 
 	// Template details joined in by list queries, so the queue can be rendered
 	// and validated without a second round trip per row.
@@ -545,16 +553,39 @@ const (
 	// SkipCampaignClosed: the campaign is finished or archived, so no step of
 	// it will run again.
 	SkipCampaignClosed = "skip:campaign_closed"
+	// SkipNotEligible: the step carries an audience cutoff and this contact
+	// entered the campaign before it. Unlike the other reasons this one can
+	// never stop being true — an enrolment's entry time does not move — so the
+	// row is written once and never reconsidered.
+	SkipNotEligible = "skip:recipient_not_eligible"
 )
 
 // IsSkipReason reports whether a cancel reason marks a deliberate skip rather
 // than a revocation.
 func IsSkipReason(reason string) bool {
 	switch reason {
-	case SkipStepExpired, SkipStepDisabled, SkipNoEventAnchor, SkipCampaignClosed:
+	case SkipStepExpired, SkipStepDisabled, SkipNoEventAnchor, SkipCampaignClosed,
+		SkipNotEligible:
 		return true
 	}
 	return false
+}
+
+// EligibleFor reports whether a contact who entered the campaign at enrolledAt
+// may receive this step.
+//
+// The boundary is inclusive: a contact who arrived at exactly the cutoff is in.
+// This is the single definition of eligibility in the system — the planner, the
+// reconciler and the send path all call it, so the queue and the worker can
+// never disagree about who a message is for.
+//
+// A step with the filter switched off is open to everyone, which is what keeps
+// the feature opt-in: an unconfigured step behaves as it always has.
+func (s *CampaignStep) EligibleFor(enrolledAt time.Time) bool {
+	if !s.AudienceFilterEnabled || s.AudienceMinJoinedAt == nil {
+		return true
+	}
+	return !enrolledAt.Before(*s.AudienceMinJoinedAt)
 }
 
 type ScheduledMessage struct {

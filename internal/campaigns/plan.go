@@ -85,6 +85,15 @@ func BuildPlan(eventStart *time.Time, steps []domain.CampaignStep, opts PlanOpti
 			entry.Reason = "қадам өшірілген"
 			entry.SkipCode = domain.SkipStepDisabled
 
+		// The audience cutoff is checked before any time is resolved, because a
+		// contact who is not in this step's audience has no send time for it at
+		// all. Deciding it here means an ineligible contact never reaches the
+		// queue as live work — the row is written as a recorded skip instead.
+		case !step.EligibleFor(opts.EnrolledAt):
+			entry.Skipped = true
+			entry.Reason = "қатысушы белгіленген уақыттан бұрын қосылған"
+			entry.SkipCode = domain.SkipNotEligible
+
 		case step.ScheduleKind == domain.ScheduleOnTrigger:
 			delay := time.Duration(step.OffsetSeconds) * time.Second
 			if delay < opts.TriggerDelay {

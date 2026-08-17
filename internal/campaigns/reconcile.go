@@ -111,6 +111,16 @@ func resolveStep(campaign *domain.Campaign, step domain.CampaignStep, enrolledAt
 		return desired{skipReason: domain.SkipStepDisabled}
 	}
 
+	// The audience cutoff. An enrolment's entry time never moves, so a contact
+	// who was too early for this step stays too early for as long as the cutoff
+	// stands — but the operator can withdraw or lower the cutoff itself, and
+	// then the message is owed to them again. That is why the skip is recorded
+	// as revivable like any other: the decision belongs to the configuration,
+	// not to the contact.
+	if !step.EligibleFor(enrolledAt) {
+		return desired{skipReason: domain.SkipNotEligible}
+	}
+
 	if step.ScheduleKind == domain.ScheduleOnTrigger {
 		delay := time.Duration(step.OffsetSeconds) * time.Second
 		if delay < triggerDelay {

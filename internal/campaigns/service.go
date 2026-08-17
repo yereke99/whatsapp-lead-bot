@@ -721,11 +721,23 @@ type StepInput struct {
 	TemplateID    uuid.UUID
 	Enabled       bool
 	ScheduleKind  string
+	// AudienceFilterEnabled limits this step to contacts who entered the
+	// campaign at or after AudienceMinJoinedAt.
+	AudienceFilterEnabled bool
+	// AudienceMinJoinedAt is the cutoff in UTC. The handler converts it from
+	// the operator's local date, time and zone before it gets here.
+	AudienceMinJoinedAt *time.Time
 }
 
 func (in StepInput) validate() error {
 	if in.TemplateID == uuid.Nil {
 		return errors.New("шаблон таңдалуы керек")
+	}
+	// A cutoff that is switched on but never set would silently send to
+	// everybody, which is the opposite of what the operator asked for. Refuse
+	// it rather than guess.
+	if in.AudienceFilterEnabled && in.AudienceMinJoinedAt == nil {
+		return errors.New("аудитория шектеуі қосылған кезде қосылу уақытын көрсету міндетті")
 	}
 	kind := domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent)))
 	if !domain.ValidScheduleKind(string(kind)) {
@@ -751,12 +763,14 @@ func (s *Service) AddStep(ctx context.Context, campaignID uuid.UUID, in StepInpu
 	}
 
 	step := &domain.CampaignStep{
-		CampaignID:    campaignID,
-		Name:          strings.TrimSpace(in.Name),
-		OffsetSeconds: in.OffsetSeconds,
-		TemplateID:    in.TemplateID,
-		Enabled:       in.Enabled,
-		ScheduleKind:  domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent))),
+		CampaignID:            campaignID,
+		Name:                  strings.TrimSpace(in.Name),
+		OffsetSeconds:         in.OffsetSeconds,
+		TemplateID:            in.TemplateID,
+		Enabled:               in.Enabled,
+		ScheduleKind:          domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent))),
+		AudienceFilterEnabled: in.AudienceFilterEnabled,
+		AudienceMinJoinedAt:   in.AudienceMinJoinedAt,
 	}
 
 	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
@@ -814,12 +828,14 @@ func (s *Service) UpdateStep(ctx context.Context, stepID uuid.UUID, in StepInput
 	}
 
 	step := &domain.CampaignStep{
-		ID:            stepID,
-		Name:          strings.TrimSpace(in.Name),
-		OffsetSeconds: in.OffsetSeconds,
-		TemplateID:    in.TemplateID,
-		Enabled:       in.Enabled,
-		ScheduleKind:  domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent))),
+		ID:                    stepID,
+		Name:                  strings.TrimSpace(in.Name),
+		OffsetSeconds:         in.OffsetSeconds,
+		TemplateID:            in.TemplateID,
+		Enabled:               in.Enabled,
+		ScheduleKind:          domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent))),
+		AudienceFilterEnabled: in.AudienceFilterEnabled,
+		AudienceMinJoinedAt:   in.AudienceMinJoinedAt,
 	}
 
 	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {

@@ -537,14 +537,40 @@ type stepRequest struct {
 	TemplateID    string `json:"message_template_id"`
 	Enabled       bool   `json:"enabled"`
 	ScheduleKind  string `json:"schedule_kind"`
+	// Audience cutoff: send this step only to contacts who entered the campaign
+	// at or after the given local date and time.
+	AudienceFilterEnabled bool   `json:"audience_filter_enabled"`
+	AudienceJoinedDate    string `json:"audience_joined_date"`
+	AudienceJoinedTime    string `json:"audience_joined_time"`
+	AudienceTimezone      string `json:"audience_timezone"`
 }
 
 func (req stepRequest) toInput(campaign *domain.Campaign) (campaigns.StepInput, error) {
 	in := campaigns.StepInput{
-		Name:          req.Name,
-		OffsetSeconds: req.OffsetSeconds,
-		Enabled:       req.Enabled,
-		ScheduleKind:  req.ScheduleKind,
+		Name:                  req.Name,
+		OffsetSeconds:         req.OffsetSeconds,
+		Enabled:               req.Enabled,
+		ScheduleKind:          req.ScheduleKind,
+		AudienceFilterEnabled: req.AudienceFilterEnabled,
+	}
+
+	// The cutoff is entered as a wall-clock moment in a named zone and stored as
+	// UTC, the same conversion a step's own send time already goes through. The
+	// campaign's timezone is the default so the operator is not asked the same
+	// question twice.
+	if date := strings.TrimSpace(req.AudienceJoinedDate); date != "" {
+		tz := strings.TrimSpace(req.AudienceTimezone)
+		if tz == "" && campaign != nil {
+			tz = campaign.Timezone
+		}
+		if tz == "" {
+			tz = "Asia/Almaty"
+		}
+		at, err := timex.ParseInLocation(date, req.AudienceJoinedTime, tz)
+		if err != nil {
+			return in, fmt.Errorf("аудитория шектеуінің уақыты жарамсыз: %w", err)
+		}
+		in.AudienceMinJoinedAt = &at
 	}
 
 	id, err := uuid.Parse(strings.TrimSpace(req.TemplateID))

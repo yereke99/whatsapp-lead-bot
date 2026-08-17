@@ -220,6 +220,12 @@ func (r *Repository) MovePending(ctx context.Context, q sqlite.Querier, jobID uu
 // an operator's cancellation, a consent refusal, a send that already happened
 // and a job that failed are all excluded, so reviving can never resurrect a
 // decision a human made or repeat a message a contact already received.
+//
+// Skip codes are matched by their "skip:" prefix rather than listed one by one.
+// An enumeration here would be a second copy of domain.IsSkipReason, and the
+// two would drift the first time a reason was added — silently, because a code
+// missing from the list simply never revives. Every reason the system records
+// carries the prefix; everything a human or the send path writes does not.
 func (r *Repository) ReviveSkipped(ctx context.Context, q sqlite.Querier, jobID uuid.UUID, runAt time.Time) (bool, error) {
 	const query = `
 		UPDATE scheduled_messages SET
@@ -229,8 +235,7 @@ func (r *Repository) ReviveSkipped(ctx context.Context, q sqlite.Querier, jobID 
 			locked_by = NULL, locked_at = NULL, updated_at = now()
 		WHERE id = $1
 		  AND status = 'CANCELLED'
-		  AND cancel_reason IN ('skip:step_expired', 'skip:step_disabled',
-		                        'skip:no_event_anchor', 'skip:campaign_closed')`
+		  AND cancel_reason LIKE 'skip:%'`
 
 	tag, err := r.querier(q).Exec(ctx, query, jobID, runAt)
 	if err != nil {
@@ -350,6 +355,11 @@ type JobContext struct {
 	StepName   string
 	StepOffset int
 	TemplateID uuid.UUID
+	// StepAudienceFilter and StepAudienceMinJoinedAt carry the step's audience
+	// cutoff so the send path can re-check eligibility against the enrolment,
+	// rather than trusting that whatever queued this row got it right.
+	StepAudienceFilter      bool
+	StepAudienceMinJoinedAt *time.Time
 
 	ContactPhone     string
 	ContactChatID    string
@@ -360,8 +370,9 @@ type JobContext struct {
 	ContactStatus    domain.ContactStatus
 	ContactConsentAt *time.Time
 
-	EnrollmentStatus domain.EnrollmentStatus
-	StepEnabled      bool
+	EnrollmentStatus   domain.EnrollmentStatus
+	EnrollmentJoinedAt time.Time
+	StepEnabled        bool
 }
 
 func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobContext, error) {
@@ -371,8 +382,9 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 			camp.max_send_attempts, camp.pin_template_version,
 			camp.max_messages_per_hour, camp.max_messages_per_day,
 			cs.name, cs.offset_seconds, cs.message_template_id, cs.enabled,
+			cs.audience_filter_enabled, cs.audience_min_joined_at,
 			c.phone, c.chat_id, c.name, c.push_name, c.opted_out, (c.blocked_at IS NOT NULL), c.status, c.first_contact_at,
-			cc.status
+			cc.status, cc.enrolled_at
 		FROM scheduled_messages sm
 		JOIN campaigns camp        ON camp.id = sm.campaign_id
 		JOIN campaign_steps cs     ON cs.id = sm.campaign_step_id
@@ -389,9 +401,10 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 		&jc.CampaignEventStart, &jc.CampaignMaxAttempts, &jc.CampaignPinVersion,
 		&jc.CampaignMaxPerHour, &jc.CampaignMaxPerDay,
 		&jc.StepName, &jc.StepOffset, &jc.TemplateID, &jc.StepEnabled,
+		&jc.StepAudienceFilter, &jc.StepAudienceMinJoinedAt,
 		&jc.ContactPhone, &jc.ContactChatID, &jc.ContactName, &jc.ContactPushName,
 		&jc.ContactOptedOut, &jc.ContactBlocked, &jc.ContactStatus, &jc.ContactConsentAt,
-		&jc.EnrollmentStatus,
+		&jc.EnrollmentStatus, &jc.EnrollmentJoinedAt,
 	)
 
 	if err := row.Scan(dest...); err != nil {

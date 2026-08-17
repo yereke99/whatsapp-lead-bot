@@ -54,11 +54,20 @@ const CampaignName = "Airan"
 
 // TriggerPhrase is the exact message a lead sends to enter the funnel.
 //
-// Matching is EXACT against the normalized form, and normalization case-folds,
-// so "АЙРАН", "Айран" and "айран" all reach the same trigger while an unrelated
-// message that merely mentions ayran does not. Nothing fuzzy is involved: the
-// contact either sent this word or they did not.
-const TriggerPhrase = "АЙРАН"
+// It is a full sentence rather than a word because an opt-in should be
+// unambiguous. "АЙРАН" — what this used to be — is what somebody types when
+// they are talking about ayran, not when they are asking to join a webinar;
+// this sentence is what the ads and landing page tell people to send, and
+// nobody writes it by accident.
+//
+// Matching is EXACT against the normalized form, and normalization case-folds
+// and collapses whitespace, so the sentence still matches whatever mixture of
+// capitals and stray spaces the contact's keyboard produces. Nothing fuzzy is
+// involved: they either sent this sentence or they did not.
+//
+// Migration 0003 moves existing databases onto the same phrase, so the two must
+// stay in step.
+const TriggerPhrase = "Айран/Қаймақ кәсібі бойынша тегін сабаққа қатысқым келеді"
 
 // WebinarLink is the default room. It lives on the campaign rather than inside
 // the copy, and the templates reach it through {{webinar_link}}, so changing

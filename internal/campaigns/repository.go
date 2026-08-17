@@ -742,6 +742,80 @@ func (r *Repository) ListEnrollmentsForContact(ctx context.Context, contactID uu
 	return out, rows.Err()
 }
 
+// EnrollmentsForReconcile lists the enrollments whose queue reconciliation is
+// allowed to repair.
+//
+// COMPLETED is included deliberately, and it is the difference between the old
+// back-fill and this one. The original ActiveEnrollmentIDs query filtered to
+// ACTIVE, which sounds right until a completion sweep closes an enrollment
+// early: the contact then becomes invisible to every repair path, and any step
+// added afterwards can never reach them. Since completion is now derived from
+// the steps, a COMPLETED enrollment that turns out to have unfinished work is
+// simply reopened.
+//
+// CANCELLED and UNSUBSCRIBED are never returned. Those are decisions about the
+// contact, not about the queue, and no amount of repair should undo them.
+func (r *Repository) EnrollmentsForReconcile(ctx context.Context, q sqlite.Querier, campaignID *uuid.UUID) ([]domain.Enrollment, error) {
+	query := `
+		SELECT cc.id, cc.campaign_id, cc.contact_id, cc.status, cc.run_number, cc.enrolled_at
+		FROM campaign_contacts cc
+		JOIN contacts c ON c.id = cc.contact_id
+		WHERE cc.status IN ('ACTIVE', 'COMPLETED')
+		  AND NOT c.opted_out
+		  AND c.blocked_at IS NULL`
+
+	var args []any
+	if campaignID != nil {
+		args = append(args, *campaignID)
+		query += " AND cc.campaign_id = $1"
+	}
+	query += " ORDER BY cc.enrolled_at"
+
+	rows, err := r.querier(q).Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list enrollments for reconcile: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.Enrollment
+	for rows.Next() {
+		var e domain.Enrollment
+		if err := rows.Scan(&e.ID, &e.CampaignID, &e.ContactID, &e.Status,
+			&e.RunNumber, &e.EnrolledAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ReconcilableCampaignIDs lists the campaigns the periodic sweep should visit:
+// those that can still have work in flight. DRAFT has never run and ARCHIVED is
+// closed, so neither can gain a queue.
+func (r *Repository) ReconcilableCampaignIDs(ctx context.Context) ([]uuid.UUID, error) {
+	const query = `
+		SELECT id FROM campaigns
+		WHERE status IN ('ACTIVE', 'PAUSED', 'COMPLETED')
+		  AND archived_at IS NULL
+		ORDER BY created_at`
+
+	rows, err := r.db.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list reconcilable campaigns: %w", err)
+	}
+	defer rows.Close()
+
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // ActiveEnrollmentIDs lists enrollments still running in a campaign, used when
 // a newly enabled step must be back-filled.
 func (r *Repository) ActiveEnrollmentIDs(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID) ([]domain.Enrollment, error) {

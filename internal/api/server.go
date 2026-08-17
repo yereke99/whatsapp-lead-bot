@@ -118,6 +118,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("GET /api/campaigns/{id}/timeline", s.handleCampaignPreview)
 	protected.HandleFunc("GET /api/campaigns/{id}/validate", s.handleCampaignValidate)
 	protected.HandleFunc("GET /api/campaigns/{id}/scheduled-messages", s.handleCampaignScheduled)
+	protected.HandleFunc("POST /api/campaigns/{id}/reconcile", s.handleReconcileCampaign)
 
 	protected.HandleFunc("GET /api/campaigns/{id}/steps", s.handleListSteps)
 	protected.HandleFunc("POST /api/campaigns/{id}/steps", s.handleCreateStep)
@@ -153,6 +154,7 @@ func (s *Server) routes() {
 
 	protected.HandleFunc("GET /api/audit-logs", s.handleAuditLogs)
 	protected.HandleFunc("GET /api/webhook-events", s.handleWebhookEvents)
+	protected.HandleFunc("GET /api/system/consistency", s.handleConsistency)
 	protected.HandleFunc("GET /api/system/provider", s.handleProviderState)
 	protected.HandleFunc("GET /api/system/settings", s.handleSystemSettings)
 

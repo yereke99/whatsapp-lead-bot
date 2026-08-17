@@ -54,14 +54,22 @@ type NewJob struct {
 	StepID       uuid.UUID
 	RunNumber    int
 	ScheduledAt  time.Time
+
+	// SkipReason, when set, records the step as a deliberately skipped job
+	// instead of a live one: the row is written straight to CANCELLED carrying
+	// the reason. The step is then accounted for rather than absent, which is
+	// what lets reconciliation stay idempotent and completion stay decidable.
+	SkipReason string
 }
 
 // Enqueue inserts jobs, ignoring any that already exist.
 //
 // The (enrollment_id, campaign_step_id, run_number) unique constraint is the
-// anti-duplicate guarantee: re-running enrollment after a partial failure, or
-// two webhook deliveries racing, can never produce a second delivery of the
-// same step.
+// anti-duplicate guarantee: re-running enrollment after a partial failure, two
+// webhook deliveries racing, or a reconciliation pass crossing an enrollment
+// can never produce a second delivery of the same step. The conflict is
+// resolved by the database, not by a read-then-write in application code, so
+// there is no window between the check and the insert.
 func (r *Repository) Enqueue(ctx context.Context, q sqlite.Querier, jobs []NewJob) (int, error) {
 	if len(jobs) == 0 {
 		return 0, nil
@@ -74,12 +82,15 @@ func (r *Repository) Enqueue(ctx context.Context, q sqlite.Querier, jobs []NewJo
 	const query = `
 		INSERT INTO scheduled_messages (
 			campaign_id, contact_id, enrollment_id, campaign_step_id, run_number,
-			scheduled_at, template_version
+			scheduled_at, template_version, status, cancelled_at, cancel_reason
 		) VALUES ($1,$2,$3,$4,$5,$6, (
 			SELECT t.version FROM message_templates t
 			JOIN campaign_steps cs ON cs.message_template_id = t.id
 			WHERE cs.id = $4
-		))
+		),
+		CASE WHEN $7 = '' THEN 'PENDING' ELSE 'CANCELLED' END,
+		CASE WHEN $7 = '' THEN NULL ELSE now() END,
+		$7)
 		ON CONFLICT (enrollment_id, campaign_step_id, run_number) DO NOTHING`
 
 	querier := r.querier(q)
@@ -89,13 +100,159 @@ func (r *Repository) Enqueue(ctx context.Context, q sqlite.Querier, jobs []NewJo
 			j.RunNumber = 1
 		}
 		tag, err := querier.Exec(ctx, query,
-			j.CampaignID, j.ContactID, j.EnrollmentID, j.StepID, j.RunNumber, j.ScheduledAt)
+			j.CampaignID, j.ContactID, j.EnrollmentID, j.StepID, j.RunNumber,
+			j.ScheduledAt, j.SkipReason)
 		if err != nil {
 			return created, fmt.Errorf("enqueue job: %w", err)
 		}
 		created += int(tag.RowsAffected())
 	}
 	return created, nil
+}
+
+// ExistingJob is the reconciliation view of a queued row: just enough to decide
+// whether the step is already accounted for and whether its time may move.
+type ExistingJob struct {
+	ID           uuid.UUID
+	EnrollmentID uuid.UUID
+	StepID       uuid.UUID
+	RunNumber    int
+	Status       domain.JobStatus
+	ScheduledAt  time.Time
+	CancelReason string
+}
+
+// JobsForEnrollment lists every job already recorded for one enrollment,
+// whatever its state. Reconciliation needs the terminal rows too: a SENT step
+// must never be recreated, and a skipped one must not be re-evaluated.
+func (r *Repository) JobsForEnrollment(ctx context.Context, q sqlite.Querier, enrollmentID uuid.UUID) ([]ExistingJob, error) {
+	const query = `
+		SELECT id, enrollment_id, campaign_step_id, run_number, status, scheduled_at, cancel_reason
+		FROM scheduled_messages
+		WHERE enrollment_id = $1`
+
+	return r.scanExisting(ctx, q, query, enrollmentID)
+}
+
+// JobsForEnrollments loads the queue for many enrollments in one round trip.
+//
+// The periodic sweep reads every running enrollment's jobs. Doing that one
+// query at a time is what turns a routine health check into load: ten thousand
+// contacts would mean ten thousand statements every interval, competing with
+// the workers actually sending messages. Batching keeps a sweep proportional to
+// the number of campaigns rather than the number of contacts.
+func (r *Repository) JobsForEnrollments(ctx context.Context, q sqlite.Querier, enrollmentIDs []uuid.UUID) (map[uuid.UUID][]ExistingJob, error) {
+	out := make(map[uuid.UUID][]ExistingJob, len(enrollmentIDs))
+	if len(enrollmentIDs) == 0 {
+		return out, nil
+	}
+
+	placeholders := make([]string, len(enrollmentIDs))
+	args := make([]any, len(enrollmentIDs))
+	for i, id := range enrollmentIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	query := `
+		SELECT id, enrollment_id, campaign_step_id, run_number, status, scheduled_at, cancel_reason
+		FROM scheduled_messages
+		WHERE enrollment_id IN (` + strings.Join(placeholders, ",") + `)`
+
+	jobs, err := r.scanExisting(ctx, q, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, job := range jobs {
+		out[job.EnrollmentID] = append(out[job.EnrollmentID], job)
+	}
+	return out, nil
+}
+
+func (r *Repository) scanExisting(ctx context.Context, q sqlite.Querier, query string, args ...any) ([]ExistingJob, error) {
+	rows, err := r.querier(q).Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list enrollment jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ExistingJob
+	for rows.Next() {
+		var j ExistingJob
+		if err := rows.Scan(&j.ID, &j.EnrollmentID, &j.StepID, &j.RunNumber,
+			&j.Status, &j.ScheduledAt, &j.CancelReason); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// MovePending shifts one PENDING job to a new time.
+//
+// The status is re-checked in the WHERE clause rather than trusted from the
+// caller's earlier read, so a job that a worker claimed in the meantime is left
+// alone instead of being rewritten underneath it.
+func (r *Repository) MovePending(ctx context.Context, q sqlite.Querier, jobID uuid.UUID, runAt time.Time) (bool, error) {
+	const query = `
+		UPDATE scheduled_messages SET
+			scheduled_at = $2, updated_at = now()
+		WHERE id = $1 AND status = 'PENDING' AND scheduled_at <> $2`
+
+	tag, err := r.querier(q).Exec(ctx, query, jobID, runAt)
+	if err != nil {
+		return false, fmt.Errorf("move pending job: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// ReviveSkipped turns a recorded skip back into a live job.
+//
+// A skip is not history in the way a send is. It is a *derived* statement —
+// "given the campaign as it stood, this step did not apply to this contact" —
+// and derived statements stop being true when the campaign changes. An operator
+// who adds a step with the wrong offset, sees it recorded as expired, and
+// corrects it to a time that has not happened yet is entitled to have it sent.
+// Before this existed the correction updated the step and nothing else, because
+// every reschedule path was an UPDATE against a row that did not exist.
+//
+// The WHERE clause is the safety rail. Only a system-recorded skip is eligible:
+// an operator's cancellation, a consent refusal, a send that already happened
+// and a job that failed are all excluded, so reviving can never resurrect a
+// decision a human made or repeat a message a contact already received.
+func (r *Repository) ReviveSkipped(ctx context.Context, q sqlite.Querier, jobID uuid.UUID, runAt time.Time) (bool, error) {
+	const query = `
+		UPDATE scheduled_messages SET
+			status = 'PENDING', scheduled_at = $2,
+			cancelled_at = NULL, cancel_reason = '',
+			attempt_count = 0, next_attempt_at = NULL, last_error = '',
+			locked_by = NULL, locked_at = NULL, updated_at = now()
+		WHERE id = $1
+		  AND status = 'CANCELLED'
+		  AND cancel_reason IN ('skip:step_expired', 'skip:step_disabled',
+		                        'skip:no_event_anchor', 'skip:campaign_closed')`
+
+	tag, err := r.querier(q).Exec(ctx, query, jobID, runAt)
+	if err != nil {
+		return false, fmt.Errorf("revive skipped job: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// SkipPending turns a live job into a recorded skip, used when a step stops
+// being applicable to an enrollment that already had it queued.
+func (r *Repository) SkipPending(ctx context.Context, q sqlite.Querier, jobID uuid.UUID, reason string) (bool, error) {
+	const query = `
+		UPDATE scheduled_messages SET
+			status = 'CANCELLED', cancelled_at = now(), cancel_reason = $2,
+			locked_by = NULL, locked_at = NULL, updated_at = now()
+		WHERE id = $1 AND status = 'PENDING'`
+
+	tag, err := r.querier(q).Exec(ctx, query, jobID, reason)
+	if err != nil {
+		return false, fmt.Errorf("skip pending job: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // Claim atomically moves up to limit due jobs into PROCESSING and returns them.

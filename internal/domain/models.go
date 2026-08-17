@@ -508,6 +508,55 @@ const (
 	JobCancelled  JobStatus = "CANCELLED"
 )
 
+// IsTerminal reports whether a job has finished moving.
+//
+// This is the predicate an enrollment's completion is decided by: a step counts
+// as resolved once its job can no longer change on its own. PENDING and
+// PROCESSING are the only states the queue will still act on — a FAILED job has
+// exhausted its attempts, and CANCELLED is a deliberate end.
+func (s JobStatus) IsTerminal() bool {
+	switch s {
+	case JobSent, JobFailed, JobCancelled:
+		return true
+	}
+	return false
+}
+
+// Skip reasons.
+//
+// A step that was never eligible for an enrollment is recorded as a CANCELLED
+// job carrying one of these codes, rather than left absent. That distinction is
+// the whole point: an absent row is indistinguishable from a lost one, which is
+// exactly how missing steps used to hide. A row with a skip reason is a
+// decision the system can show, count and audit.
+//
+// The codes are stored, so they are machine-readable and must stay stable. The
+// panel renders them as "SKIPPED"; a CANCELLED job without one of these codes
+// was revoked by an operator or by the send path.
+const (
+	// SkipStepExpired: the step's moment had already passed when the job would
+	// have been created, and campaign policy does not catch up.
+	SkipStepExpired = "skip:step_expired"
+	// SkipStepDisabled: the step is switched off.
+	SkipStepDisabled = "skip:step_disabled"
+	// SkipNoEventAnchor: a RELATIVE_TO_EVENT step in a campaign with no event
+	// start, so no absolute time can be derived.
+	SkipNoEventAnchor = "skip:no_event_anchor"
+	// SkipCampaignClosed: the campaign is finished or archived, so no step of
+	// it will run again.
+	SkipCampaignClosed = "skip:campaign_closed"
+)
+
+// IsSkipReason reports whether a cancel reason marks a deliberate skip rather
+// than a revocation.
+func IsSkipReason(reason string) bool {
+	switch reason {
+	case SkipStepExpired, SkipStepDisabled, SkipNoEventAnchor, SkipCampaignClosed:
+		return true
+	}
+	return false
+}
+
 type ScheduledMessage struct {
 	ID           uuid.UUID `json:"id"`
 	CampaignID   uuid.UUID `json:"campaign_id"`

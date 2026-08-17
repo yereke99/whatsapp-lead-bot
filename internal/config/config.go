@@ -99,6 +99,15 @@ type Scheduler struct {
 	RetryMaxDelay  time.Duration
 	LockTimeout    time.Duration
 	StaleJobTTL    time.Duration
+	// ReconcileInterval is how often every running enrollment is checked
+	// against its campaign's steps, and missing jobs created.
+	//
+	// This is a safety net, not the primary mechanism: steps reconcile the
+	// moment they are edited. It exists because the primary mechanism is code,
+	// and code has bugs — a step that loses its job for any reason at all is
+	// repaired within one interval instead of never. A pass over a correct
+	// campaign only reads, so the interval can be short.
+	ReconcileInterval time.Duration
 	// TriggerDelay is the floor applied to a step scheduled at trigger time, so
 	// the first reply never lands in the same instant as the customer's own
 	// message. It is a scheduled job, not a sleep: the queue holds the message
@@ -202,6 +211,7 @@ func Load() (*Config, error) {
 			// rest of that contact's queue. Keep it tight.
 			LockTimeout:           envDuration("SCHEDULER_LOCK_TIMEOUT", 2*time.Minute),
 			StaleJobTTL:           envDuration("SCHEDULER_STALE_JOB_TTL", 2*time.Hour),
+			ReconcileInterval:     envDuration("SCHEDULER_RECONCILE_INTERVAL", 30*time.Second),
 			TriggerDelay:          time.Duration(envInt("TRIGGER_GREETING_DELAY_MS", 2000)) * time.Millisecond,
 			NotificationWorkers:   envInt("GREEN_API_WORKERS", 5),
 			NotificationBatchSize: envInt("GREEN_API_BATCH_SIZE", 50),

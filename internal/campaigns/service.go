@@ -297,32 +297,74 @@ func (s *Service) applyExistingBehavior(
 // computed once, written to the queue, and from then on the database is the
 // only thing that decides when anything is sent. Nothing is delivered inline,
 // and nothing depends on this process staying alive.
+//
+// Every step produces a row — a live job, or a recorded skip saying why not.
+// Writing the skips down is what lets reconciliation tell "this step was
+// considered and declined" apart from "this step has no job", and the second of
+// those is now always a fault worth repairing.
+//
+// This is also the only place catch-up applies. Deciding to send a contact the
+// most recent message they missed is a judgement about someone who has just
+// arrived; later repairs must never make it again, or a step added late would
+// fire at everyone already in the funnel at once.
 func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, campaign *domain.Campaign, enrollment *domain.Enrollment, at time.Time) (int, error) {
 	steps, err := s.repo.ListSteps(ctx, tx, campaign.ID)
 	if err != nil {
 		return 0, err
 	}
 
+	now := time.Now().UTC()
 	plan := BuildPlan(campaign.EventStartAt, steps, PlanOptions{
 		EnrolledAt:   at,
-		Now:          time.Now().UTC(),
+		Now:          now,
 		CatchUp:      campaign.CatchUpMissedSteps,
 		TriggerDelay: s.triggerDelay,
 	})
 
 	jobs := make([]scheduler.NewJob, 0, len(plan))
-	for _, entry := range Scheduled(plan) {
+	live := 0
+	for _, entry := range plan {
+		runAt := entry.RunAt
+		if entry.Skipped && runAt.IsZero() {
+			// A step with no derivable time still needs one on the row: the
+			// column is NOT NULL and the panel sorts the queue by it.
+			runAt = now
+		}
+		if !entry.Skipped {
+			live++
+		}
 		jobs = append(jobs, scheduler.NewJob{
 			CampaignID:   campaign.ID,
 			ContactID:    enrollment.ContactID,
 			EnrollmentID: enrollment.ID,
 			StepID:       entry.Step.ID,
 			RunNumber:    enrollment.RunNumber,
-			ScheduledAt:  entry.RunAt,
+			ScheduledAt:  runAt,
+			SkipReason:   entry.SkipCode,
 		})
 	}
 
-	return s.jobs.Enqueue(ctx, tx, jobs)
+	if _, err := s.jobs.Enqueue(ctx, tx, jobs); err != nil {
+		return 0, err
+	}
+
+	for _, entry := range plan {
+		if entry.Skipped {
+			continue
+		}
+		s.log.Info("JOB_CREATED",
+			slog.String("campaign_id", campaign.ID.String()),
+			slog.String("enrollment_id", enrollment.ID.String()),
+			slog.String("campaign_step_id", entry.Step.ID.String()),
+			slog.String("contact_id", enrollment.ContactID.String()),
+			slog.Time("scheduled_at", entry.RunAt),
+			slog.String("source", "enrollment"))
+	}
+
+	// Report the jobs that will actually be delivered. Skips are recorded, not
+	// scheduled, and counting them would tell the operator a contact is getting
+	// messages that were explicitly declined.
+	return live, nil
 }
 
 // -------------------------------------------------------------- lifecycle --
@@ -502,6 +544,12 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*Upda
 			slog.Int64("rescheduled", result.Rescheduled))
 	}
 
+	// RescheduleCampaign moves the jobs that exist. Reconciling afterwards
+	// covers the ones that do not: moving an event later makes steps that were
+	// skipped as expired viable again, and only a re-derivation from the steps
+	// can notice that.
+	s.reconcileAfterChange(ctx, id, "campaign updated")
+
 	campaign, err := s.repo.GetFull(ctx, id)
 	if err != nil {
 		return nil, err
@@ -544,6 +592,11 @@ func (s *Service) Activate(ctx context.Context, id uuid.UUID) (*domain.Campaign,
 	if err != nil {
 		return nil, err
 	}
+
+	// Going live is the moment the queue has to be right. A campaign activated
+	// after its steps were built, or resumed after an edit during the pause,
+	// gets its enrollments brought in line before any of them come due.
+	s.reconcileAfterChange(ctx, id, "campaign activated")
 
 	return s.repo.GetFull(ctx, id)
 }
@@ -707,20 +760,51 @@ func (s *Service) AddStep(ctx context.Context, campaignID uuid.UUID, in StepInpu
 	}
 
 	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
-		if err := s.repo.CreateStep(ctx, tx, step); err != nil {
-			return err
-		}
-		// Back-fill the new step for contacts already moving through the
-		// campaign, so a step added mid-flight is not silently missed.
-		if step.Enabled {
-			return s.backfillStep(ctx, tx, campaignID, step)
-		}
-		return nil
+		return s.repo.CreateStep(ctx, tx, step)
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	// Every contact already moving through this campaign gets the new step,
+	// whether they are mid-funnel or were closed out before it existed. This is
+	// the case the platform used to lose: a step added after enrollment reached
+	// nobody, and nothing ever noticed.
+	s.reconcileAfterChange(ctx, campaignID, "step added")
 	return step, nil
+}
+
+// reconcileAfterChange brings every enrollment in line after the campaign's
+// configuration changed.
+//
+// It runs after the change has committed, not inside its transaction. The
+// reconciler takes one transaction per enrollment so a large campaign does not
+// hold SQLite's single write lock for the whole sweep, and nesting that inside
+// the caller's transaction would deadlock. The cost of committing first is that
+// a crash in between leaves the steps updated and the queue briefly stale —
+// which the periodic sweep repairs on its next pass. That is the whole reason
+// the periodic sweep exists: correctness does not depend on this call
+// succeeding.
+func (s *Service) reconcileAfterChange(ctx context.Context, campaignID uuid.UUID, cause string) {
+	stats, err := s.ReconcileCampaign(ctx, campaignID)
+	if err != nil {
+		s.log.Error("reconciling campaign after change failed",
+			slog.String("campaign_id", campaignID.String()),
+			slog.String("cause", cause),
+			slog.String("error", err.Error()))
+		return
+	}
+	if stats.Changed() {
+		s.log.Info("campaign reconciled",
+			slog.String("campaign_id", campaignID.String()),
+			slog.String("cause", cause),
+			slog.Int("enrollments", stats.EnrollmentsChecked),
+			slog.Int("jobs_created", stats.JobsCreated),
+			slog.Int("jobs_moved", stats.JobsMoved),
+			slog.Int("jobs_cancelled", stats.JobsCancelled),
+			slog.Int("skips_recorded", stats.SkipsRecorded),
+			slog.Int("enrollments_reopened", stats.EnrollmentsReopen))
+	}
 }
 
 // UpdateStep saves a step and reconciles the jobs already queued for it.
@@ -746,101 +830,65 @@ func (s *Service) UpdateStep(ctx context.Context, stepID uuid.UUID, in StepInput
 		if previous == nil {
 			return ErrStepNotFound
 		}
-
-		if err := s.repo.UpdateStep(ctx, tx, step); err != nil {
-			return err
-		}
-
-		// Only queued messages are reconciled. Anything already sent is
-		// history, and anything in flight belongs to the worker holding it.
-		switch {
-		case previous.Enabled && !step.Enabled:
-			_, err = s.jobs.CancelPendingForStep(ctx, tx, stepID, "қадам өшірілді")
-			return err
-
-		case !previous.Enabled && step.Enabled:
-			return s.backfillStep(ctx, tx, step.CampaignID, step)
-
-		case previous.OffsetSeconds != step.OffsetSeconds || previous.ScheduleKind != step.ScheduleKind:
-			if step.ScheduleKind == domain.ScheduleOnTrigger {
-				_, err = s.jobs.RescheduleTriggerStep(ctx, tx, stepID)
-			} else {
-				_, err = s.jobs.RescheduleStep(ctx, tx, stepID)
-			}
-			return err
-		}
-		return nil
+		step.CampaignID = previous.CampaignID
+		return s.repo.UpdateStep(ctx, tx, step)
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	// One path for every kind of edit. The old code had a branch per case —
+	// enable, disable, offset moved, anchor changed — and each branch could only
+	// UPDATE rows that already existed. A step that had no job (because it was
+	// added while its time was past, or because the contact had been closed out)
+	// could therefore be edited into the future and still never acquire one.
+	// Reconciling instead of patching removes that whole class: the queue is
+	// re-derived from the step as it now stands, so a missing job is created and
+	// an existing one is moved, without the caller having to know which.
+	s.reconcileAfterChange(ctx, step.CampaignID, "step updated")
 	return step, nil
 }
 
-// backfillStep enqueues a newly enabled step for every active enrollment.
-func (s *Service) backfillStep(ctx context.Context, tx sqlite.Querier, campaignID uuid.UUID, step *domain.CampaignStep) error {
-	campaign, err := s.repo.GetByID(ctx, tx, campaignID)
-	if err != nil {
-		return err
-	}
-	if campaign == nil || campaign.EventStartAt == nil {
-		return nil
-	}
-
-	enrollments, err := s.repo.ActiveEnrollmentIDs(ctx, tx, campaignID)
-	if err != nil {
-		return err
-	}
-	if len(enrollments) == 0 {
-		return nil
-	}
-
-	now := time.Now().UTC()
-	runAt := campaign.EventStartAt.Add(time.Duration(step.OffsetSeconds) * time.Second)
-	if step.ScheduleKind == domain.ScheduleOnTrigger {
-		// A trigger-time step added later has no meaningful past anchor, so it
-		// is not back-filled at all.
-		return nil
-	}
-	if runAt.Before(now) {
-		// Do not resurrect a moment that has already passed for existing
-		// contacts; the plan builder handles catch-up only at enrollment.
-		return nil
-	}
-
-	jobs := make([]scheduler.NewJob, 0, len(enrollments))
-	for _, e := range enrollments {
-		jobs = append(jobs, scheduler.NewJob{
-			CampaignID:   campaignID,
-			ContactID:    e.ContactID,
-			EnrollmentID: e.ID,
-			StepID:       step.ID,
-			RunNumber:    e.RunNumber,
-			ScheduledAt:  runAt,
-		})
-	}
-
-	created, err := s.jobs.Enqueue(ctx, tx, jobs)
-	if err != nil {
-		return err
-	}
-	s.log.Info("step back-filled for active contacts",
-		slog.String("step_id", step.ID.String()),
-		slog.Int("jobs_created", created))
-	return nil
-}
-
 func (s *Service) DeleteStep(ctx context.Context, stepID uuid.UUID) error {
-	return s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
+	var campaignID uuid.UUID
+
+	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
+		step, err := s.repo.GetStep(ctx, stepID)
+		if err != nil {
+			return err
+		}
+		if step == nil {
+			return ErrStepNotFound
+		}
+		campaignID = step.CampaignID
+
 		if _, err := s.jobs.CancelPendingForStep(ctx, tx, stepID, "step deleted"); err != nil {
 			return err
 		}
 		return s.repo.DeleteStep(ctx, stepID)
 	})
+	if err != nil {
+		return err
+	}
+
+	// Deleting a step can be what finishes an enrollment: if it was the last
+	// thing outstanding, the contact is now done and should be closed out.
+	s.reconcileAfterChange(ctx, campaignID, "step deleted")
+	return nil
 }
 
+// ReorderSteps changes presentation order only.
+//
+// order_index does not enter any scheduling arithmetic — a step's time comes
+// from its offset and its anchor — so reordering cannot move a job. It still
+// reconciles, because it is cheap and because "an admin touched this campaign"
+// is exactly when a latent gap is worth catching.
 func (s *Service) ReorderSteps(ctx context.Context, campaignID uuid.UUID, ordered []uuid.UUID) error {
-	return s.repo.ReorderSteps(ctx, campaignID, ordered)
+	if err := s.repo.ReorderSteps(ctx, campaignID, ordered); err != nil {
+		return err
+	}
+	s.reconcileAfterChange(ctx, campaignID, "steps reordered")
+	return nil
 }
 
 // -------------------------------------------------------------- triggers --
@@ -1028,23 +1076,30 @@ func (s *Service) StopForContact(ctx context.Context, contactID uuid.UUID, statu
 	})
 }
 
-// CompleteFinishedEnrollments closes enrollments whose jobs have all resolved.
+// CompleteFinishedEnrollments closes enrollments whose steps have all resolved.
+//
+// The previous implementation asked only "are there any PENDING or PROCESSING
+// jobs left?" and closed the enrollment when there were none. That question has
+// two very different answers behind one result: a contact who received
+// everything, and a contact whose jobs were never created. It could not tell
+// them apart, because it never looked at campaign_steps.
+//
+// In production it closed a contact at 10:42 who had received 2 of what became
+// 5 steps — and because the back-fill for new steps only considered ACTIVE
+// enrollments, being COMPLETED then hid that contact from the very mechanism
+// that would have given them the missing three.
+//
+// Completion is now derived from the steps, which is the only place it can
+// honestly come from, and it is derived by the same pass that repairs the
+// queue: an enrollment cannot be closed while a step is unaccounted for,
+// because reconciliation creates the missing job first and then finds it
+// unfinished.
 func (s *Service) CompleteFinishedEnrollments(ctx context.Context) (int64, error) {
-	const query = `
-		UPDATE campaign_contacts SET
-			status = 'COMPLETED', completed_at = now()
-		WHERE status = 'ACTIVE'
-		  AND EXISTS (SELECT 1 FROM scheduled_messages sm WHERE sm.enrollment_id = campaign_contacts.id)
-		  AND NOT EXISTS (
-			SELECT 1 FROM scheduled_messages sm
-			WHERE sm.enrollment_id = campaign_contacts.id AND sm.status IN ('PENDING', 'PROCESSING')
-		  )`
-
-	tag, err := s.repo.DB().Exec(ctx, query)
+	stats, err := s.ReconcileAll(ctx)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	return int64(stats.EnrollmentsDone), nil
 }
 
 func sameInstant(a, b *time.Time) bool {

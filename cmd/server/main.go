@@ -157,7 +157,7 @@ func run() error {
 		log.Warn("scheduler is disabled: scheduled messages will not be sent")
 	}
 
-	go completeEnrollmentsLoop(ctx, campaignSvc, log)
+	go reconcileLoop(ctx, campaignSvc, cfg.Scheduler.ReconcileInterval, log)
 
 	// ---- http -------------------------------------------------------------
 
@@ -242,10 +242,52 @@ func run() error {
 	return nil
 }
 
-// completeEnrollmentsLoop closes out enrollments whose jobs have all resolved,
-// which is what moves a contact to COMPLETED after a webinar finishes.
-func completeEnrollmentsLoop(ctx context.Context, svc *campaigns.Service, log *slog.Logger) {
-	ticker := time.NewTicker(5 * time.Minute)
+// reconcileLoop keeps the queue in agreement with the campaigns that define it.
+//
+// Every running enrollment is compared against its campaign's steps: a step
+// with no job gets one, a step whose time moved has its pending job moved, and
+// an enrollment whose steps have all resolved is closed out. It is the same
+// operation the step editor performs, run on a timer.
+//
+// The point of running it periodically is that it does not depend on anything
+// having noticed. Every event-driven path can fail — a handler that misses a
+// case, a process killed between two commits, a step written by hand — and each
+// failure used to mean a contact silently stopped receiving messages, with
+// nothing in the system able to detect it. Here the queue converges on the
+// campaign definition regardless of how it drifted.
+//
+// It runs immediately on start rather than waiting out the first tick, so a
+// restart repairs anything that was lost while the process was down.
+func reconcileLoop(ctx context.Context, svc *campaigns.Service, interval time.Duration, log *slog.Logger) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	run := func() {
+		stats, err := svc.ReconcileAll(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Error("reconciliation sweep failed", slog.String("error", err.Error()))
+			}
+			return
+		}
+		// A correct system reconciles silently. Anything logged here is a gap
+		// that was found and repaired, which is worth seeing.
+		if stats.Changed() {
+			log.Info("reconciliation repaired the queue",
+				slog.Int("enrollments_checked", stats.EnrollmentsChecked),
+				slog.Int("jobs_created", stats.JobsCreated),
+				slog.Int("jobs_moved", stats.JobsMoved),
+				slog.Int("jobs_cancelled", stats.JobsCancelled),
+				slog.Int("skips_recorded", stats.SkipsRecorded),
+				slog.Int("enrollments_reopened", stats.EnrollmentsReopen),
+				slog.Int("enrollments_completed", stats.EnrollmentsDone))
+		}
+	}
+
+	run()
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -253,14 +295,7 @@ func completeEnrollmentsLoop(ctx context.Context, svc *campaigns.Service, log *s
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			completed, err := svc.CompleteFinishedEnrollments(ctx)
-			if err != nil {
-				log.Error("completing enrollments failed", slog.String("error", err.Error()))
-				continue
-			}
-			if completed > 0 {
-				log.Info("enrollments completed", slog.Int64("count", completed))
-			}
+			run()
 		}
 	}
 }

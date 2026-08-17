@@ -419,6 +419,56 @@ func (s *Server) handleCampaignValidate(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// handleReconcileCampaign runs reconciliation for one campaign on demand.
+//
+// The scheduler does this on a timer already, so the button is not what makes
+// the system correct. It is here because an operator who has just fixed a
+// campaign should not have to wait out an interval to see the queue agree with
+// it, and because the counters it returns answer "did that actually change
+// anything?" — which is otherwise only visible in the logs.
+func (s *Server) handleReconcileCampaign(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWriter(w, r) {
+		return
+	}
+
+	id, err := httpx.PathUUID(r, "id")
+	if err != nil {
+		httpx.Fail(w, http.StatusBadRequest, httpx.CodeBadRequest, err.Error())
+		return
+	}
+
+	stats, err := s.deps.Campaigns.ReconcileCampaign(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, campaigns.ErrNotFound) {
+			httpx.Fail(w, http.StatusNotFound, httpx.CodeNotFound, "Кампания табылмады")
+			return
+		}
+		httpx.Internal(w, s.log, err, "reconcile campaign")
+		return
+	}
+
+	s.deps.Audit.Record(r.Context(), s.actorFrom(r), audit.Entry{
+		Action:     audit.ActionCampaignReconciled,
+		EntityType: "campaign",
+		EntityID:   id.String(),
+		Summary: fmt.Sprintf("Кезек тексерілді: %d жазылым, %d жаңа тапсырма, %d жылжытылды",
+			stats.EnrollmentsChecked, stats.JobsCreated, stats.JobsMoved),
+	})
+
+	httpx.JSON(w, http.StatusOK, stats)
+}
+
+// handleConsistency reports whether the queue still matches the campaigns that
+// define it, without changing anything.
+func (s *Server) handleConsistency(w http.ResponseWriter, r *http.Request) {
+	report, err := s.deps.Campaigns.Consistency(r.Context())
+	if err != nil {
+		httpx.Internal(w, s.log, err, "run consistency checks")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, report)
+}
+
 // handleCampaignScheduled lists the real queued messages for one campaign, as
 // opposed to the plan: what is actually waiting, for whom, and at what time.
 func (s *Server) handleCampaignScheduled(w http.ResponseWriter, r *http.Request) {

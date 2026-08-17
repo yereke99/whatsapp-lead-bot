@@ -84,7 +84,9 @@ func (w *Worker) Start(ctx context.Context) {
 		if released, err := w.repo.ReleaseStale(ctx, w.cfg.LockTimeout); err != nil {
 			w.log.Error("startup recovery failed", slog.String("error", err.Error()))
 		} else if released > 0 {
-			w.log.Warn("requeued jobs orphaned by a previous run", slog.Int64("count", released))
+			w.log.Warn("JOB_RECOVERED",
+				slog.Int64("count", released),
+				slog.String("reason", "orphaned by a previous run"))
 		}
 
 		for i := 0; i < w.cfg.Workers; i++ {
@@ -175,7 +177,9 @@ func (w *Worker) maintenanceLoop(ctx context.Context) {
 			if released, err := w.repo.ReleaseStale(ctx, w.cfg.LockTimeout); err != nil {
 				w.log.Error("releasing stale locks failed", slog.String("error", err.Error()))
 			} else if released > 0 {
-				w.log.Warn("released stale job locks", slog.Int64("count", released))
+				w.log.Warn("JOB_RECOVERED",
+					slog.Int64("count", released),
+					slog.String("reason", "worker lease expired"))
 			}
 
 			if cancelled, err := w.repo.CancelStale(ctx, w.cfg.StaleJobTTL); err != nil {
@@ -188,10 +192,23 @@ func (w *Worker) maintenanceLoop(ctx context.Context) {
 }
 
 // process handles one claimed job end to end.
+//
+// Every transition a job makes is logged under a stable event name —
+// JOB_CLAIMED, JOB_SENT, JOB_RETRY, JOB_FAILED, JOB_CANCELLED, JOB_DEFERRED —
+// carrying the identifiers needed to follow one message from campaign step to
+// delivery. A message that does not arrive should be explainable from the log
+// alone, without reading the database.
 func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 	log := w.log.With(
-		slog.String("job_id", job.ID.String()),
+		slog.String("scheduled_message_id", job.ID.String()),
+		slog.String("campaign_id", job.CampaignID.String()),
+		slog.String("enrollment_id", job.EnrollmentID.String()),
+		slog.String("campaign_step_id", job.StepID.String()),
+		slog.String("contact_id", job.ContactID.String()),
+		slog.Time("scheduled_at", job.ScheduledAt),
 		slog.Int("attempt", job.AttemptCount+1))
+
+	log.Info("JOB_CLAIMED", slog.String("worker_id", w.workerID))
 
 	jobCtx, err := w.repo.LoadContext(ctx, job.ID)
 	if err != nil {
@@ -208,7 +225,7 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 	}
 
 	if reason, skip := shouldSkip(jobCtx); skip {
-		log.Info("job cancelled before sending", slog.String("reason", reason))
+		log.Info("JOB_CANCELLED", slog.String("reason", reason))
 		if err := w.repo.Cancel(ctx, job.ID, reason); err != nil {
 			log.Error("cancelling job failed", slog.String("error", err.Error()))
 		}
@@ -225,6 +242,9 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		if err := w.repo.Defer(ctx, job.ID, next, "кампания кідіртілген"); err != nil {
 			log.Error("deferring paused job failed", slog.String("error", err.Error()))
 		}
+		log.Info("JOB_DEFERRED",
+			slog.String("reason", "campaign paused"),
+			slog.Time("next_attempt", next))
 		return
 	}
 
@@ -234,9 +254,10 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		if err := w.repo.Defer(ctx, job.ID, until, reason); err != nil {
 			log.Error("deferring rate-limited job failed", slog.String("error", err.Error()))
 		}
-		log.Warn("campaign sending limit reached; queue is holding",
+		log.Warn("JOB_DEFERRED",
 			slog.String("campaign", jobCtx.CampaignName),
-			slog.String("reason", reason))
+			slog.String("reason", reason),
+			slog.Time("next_attempt", until))
 		return
 	}
 
@@ -281,14 +302,24 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		sentAt = *message.SentAt
 	}
 	if err := w.repo.MarkSent(ctx, nil, job.ID, message.ID, sentAt); err != nil {
-		log.Error("marking job sent failed", slog.String("error", err.Error()))
+		// The provider has accepted the message but the row still says
+		// PROCESSING. This is the one gap no database can close, because the
+		// send and the write cannot share a transaction with an external API.
+		// It is logged loudly and left to the lease to recover: the job returns
+		// to PENDING and may send a second time. Losing the message would be
+		// worse than repeating it, so the recovery is deliberately biased that
+		// way — see the send-idempotency note in the package docs.
+		log.Error("JOB_SENT_UNRECORDED",
+			slog.String("message_id", message.ID.String()),
+			slog.String("error", err.Error()))
+		return
 	}
 
-	log.Info("scheduled message delivered",
+	log.Info("JOB_SENT",
 		slog.String("campaign", jobCtx.CampaignName),
 		slog.String("step", jobCtx.StepName),
-		slog.String("contact_id", jobCtx.Job.ContactID.String()))
-
+		slog.String("message_id", message.ID.String()),
+		slog.Time("sent_at", sentAt))
 }
 
 // resolveTemplate loads the content this job should render.
@@ -442,8 +473,12 @@ func (w *Worker) retryOrFail(ctx context.Context, job domain.ScheduledMessage, m
 		if err := w.repo.Fail(ctx, job.ID, reason); err != nil {
 			log.Error("marking job failed", slog.String("error", err.Error()))
 		}
-		log.Error("job failed permanently",
+		// FAILED is a resting place, not a deletion: the row keeps its error,
+		// its attempt count and its schedule, stays visible in the panel and
+		// can be requeued by hand.
+		log.Error("JOB_FAILED",
 			slog.Int("attempts", attempts),
+			slog.Int("max_attempts", maxAttempts),
 			slog.Bool("retryable", retryable),
 			slog.String("error", cause.Error()))
 		return
@@ -455,8 +490,9 @@ func (w *Worker) retryOrFail(ctx context.Context, job domain.ScheduledMessage, m
 		return
 	}
 
-	log.Warn("job will be retried",
+	log.Warn("JOB_RETRY",
 		slog.Int("attempts", attempts),
+		slog.Int("max_attempts", maxAttempts),
 		slog.Time("next_attempt", next),
 		slog.String("error", cause.Error()))
 }

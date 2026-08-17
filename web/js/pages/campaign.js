@@ -349,11 +349,40 @@ export async function renderCampaignDetail(root, { params, navigate }) {
         : 'Іс-шара уақытын белгілегеннен кейін нақты уақыттар есептеледі',
       actions: el('div', { class: 'row' },
         button('Хронология', { size: 'sm', iconName: 'clock', onClick: openTimeline }),
+        button('Кезекті тексеру', { size: 'sm', iconName: 'refresh', onClick: reconcileQueue }),
         steps.length > 0
           ? button('Хабарлама қосу', { size: 'sm', variant: 'primary', iconName: 'plus', onClick: () => openStepForm(null) })
           : null),
       body,
     });
+  }
+
+  // reconcileQueue rebuilds the scheduled messages from the campaign's steps.
+  //
+  // The server already does this on a timer and after every edit, so this
+  // button should normally report that nothing was missing. That is the point:
+  // it answers "is every contact really going to get every message?" with a
+  // number rather than with a reassurance.
+  async function reconcileQueue() {
+    try {
+      const stats = await api.reconcileCampaign(campaign.id);
+      const repaired = (stats.jobs_created || 0) + (stats.jobs_moved || 0) +
+        (stats.jobs_cancelled || 0) + (stats.enrollments_reopened || 0);
+
+      if (repaired === 0) {
+        notify.info(
+          `${stats.enrollments_checked} жазылым тексерілді, жетіспейтін хабарлама жоқ`,
+          'Кезек дұрыс');
+      } else {
+        notify.success(
+          `${stats.jobs_created} жаңа хабарлама, ${stats.jobs_moved} жылжытылды, ` +
+          `${stats.enrollments_reopened} жазылым қайта ашылды`,
+          'Кезек түзетілді');
+      }
+      await reload();
+    } catch (err) {
+      notify.error(err.message || 'Кезекті тексеру сәтсіз аяқталды');
+    }
   }
 
   // orderWarning flags a queue whose listed order does not match the order it

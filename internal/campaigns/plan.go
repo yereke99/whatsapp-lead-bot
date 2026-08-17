@@ -12,6 +12,10 @@ type PlanEntry struct {
 	RunAt   time.Time           `json:"run_at"`
 	Skipped bool                `json:"skipped"`
 	Reason  string              `json:"reason,omitempty"`
+	// SkipCode is the stable, machine-readable form of Reason. Reason is the
+	// operator's sentence and may be reworded; SkipCode is stored on the job
+	// row, so it must not change. Empty when the entry is not skipped.
+	SkipCode string `json:"skip_code,omitempty"`
 }
 
 // PlanOptions controls how a plan is built for one contact.
@@ -79,6 +83,7 @@ func BuildPlan(eventStart *time.Time, steps []domain.CampaignStep, opts PlanOpti
 		case !step.Enabled:
 			entry.Skipped = true
 			entry.Reason = "қадам өшірілген"
+			entry.SkipCode = domain.SkipStepDisabled
 
 		case step.ScheduleKind == domain.ScheduleOnTrigger:
 			delay := time.Duration(step.OffsetSeconds) * time.Second
@@ -90,6 +95,7 @@ func BuildPlan(eventStart *time.Time, steps []domain.CampaignStep, opts PlanOpti
 		case eventStart == nil:
 			entry.Skipped = true
 			entry.Reason = "іс-шара уақыты белгіленбеген"
+			entry.SkipCode = domain.SkipNoEventAnchor
 
 		default:
 			entry.RunAt = eventStart.Add(time.Duration(step.OffsetSeconds) * time.Second)
@@ -137,6 +143,7 @@ func BuildPlan(eventStart *time.Time, steps []domain.CampaignStep, opts PlanOpti
 
 		e.Skipped = true
 		e.Reason = "уақыты өтіп кеткен"
+		e.SkipCode = domain.SkipStepExpired
 	}
 
 	return entries

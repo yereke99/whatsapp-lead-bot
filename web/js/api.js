@@ -170,6 +170,11 @@ export const api = {
   campaignTimeline: (id) => get(`/api/campaigns/${id}/timeline`),
   campaignValidate: (id) => get(`/api/campaigns/${id}/validate`),
   campaignScheduled: (id, query) => get(`/api/campaigns/${id}/scheduled-messages`, query),
+  // Forces the queue to be rebuilt from the campaign's steps. The server does
+  // this on a timer anyway; the button is for an operator who has just fixed a
+  // campaign and wants to see it take effect now.
+  reconcileCampaign: (id) => post(`/api/campaigns/${id}/reconcile`),
+  consistency: () => get('/api/system/consistency'),
 
   // steps
   steps: (campaignId) => get(`/api/campaigns/${campaignId}/steps`),

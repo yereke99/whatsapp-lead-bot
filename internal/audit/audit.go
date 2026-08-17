@@ -39,6 +39,8 @@ const (
 	ActionStepDeleted   = "step.deleted"
 	ActionStepReordered = "step.reordered"
 
+	ActionCampaignReconciled = "campaign.reconciled"
+
 	ActionTriggerCreated = "trigger.created"
 	ActionTriggerUpdated = "trigger.updated"
 	ActionTriggerDeleted = "trigger.deleted"

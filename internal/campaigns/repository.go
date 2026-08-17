@@ -789,6 +789,19 @@ func (r *Repository) EnrollmentsForReconcile(ctx context.Context, q sqlite.Queri
 	return out, rows.Err()
 }
 
+// CountAll reports how many campaigns exist, archived ones included.
+//
+// It backs the "is this a fresh installation?" question the default-campaign
+// seeder asks. Archived campaigns count deliberately: archiving one is still a
+// decision somebody made, and a database holding it is not empty.
+func (r *Repository) CountAll(ctx context.Context) (int, error) {
+	var count int
+	if err := r.db.QueryRow(ctx, `SELECT count(*) FROM campaigns`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count campaigns: %w", err)
+	}
+	return count, nil
+}
+
 // ReconcilableCampaignIDs lists the campaigns the periodic sweep should visit:
 // those that can still have work in flight. DRAFT has never run and ARCHIVED is
 // closed, so neither can gain a queue.

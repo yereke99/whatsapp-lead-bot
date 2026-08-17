@@ -23,6 +23,7 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/config"
 	"github.com/ayran/whatsapp-automation/internal/contacts"
 	"github.com/ayran/whatsapp-automation/internal/conversations"
+	"github.com/ayran/whatsapp-automation/internal/domain"
 	"github.com/ayran/whatsapp-automation/internal/exports"
 	"github.com/ayran/whatsapp-automation/internal/inbound"
 	"github.com/ayran/whatsapp-automation/internal/logging"
@@ -30,6 +31,7 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/messaging"
 	"github.com/ayran/whatsapp-automation/internal/outbound"
 	"github.com/ayran/whatsapp-automation/internal/scheduler"
+	"github.com/ayran/whatsapp-automation/internal/seed"
 	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/internal/templates"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
@@ -130,6 +132,41 @@ func run() error {
 
 	if err := authSvc.EnsureBootstrapAdmin(ctx); err != nil {
 		return fmt.Errorf("bootstrap administrator: %w", err)
+	}
+
+	// A fresh installation gets the default campaign so the panel opens on
+	// something working rather than an empty page. A database that already has
+	// campaigns in it is left completely alone — see internal/seed.
+	if cfg.App.SeedDefaultCampaign {
+		result, err := seed.EnsureDefaultCampaign(ctx, seed.Deps{
+			Campaigns: campaignSvc,
+			Templates: templateSvc,
+			Log:       log,
+		}, seed.Options{
+			Timezone: cfg.App.DefaultTimezone,
+			Activate: cfg.App.SeedCampaignActive,
+		})
+		if err != nil {
+			// Seeding is a convenience, not a prerequisite. A failure here must
+			// not stop an otherwise healthy system from starting.
+			log.Error("installing the default campaign failed", slog.String("error", err.Error()))
+		} else if result.Skipped {
+			log.Info("default campaign not installed", slog.String("reason", result.SkipReason))
+		} else {
+			log.Info("default campaign installed",
+				slog.String("campaign", result.CampaignName),
+				slog.String("campaign_id", result.CampaignID.String()),
+				slog.String("status", string(result.CampaignStatus)),
+				slog.String("trigger", result.TriggerKeyword),
+				slog.Time("event_start_at", result.EventStartAt),
+				slog.Int("templates", result.Templates),
+				slog.Int("steps", result.Steps))
+			if result.CampaignStatus == domain.CampaignDraft {
+				log.Warn("the default campaign is a DRAFT and sends nothing yet: " +
+					"upload the voice and image assets, switch each template to its intended " +
+					"type, then activate it in the panel")
+			}
+		}
 	}
 
 	// ---- background work --------------------------------------------------

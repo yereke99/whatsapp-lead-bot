@@ -25,6 +25,17 @@ type App struct {
 	DefaultTimezone string
 	LogLevel        string
 	LogFormat       string
+	// SeedDefaultCampaign installs the Airan campaign when the database holds
+	// no campaigns at all. It never modifies a database that already has one,
+	// so leaving it on is safe on an existing installation.
+	SeedDefaultCampaign bool
+	// SeedCampaignActive makes that campaign go live immediately.
+	//
+	// Off by default. Every media step is seeded as text until its asset is
+	// uploaded, so activating on first boot would send the script of a voice
+	// note to real leads as a written message. Turning this on is a statement
+	// that the assets are already in place.
+	SeedCampaignActive bool
 }
 
 type HTTP struct {
@@ -138,10 +149,12 @@ type Outbound struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		App: App{
-			Env:             envStr("APP_ENV", "development"),
-			DefaultTimezone: envStr("TIMEZONE", "Asia/Almaty"),
-			LogLevel:        envStr("LOG_LEVEL", "info"),
-			LogFormat:       envStr("LOG_FORMAT", "json"),
+			Env:                 envStr("APP_ENV", "development"),
+			DefaultTimezone:     envStr("TIMEZONE", "Asia/Almaty"),
+			LogLevel:            envStr("LOG_LEVEL", "info"),
+			LogFormat:           envStr("LOG_FORMAT", "json"),
+			SeedDefaultCampaign: envBool("SEED_DEFAULT_CAMPAIGN", true),
+			SeedCampaignActive:  envBool("SEED_CAMPAIGN_ACTIVE", false),
 		},
 		HTTP: HTTP{
 			Port:            envInt("PORT", 8086),

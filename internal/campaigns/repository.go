@@ -26,7 +26,15 @@ var (
 
 const campaignColumns = `
 	c.id, c.name, c.description, c.event_type, c.event_start_at, c.timezone,
-	c.webinar_link, c.is_daily_recurring, c.recurrence_time, c.recurrence_start_date,
+	c.webinar_link, c.is_daily_recurring,
+	-- COALESCE, because these columns are nullable and every row that predates
+	-- migration 0005 holds NULL in them. The model carries them as strings —
+	-- "not configured" and "empty" mean the same thing here — and a bare NULL
+	-- would fail the scan, which is exactly what it did in production the first
+	-- time this shipped. Defaulting in SQL keeps that true for rows written by
+	-- hand or by a future migration as well, not only for the ones the service
+	-- happens to write.
+	COALESCE(c.recurrence_time, ''), COALESCE(c.recurrence_start_date, ''),
 	c.status, c.existing_contact_behavior, c.existing_contact_template_id,
 	c.unsubscribe_keywords, c.catch_up_missed_steps, c.max_send_attempts,
 	c.resume_policy, c.pin_template_version, c.max_messages_per_hour,

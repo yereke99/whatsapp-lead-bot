@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/ayran/whatsapp-automation/internal/campaigns"
 	"github.com/ayran/whatsapp-automation/internal/config"
 	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/migrations"
@@ -207,5 +210,75 @@ func TestMigration0005PreservesExistingData(t *testing.T) {
 		if final[table] != want {
 			t.Errorf("%s changed on restart: %d, want %d", table, final[table], want)
 		}
+	}
+}
+
+// TestCampaignRowsFromBeforeTheMigrationStillLoad is the regression test for a
+// production outage this feature caused on its first deploy.
+//
+// The new recurrence columns are nullable, so every campaign that predates
+// migration 0005 holds NULL in them. The model carries them as plain strings,
+// and scanning NULL into a string fails — which took out the campaign list, the
+// campaign detail page and the reconciliation sweep the moment the binary met a
+// real database.
+//
+// The original tests missed it from both sides: the migration test read those
+// columns as *string, and every other test created its campaigns through the
+// service, which writes ” rather than NULL. Nothing ever loaded a NULL row
+// through the repository, which is the only path the panel uses.
+//
+// So this test writes the row the way an existing database holds it — raw SQL,
+// columns left unset — and reads it back the way the panel does.
+func TestCampaignRowsFromBeforeTheMigrationStillLoad(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	eventStart := time.Now().UTC().Add(3 * time.Hour)
+	if _, err := testDB.Exec(ctx, `
+		INSERT INTO campaigns (id, name, event_start_at, timezone, status,
+		                       is_daily_recurring, recurrence_time, recurrence_start_date)
+		VALUES ('d0000000-0000-0000-0000-000000000001', 'Legacy Airan', $1, 'Asia/Almaty',
+		        'ACTIVE', 0, NULL, NULL)`, eventStart); err != nil {
+		t.Fatalf("insert a pre-migration campaign row: %v", err)
+	}
+	id := uuid.MustParse("d0000000-0000-0000-0000-000000000001")
+
+	// GET /api/campaigns/{id}
+	campaign, err := f.campaignRepo.GetByID(ctx, nil, id)
+	if err != nil {
+		t.Fatalf("GetByID on a NULL-recurrence row: %v", err)
+	}
+	if campaign == nil {
+		t.Fatal("GetByID returned no campaign")
+	}
+	if campaign.IsDailyRecurring {
+		t.Error("a row with is_daily_recurring = 0 loaded as recurring")
+	}
+	if campaign.RecurrenceTime != "" || campaign.RecurrenceStartDate != "" {
+		t.Errorf("NULL recurrence columns loaded as %q/%q, want empty strings",
+			campaign.RecurrenceTime, campaign.RecurrenceStartDate)
+	}
+	if campaign.NextOccurrenceAt != nil {
+		t.Errorf("NextOccurrenceAt = %v, want nil", campaign.NextOccurrenceAt)
+	}
+
+	// GET /api/campaigns
+	list, err := f.campaignRepo.List(ctx, campaigns.ListFilter{IncludeArchived: true})
+	if err != nil {
+		t.Fatalf("List with a NULL-recurrence row present: %v", err)
+	}
+	if len(list) == 0 {
+		t.Fatal("List returned nothing")
+	}
+
+	// GET /api/campaigns/{id} with steps and triggers, which the detail page and
+	// the validation endpoint both use.
+	if _, err := f.campaignRepo.GetFull(ctx, id); err != nil {
+		t.Fatalf("GetFull on a NULL-recurrence row: %v", err)
+	}
+
+	// And the sweep, which failed every thirty seconds during the outage.
+	if _, err := f.campaignSvc.ReconcileAll(ctx); err != nil {
+		t.Fatalf("ReconcileAll with a NULL-recurrence row present: %v", err)
 	}
 }

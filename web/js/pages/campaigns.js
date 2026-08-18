@@ -82,10 +82,7 @@ export async function renderCampaigns(root, { navigate }) {
           el('div', { class: 'row' },
             el('span', { class: 'card__title' }, campaign.name),
             badge(status.label, status.tone)),
-          el('div', { class: 'card__sub' },
-            campaign.event_start_at
-              ? `${formatDateTime(campaign.event_start_at)} · ${campaign.timezone}`
-              : 'Іс-шара уақыты белгіленбеген')),
+          el('div', { class: 'card__sub' }, campaignSchedule(campaign))),
         el('div', { class: 'card__actions' }, actions)),
       el('div', { class: 'card__body' },
         campaign.description ? el('p', { class: 'muted small mb-3' }, campaign.description) : null,
@@ -150,6 +147,21 @@ export async function renderCampaigns(root, { navigate }) {
   }
 }
 
+// campaignSchedule is the one-line answer to "when does this campaign fire?".
+// A recurring series reports the webinar that is coming rather than the day it
+// started, which is the only date the operator can act on.
+function campaignSchedule(campaign) {
+  if (campaign.is_daily_recurring) {
+    const next = campaign.next_occurrence_at
+      ? ` · келесі: ${formatDateTime(campaign.next_occurrence_at)}`
+      : '';
+    return `Күн сайын ${campaign.recurrence_time || ''} · ${campaign.timezone}${next}`;
+  }
+  return campaign.event_start_at
+    ? `${formatDateTime(campaign.event_start_at)} · ${campaign.timezone}`
+    : 'Іс-шара уақыты белгіленбеген';
+}
+
 function miniStat(label, value) {
   return el('div', { class: 'stat' },
     el('div', { class: 'stat__label' }, label),
@@ -173,6 +185,35 @@ export async function openCampaignForm(campaign, onSaved) {
 
   const dateInput = input({ type: 'date', value: campaign?.event_start_at ? dateInputValue(campaign.event_start_at) : '' });
   const timeInput = input({ type: 'time', value: campaign?.event_start_at ? timeInputValue(campaign.event_start_at) : '21:00' });
+
+  // Daily recurring webinar. One toggle and one time: everything else — the
+  // steps, their offsets, the link, the audience rules — is reused as it
+  // stands, and each day's webinar simply becomes the anchor they measure
+  // from. The date field above keeps working and becomes the day the series
+  // starts.
+  const recurringTime = input({ type: 'time', value: campaign?.recurrence_time || '' });
+  const recurringDaily = checkbox('Вебинар күн сайын қайталансын', {
+    checked: campaign?.is_daily_recurring ?? false,
+    hint: 'Қосылса, вебинар күнделікті сол уақытта өтеді. Барлық хабарламалар сол күнгі вебинарға '
+      + 'қарай автоматты есептеледі — кампанияны күн сайын көшірудің қажеті жоқ.',
+  });
+
+  const recurringField = field('Күнделікті вебинар уақыты', recurringTime, {
+    hint: 'Жоғарыдағы «Іс-шара күні» — қайталанудың басталатын күні.',
+  });
+  const recurringNote = el('p', { class: 'muted small' });
+
+  const syncRecurring = () => {
+    const on = recurringDaily.input.checked;
+    recurringField.classList.toggle('hidden', !on);
+    recurringNote.classList.toggle('hidden', !on);
+    if (on && !recurringTime.value) recurringTime.value = timeInput.value || '21:00';
+    recurringNote.textContent = on && campaign?.next_occurrence_at
+      ? `Келесі вебинар: ${formatDateTime(campaign.next_occurrence_at)} (${campaign.timezone})`
+      : '';
+  };
+  recurringDaily.input.addEventListener('change', syncRecurring);
+  syncRecurring();
 
   const tzSelect = select(
     TIMEZONES.map((tz) => ({ value: tz, label: tz })),
@@ -251,6 +292,9 @@ export async function openCampaignForm(campaign, onSaved) {
       field('Іс-шара күні', dateInput),
       field('Уақыты', timeInput),
       field('Уақыт белдеуі', tzSelect)),
+    el('div', { class: 'field' }, recurringDaily),
+    recurringField,
+    recurringNote,
     field('Вебинар сілтемесі', linkInput, {
       hint: 'Шаблондарда {{webinar_link}} арқылы қолданылады',
     }),
@@ -295,6 +339,12 @@ export async function openCampaignForm(campaign, onSaved) {
       event_date: dateInput.value,
       event_time: timeInput.value,
       timezone: tzSelect.value,
+      is_daily_recurring: recurringDaily.input.checked,
+      // The backend falls back to the event time and date when these are
+      // blank, so a bare tick of the box means "every day, at the hour I have
+      // already chosen".
+      recurrence_time: recurringDaily.input.checked ? recurringTime.value : '',
+      recurrence_start_date: recurringDaily.input.checked ? dateInput.value : '',
       webinar_link: linkInput.value.trim(),
       existing_contact_behavior: behaviorSelect.value,
       existing_contact_template_id: replyTemplateSelect.value || '',
@@ -310,6 +360,10 @@ export async function openCampaignForm(campaign, onSaved) {
 
     if (!payload.name) {
       showError('Кампания атауын енгізіңіз');
+      return;
+    }
+    if (payload.is_daily_recurring && !payload.recurrence_time) {
+      showError('Күнделікті вебинар уақытын көрсетіңіз');
       return;
     }
 

@@ -45,11 +45,9 @@ export async function renderCampaignDetail(root, { params, navigate }) {
         el('div', { class: 'page-head__text' },
           el('div', { class: 'row' },
             el('h1', {}, campaign.name),
-            badge(status.label, status.tone)),
-          el('p', { class: 'page-head__desc' },
-            campaign.event_start_at
-              ? `Іс-шара: ${formatDateTime(campaign.event_start_at)} (${campaign.timezone})`
-              : 'Іс-шара уақыты белгіленбеген'))),
+            badge(status.label, status.tone),
+            campaign.is_daily_recurring ? badge('Күн сайын', 'info') : null),
+          el('p', { class: 'page-head__desc' }, scheduleSummary()))),
       el('div', { class: 'page-head__actions' },
         campaign.status === 'ACTIVE'
           ? button('Тоқтату', { iconName: 'pause', onClick: () => setStatus('PAUSED') })
@@ -73,6 +71,21 @@ export async function renderCampaignDetail(root, { params, navigate }) {
       el('div', { class: 'mt-3' }, triggersCard()),
       el('div', { class: 'mt-3' }, queueCard()),
     );
+  }
+
+  // scheduleSummary is the header line: when this campaign's webinar happens.
+  // A recurring series reports the occurrence that is coming, because the day
+  // the series began is not something the operator can act on.
+  function scheduleSummary() {
+    if (campaign.is_daily_recurring) {
+      const next = campaign.next_occurrence_at
+        ? ` · келесі вебинар: ${formatDateTime(campaign.next_occurrence_at)}`
+        : '';
+      return `Күн сайын ${campaign.recurrence_time || ''} (${campaign.timezone})${next}`;
+    }
+    return campaign.event_start_at
+      ? `Іс-шара: ${formatDateTime(campaign.event_start_at)} (${campaign.timezone})`
+      : 'Іс-шара уақыты белгіленбеген';
   }
 
   // ----------------------------------------------------------------- help --

@@ -372,7 +372,13 @@ type JobContext struct {
 
 	EnrollmentStatus   domain.EnrollmentStatus
 	EnrollmentJoinedAt time.Time
-	StepEnabled        bool
+	// EnrollmentOccurrenceAt is the webinar occurrence this enrolment belongs
+	// to, for a campaign with a daily recurring webinar. It is what the
+	// {{webinar_date}}, {{webinar_time}} and {{remaining_time}} variables
+	// resolve against, so a message sent on the 19th says the 19th. nil for a
+	// one-time campaign, where the campaign's own event start is the answer.
+	EnrollmentOccurrenceAt *time.Time
+	StepEnabled            bool
 }
 
 func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobContext, error) {
@@ -384,7 +390,7 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 			cs.name, cs.offset_seconds, cs.message_template_id, cs.enabled,
 			cs.audience_filter_enabled, cs.audience_min_joined_at,
 			c.phone, c.chat_id, c.name, c.push_name, c.opted_out, (c.blocked_at IS NOT NULL), c.status, c.first_contact_at,
-			cc.status, cc.enrolled_at
+			cc.status, cc.enrolled_at, cc.occurrence_at
 		FROM scheduled_messages sm
 		JOIN campaigns camp        ON camp.id = sm.campaign_id
 		JOIN campaign_steps cs     ON cs.id = sm.campaign_step_id
@@ -404,7 +410,7 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 		&jc.StepAudienceFilter, &jc.StepAudienceMinJoinedAt,
 		&jc.ContactPhone, &jc.ContactChatID, &jc.ContactName, &jc.ContactPushName,
 		&jc.ContactOptedOut, &jc.ContactBlocked, &jc.ContactStatus, &jc.ContactConsentAt,
-		&jc.EnrollmentStatus, &jc.EnrollmentJoinedAt,
+		&jc.EnrollmentStatus, &jc.EnrollmentJoinedAt, &jc.EnrollmentOccurrenceAt,
 	)
 
 	if err := row.Scan(dest...); err != nil {

@@ -193,6 +193,17 @@ func (s *Service) HandleTrigger(ctx context.Context, contact *domain.Contact, ma
 			TriggerID:      &match.TriggerID,
 			TriggerKeyword: match.Keyword,
 		}
+
+		// A recurring campaign pins the webinar this contact is joining before
+		// the enrolment row exists, so the anchor is written once, atomically,
+		// and every later read — planner, reconciler, worker — sees the same
+		// answer. For a one-time campaign this is nil and nothing changes.
+		occurrence, err := s.occurrenceFor(ctx, tx, campaign, at)
+		if err != nil {
+			return err
+		}
+		enrollment.OccurrenceAt = occurrence
+
 		if err := s.repo.CreateEnrollment(ctx, tx, enrollment); err != nil {
 			if errors.Is(err, ErrAlreadyEnrolled) {
 				// Lost a race with a concurrent delivery of the same trigger.
@@ -245,7 +256,15 @@ func (s *Service) applyExistingBehavior(
 		if _, err := s.jobs.CancelPendingForEnrollment(ctx, tx, existing.ID, "campaign restarted by trigger"); err != nil {
 			return err
 		}
-		restarted, err := s.repo.RestartEnrollment(ctx, tx, existing.ID, match.Keyword)
+		// A restart is a new run, so it gets the webinar that is next for this
+		// contact now rather than inheriting the one the previous run was
+		// waiting for. nil for a non-recurring campaign, which restores exactly
+		// the previous behaviour.
+		occurrence, err := s.occurrenceFor(ctx, tx, campaign, at)
+		if err != nil {
+			return err
+		}
+		restarted, err := s.repo.RestartEnrollment(ctx, tx, existing.ID, match.Keyword, occurrence)
 		if err != nil {
 			return err
 		}
@@ -265,6 +284,24 @@ func (s *Service) applyExistingBehavior(
 		if existing.Status != domain.EnrollmentActive {
 			if err := s.repo.SetEnrollmentStatus(ctx, tx, existing.ID, domain.EnrollmentActive, ""); err != nil {
 				return err
+			}
+		}
+		// A contact enrolled before recurrence was switched on has no webinar
+		// pinned, so they are still anchored to the series start — a date in the
+		// past, whose every step is expired. Giving them the next occurrence is
+		// what CONTINUE means for a daily webinar. An enrolment that already has
+		// an occurrence keeps it: CONTINUE's contract is not to disturb a
+		// schedule that exists.
+		if campaign.IsDailyRecurring && existing.OccurrenceAt == nil {
+			occurrence, err := s.occurrenceFor(ctx, tx, campaign, at)
+			if err != nil {
+				return err
+			}
+			if occurrence != nil {
+				if err := s.repo.SetEnrollmentOccurrence(ctx, tx, existing.ID, occurrence); err != nil {
+					return err
+				}
+				existing.OccurrenceAt = occurrence
 			}
 		}
 		created, err := s.scheduleEnrollment(ctx, tx, campaign, existing, at)
@@ -291,6 +328,52 @@ func (s *Service) applyExistingBehavior(
 	}
 }
 
+// occurrenceFor decides which webinar a contact entering at `at` belongs to.
+//
+// It returns nil for every campaign that is not recurring, which is what keeps
+// the feature opt-in all the way down: a nil occurrence means the enrolment is
+// anchored to campaign.event_start_at, exactly as every enrolment is today.
+//
+// The steps are read only for a recurring campaign, and only to ask how long an
+// occurrence keeps claiming arrivals — see Recurrence.OccurrenceFor. A campaign
+// with the toggle off pays nothing for this.
+//
+// A misconfigured recurrence is not allowed to break enrolment. The trigger has
+// already arrived and the contact is already in the funnel; refusing to enrol
+// them because an operator typed a bad time would lose the lead. The campaign
+// falls back to its one-time anchor and the fault is logged loudly instead.
+func (s *Service) occurrenceFor(ctx context.Context, tx sqlite.Querier, campaign *domain.Campaign, at time.Time) (*time.Time, error) {
+	if !campaign.IsDailyRecurring {
+		return nil, nil
+	}
+
+	steps, err := s.repo.ListSteps(ctx, tx, campaign.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	recurrence := RecurrenceOf(campaign)
+	occurrence, err := recurrence.OccurrenceFor(at, StepTail(steps))
+	if err != nil {
+		s.log.Error("recurring webinar is misconfigured; falling back to the campaign event time",
+			slog.String("campaign_id", campaign.ID.String()),
+			slog.String("campaign_name", campaign.Name),
+			slog.String("webinar_time", recurrence.Time),
+			slog.String("timezone", recurrence.Zone),
+			slog.String("error", err.Error()))
+		return nil, nil
+	}
+
+	s.log.Info("RECURRING_OCCURRENCE_ASSIGNED",
+		slog.String("campaign_id", campaign.ID.String()),
+		slog.String("campaign_name", campaign.Name),
+		slog.String("occurrence_date", timex.FormatIn(occurrence, campaign.Timezone, timex.DateLayout)),
+		slog.Time("webinar_datetime", occurrence),
+		slog.String("timezone", campaign.Timezone))
+
+	return &occurrence, nil
+}
+
 // scheduleEnrollment turns the campaign's steps into persisted jobs.
 //
 // This is the whole of "send the campaign to this contact": the plan is
@@ -314,7 +397,7 @@ func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, cam
 	}
 
 	now := time.Now().UTC()
-	plan := BuildPlan(campaign.EventStartAt, steps, PlanOptions{
+	plan := BuildPlan(EventAnchor(campaign, enrollment), steps, PlanOptions{
 		EnrolledAt:   at,
 		Now:          now,
 		CatchUp:      campaign.CatchUpMissedSteps,
@@ -371,13 +454,24 @@ func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, cam
 
 // SaveInput is the validated payload for creating or updating a campaign.
 type SaveInput struct {
-	Name                    string
-	Description             string
-	EventType               string
-	EventDate               string
-	EventTime               string
-	Timezone                string
-	WebinarLink             string
+	Name        string
+	Description string
+	EventType   string
+	EventDate   string
+	EventTime   string
+	Timezone    string
+	WebinarLink string
+	// IsDailyRecurring turns the single webinar into a daily one. EventDate
+	// then means the day the series starts, and RecurrenceTime the hour it
+	// happens at.
+	IsDailyRecurring bool
+	// RecurrenceTime is "HH:MM" local to Timezone. Empty falls back to
+	// EventTime, so an operator who only ticks the box gets the hour they had
+	// already chosen.
+	RecurrenceTime string
+	// RecurrenceStartDate is "YYYY-MM-DD" local to Timezone. Empty falls back
+	// to EventDate.
+	RecurrenceStartDate     string
 	ExistingContactBehavior string
 	ExistingContactTemplate *uuid.UUID
 	UnsubscribeKeywords     []string
@@ -451,6 +545,10 @@ func (in SaveInput) toCampaign() (*domain.Campaign, error) {
 		c.EventStartAt = &start
 	}
 
+	if err := applyRecurrence(c, in); err != nil {
+		return nil, err
+	}
+
 	keywords := make([]string, 0, len(in.UnsubscribeKeywords))
 	seen := map[string]bool{}
 	for _, kw := range in.UnsubscribeKeywords {
@@ -473,6 +571,71 @@ func (in SaveInput) toCampaign() (*domain.Campaign, error) {
 	return c, nil
 }
 
+// applyRecurrence resolves the daily-webinar settings onto the campaign.
+//
+// Two things matter here and both are about not breaking what exists.
+//
+// The date field keeps working. For a one-time campaign it is still the event
+// date, untouched. For a recurring one it becomes the day the series starts,
+// which is the same field answering the same question — "when does this
+// webinar happen?" — one calendar step out. Nothing is removed from the form
+// and no existing campaign's date changes meaning.
+//
+// event_start_at stays the series' own first occurrence rather than being
+// advanced daily. A column that moved on its own would drag every pending job
+// of every enrolment that has no occurrence pinned along with it, at midnight,
+// unattended. The upcoming webinar is derived for display instead — see
+// NextOccurrence — so the stored configuration can stay still while the day it
+// resolves to moves.
+func applyRecurrence(c *domain.Campaign, in SaveInput) error {
+	if !in.IsDailyRecurring {
+		// Switching recurrence off clears the settings but never touches the
+		// occurrences already pinned on enrolments: those are messages people
+		// are waiting for, and the operator asked to stop the series, not to
+		// cancel the webinar that is already on its way.
+		c.IsDailyRecurring = false
+		c.RecurrenceTime = ""
+		c.RecurrenceStartDate = ""
+		return nil
+	}
+
+	clock := strings.TrimSpace(in.RecurrenceTime)
+	if clock == "" {
+		clock = strings.TrimSpace(in.EventTime)
+	}
+	startDate := strings.TrimSpace(in.RecurrenceStartDate)
+	if startDate == "" {
+		startDate = strings.TrimSpace(in.EventDate)
+	}
+	if startDate == "" && c.EventStartAt != nil {
+		startDate = timex.FormatIn(*c.EventStartAt, c.Timezone, timex.DateLayout)
+	}
+	if startDate == "" {
+		startDate = time.Now().In(timex.MustLocation(c.Timezone)).Format(timex.DateLayout)
+	}
+
+	c.IsDailyRecurring = true
+	c.RecurrenceTime = clock
+	c.RecurrenceStartDate = startDate
+
+	// Validated on the server, always. The panel checks the same things, but a
+	// request does not have to come from the panel.
+	if err := (Recurrence{Enabled: true, Time: clock, StartDate: startDate, Zone: c.Timezone}).Validate(); err != nil {
+		return err
+	}
+
+	// The event anchor becomes the series' first occurrence, so a recurring
+	// campaign still satisfies the schema's "an ACTIVE campaign has an event"
+	// rule and still has a sensible answer for an enrolment that predates the
+	// toggle.
+	start, err := timex.ParseInLocation(startDate, clock, c.Timezone)
+	if err != nil {
+		return err
+	}
+	c.EventStartAt = &start
+	return nil
+}
+
 func (s *Service) Create(ctx context.Context, in SaveInput, adminID *uuid.UUID) (*domain.Campaign, error) {
 	campaign, err := in.toCampaign()
 	if err != nil {
@@ -492,6 +655,10 @@ type UpdateResult struct {
 	Campaign    *domain.Campaign `json:"campaign"`
 	Rescheduled int64            `json:"rescheduled_jobs"`
 	TimeChanged bool             `json:"event_time_changed"`
+	// Rebased counts the enrolments whose upcoming webinar was moved because
+	// the recurrence settings changed. Enrolments whose webinar has already
+	// happened are never among them.
+	Rebased int64 `json:"rebased_enrollments"`
 }
 
 // Update saves campaign settings and, when the event moves, recalculates every
@@ -522,14 +689,51 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*Upda
 			return err
 		}
 
+		recurrenceMoved := recurrenceChanged(existing, updated)
+
 		if !sameInstant(existing.EventStartAt, updated.EventStartAt) {
 			result.TimeChanged = true
-			if updated.EventStartAt != nil {
+			// A campaign-wide reschedule assumes every job shares one anchor,
+			// which is true of a one-time campaign and false of a recurring one:
+			// there, each enrolment is anchored to its own webinar and a blanket
+			// UPDATE would collapse them all onto the same day. Recurring
+			// campaigns are brought in line by reconciliation instead, which
+			// re-derives each job from that enrolment's own occurrence.
+			if updated.EventStartAt != nil && !existing.IsDailyRecurring && !updated.IsDailyRecurring {
 				n, err := s.jobs.RescheduleCampaign(ctx, tx, id, *updated.EventStartAt)
 				if err != nil {
 					return err
 				}
 				result.Rescheduled = n
+			}
+		}
+
+		// The webinar time, zone or start date moved on a live series. Contacts
+		// still waiting for their webinar follow it; contacts whose webinar has
+		// already happened are history and are left exactly as they are.
+		if updated.IsDailyRecurring && recurrenceMoved {
+			now := time.Now().UTC()
+			steps, err := s.repo.ListSteps(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			next, err := RecurrenceOf(updated).OccurrenceFor(now, StepTail(steps))
+			if err != nil {
+				return err
+			}
+			moved, err := s.repo.RebaseFutureOccurrences(ctx, tx, id, next, now)
+			if err != nil {
+				return err
+			}
+			result.Rebased = moved
+			if moved > 0 {
+				s.log.Info("RECURRING_OCCURRENCE_REBASED",
+					slog.String("campaign_id", id.String()),
+					slog.String("campaign_name", updated.Name),
+					slog.String("occurrence_date", timex.FormatIn(next, updated.Timezone, timex.DateLayout)),
+					slog.Time("webinar_datetime", next),
+					slog.String("timezone", updated.Timezone),
+					slog.Int64("enrollments_rebased", moved))
 			}
 		}
 		return nil
@@ -547,8 +751,12 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*Upda
 	// RescheduleCampaign moves the jobs that exist. Reconciling afterwards
 	// covers the ones that do not: moving an event later makes steps that were
 	// skipped as expired viable again, and only a re-derivation from the steps
-	// can notice that.
-	s.reconcileAfterChange(ctx, id, "campaign updated")
+	// can notice that. For a recurring campaign it is also what actually moves
+	// the queue, since the blanket reschedule above is deliberately skipped.
+	stats := s.reconcileAfterChange(ctx, id, "campaign updated")
+	if result.Rescheduled == 0 {
+		result.Rescheduled = int64(stats.JobsMoved)
+	}
 
 	campaign, err := s.repo.GetFull(ctx, id)
 	if err != nil {
@@ -799,14 +1007,14 @@ func (s *Service) AddStep(ctx context.Context, campaignID uuid.UUID, in StepInpu
 // which the periodic sweep repairs on its next pass. That is the whole reason
 // the periodic sweep exists: correctness does not depend on this call
 // succeeding.
-func (s *Service) reconcileAfterChange(ctx context.Context, campaignID uuid.UUID, cause string) {
+func (s *Service) reconcileAfterChange(ctx context.Context, campaignID uuid.UUID, cause string) ReconcileStats {
 	stats, err := s.ReconcileCampaign(ctx, campaignID)
 	if err != nil {
 		s.log.Error("reconciling campaign after change failed",
 			slog.String("campaign_id", campaignID.String()),
 			slog.String("cause", cause),
 			slog.String("error", err.Error()))
-		return
+		return stats
 	}
 	if stats.Changed() {
 		s.log.Info("campaign reconciled",
@@ -819,6 +1027,17 @@ func (s *Service) reconcileAfterChange(ctx context.Context, campaignID uuid.UUID
 			slog.Int("skips_recorded", stats.SkipsRecorded),
 			slog.Int("enrollments_reopened", stats.EnrollmentsReopen))
 	}
+	return stats
+}
+
+// recurrenceChanged reports whether an edit moved a recurring series: the
+// toggle, the hour, the zone or the day the series starts. A change to any
+// other campaign setting must not disturb the webinars already assigned.
+func recurrenceChanged(before, after *domain.Campaign) bool {
+	return before.IsDailyRecurring != after.IsDailyRecurring ||
+		before.RecurrenceTime != after.RecurrenceTime ||
+		before.RecurrenceStartDate != after.RecurrenceStartDate ||
+		before.Timezone != after.Timezone
 }
 
 // UpdateStep saves a step and reconciles the jobs already queued for it.
@@ -995,6 +1214,12 @@ func (s *Service) Preview(ctx context.Context, id uuid.UUID) ([]PreviewEntry, er
 		}
 	}
 
+	// A recurring campaign is previewed against the webinar that is coming,
+	// not against the day the series began. The operator is asking "what goes
+	// out, and when?", and for a daily webinar the honest answer is today's or
+	// tomorrow's occurrence.
+	anchor := PreviewAnchor(campaign, time.Now().UTC())
+
 	entries := make([]PreviewEntry, 0, len(campaign.Steps))
 	for _, step := range campaign.Steps {
 		entry := PreviewEntry{
@@ -1019,12 +1244,12 @@ func (s *Service) Preview(ctx context.Context, id uuid.UUID) ([]PreviewEntry, er
 			}
 			entry.LocalTime = "триггерден кейін " + timex.HumanDuration(delay)
 			entry.OffsetLabel = "+" + timex.HumanDuration(delay)
-		case campaign.EventStartAt == nil:
+		case anchor == nil:
 			if entry.Warning == "" {
 				entry.Warning = "іс-шара уақыты белгіленбеген"
 			}
 		default:
-			runAt := timex.Offset(*campaign.EventStartAt, step.OffsetSeconds)
+			runAt := timex.Offset(*anchor, step.OffsetSeconds)
 			entry.LocalDate = timex.FormatIn(runAt, campaign.Timezone, "02.01.2006")
 			entry.LocalTime = timex.FormatIn(runAt, campaign.Timezone, "15:04:05")
 			entry.UTCTime = runAt.UTC().Format(time.RFC3339)

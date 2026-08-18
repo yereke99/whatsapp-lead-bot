@@ -200,13 +200,25 @@ func ValidResumePolicy(s string) bool {
 }
 
 type Campaign struct {
-	ID                      uuid.UUID               `json:"id"`
-	Name                    string                  `json:"name"`
-	Description             string                  `json:"description"`
-	EventType               string                  `json:"event_type"`
-	EventStartAt            *time.Time              `json:"event_start_at"`
-	Timezone                string                  `json:"timezone"`
-	WebinarLink             string                  `json:"webinar_link"`
+	ID           uuid.UUID  `json:"id"`
+	Name         string     `json:"name"`
+	Description  string     `json:"description"`
+	EventType    string     `json:"event_type"`
+	EventStartAt *time.Time `json:"event_start_at"`
+	Timezone     string     `json:"timezone"`
+	WebinarLink  string     `json:"webinar_link"`
+	// IsDailyRecurring makes the webinar happen every day at RecurrenceTime in
+	// Timezone, instead of once at EventStartAt. It changes one thing only:
+	// which instant a contact's RELATIVE_TO_EVENT steps are measured from. Off
+	// by default, and a campaign with it off behaves exactly as it always has.
+	IsDailyRecurring bool `json:"is_daily_recurring"`
+	// RecurrenceTime is the daily start as "HH:MM" wall-clock in Timezone.
+	// Empty when recurrence is off.
+	RecurrenceTime string `json:"recurrence_time"`
+	// RecurrenceStartDate is the first calendar day of the series as
+	// "YYYY-MM-DD" in Timezone. Empty means the series starts on EventStartAt's
+	// own day, which is what the existing date picker already collects.
+	RecurrenceStartDate     string                  `json:"recurrence_start_date"`
 	Status                  CampaignStatus          `json:"status"`
 	ExistingContactBehavior ExistingContactBehavior `json:"existing_contact_behavior"`
 	ExistingContactTemplate *uuid.UUID              `json:"existing_contact_template_id"`
@@ -234,6 +246,11 @@ type Campaign struct {
 	SentCount    int               `json:"sent_count"`
 	SentLastHour int               `json:"sent_last_hour"`
 	SentLastDay  int               `json:"sent_last_day"`
+
+	// NextOccurrenceAt is the upcoming webinar of a recurring series, derived
+	// from the recurrence settings rather than stored. It is nil for a
+	// one-time campaign, whose upcoming webinar is EventStartAt itself.
+	NextOccurrenceAt *time.Time `json:"next_occurrence_at,omitempty"`
 }
 
 // AcceptsEnrollments reports whether new contacts may join right now.
@@ -493,11 +510,19 @@ type Enrollment struct {
 	RunNumber      int              `json:"run_number"`
 	RestartCount   int              `json:"restart_count"`
 	EnrolledAt     time.Time        `json:"enrolled_at"`
-	CompletedAt    *time.Time       `json:"completed_at"`
-	CancelledAt    *time.Time       `json:"cancelled_at"`
-	CancelReason   string           `json:"cancel_reason"`
-	CreatedAt      time.Time        `json:"created_at"`
-	UpdatedAt      time.Time        `json:"updated_at"`
+	// OccurrenceAt is the webinar occurrence this run belongs to, for a
+	// campaign with a daily recurring webinar. It is the anchor every
+	// RELATIVE_TO_EVENT step of this enrolment is measured from.
+	//
+	// nil means no occurrence is pinned — every enrolment of a one-time
+	// campaign, and every row that predates the feature. Those are anchored to
+	// the campaign's own event_start_at, exactly as before.
+	OccurrenceAt *time.Time `json:"occurrence_at,omitempty"`
+	CompletedAt  *time.Time `json:"completed_at"`
+	CancelledAt  *time.Time `json:"cancelled_at"`
+	CancelReason string     `json:"cancel_reason"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 
 	CampaignName string `json:"campaign_name,omitempty"`
 	PendingJobs  int    `json:"pending_jobs"`

@@ -399,12 +399,14 @@ func (p *Processor) sendSpecialReply(ctx context.Context, contact *domain.Contac
 		"webinar_link":  result.Campaign.WebinarLink,
 		"timezone":      result.Campaign.Timezone,
 	}
-	if result.Campaign.EventStartAt != nil {
+	// The webinar this contact is waiting for: their pinned occurrence when the
+	// campaign runs daily, the campaign's own event start otherwise.
+	if webinar := campaigns.EventAnchor(result.Campaign, result.Enrollment); webinar != nil {
 		tz := result.Campaign.Timezone
-		values["webinar_date"] = timex.FormatIn(*result.Campaign.EventStartAt, tz, "02.01.2006")
-		values["webinar_time"] = timex.FormatIn(*result.Campaign.EventStartAt, tz, "15:04")
-		values["webinar_datetime"] = timex.FormatIn(*result.Campaign.EventStartAt, tz, "02.01.2006 15:04")
-		values["remaining_time"] = timex.RemainingLabel(time.Now().UTC(), *result.Campaign.EventStartAt)
+		values["webinar_date"] = timex.FormatIn(*webinar, tz, "02.01.2006")
+		values["webinar_time"] = timex.FormatIn(*webinar, tz, "15:04")
+		values["webinar_datetime"] = timex.FormatIn(*webinar, tz, "02.01.2006 15:04")
+		values["remaining_time"] = timex.RemainingLabel(time.Now().UTC(), *webinar)
 	}
 
 	out := messaging.Outbound{

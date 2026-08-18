@@ -99,7 +99,13 @@ func (d desired) isSkip() bool { return d.skipReason != "" }
 // depend on whether it was written at enrollment or by a later repair. The
 // difference is catch-up, which belongs to enrollment alone — see reconcile
 // below.
-func resolveStep(campaign *domain.Campaign, step domain.CampaignStep, enrolledAt time.Time, triggerDelay time.Duration) desired {
+//
+// anchor is where a RELATIVE_TO_EVENT offset is measured from: the enrolment's
+// pinned webinar occurrence for a recurring campaign, the campaign's own event
+// start otherwise. It is passed in rather than read from the campaign so that
+// the recurring case cannot be forgotten by one caller and honoured by another
+// — see EventAnchor.
+func resolveStep(campaign *domain.Campaign, anchor *time.Time, step domain.CampaignStep, enrolledAt time.Time, triggerDelay time.Duration) desired {
 	// A finished or archived campaign will not send again — the worker refuses
 	// such jobs on the way out. Recording the step as skipped rather than
 	// queueing it keeps reconciliation from creating work that would only be
@@ -129,10 +135,10 @@ func resolveStep(campaign *domain.Campaign, step domain.CampaignStep, enrolledAt
 		return desired{runAt: enrolledAt.Add(delay)}
 	}
 
-	if campaign.EventStartAt == nil {
+	if anchor == nil {
 		return desired{skipReason: domain.SkipNoEventAnchor}
 	}
-	return desired{runAt: campaign.EventStartAt.Add(time.Duration(step.OffsetSeconds) * time.Second)}
+	return desired{runAt: anchor.Add(time.Duration(step.OffsetSeconds) * time.Second)}
 }
 
 // ReconcileEnrollment brings one enrollment's queue in line with its campaign.
@@ -200,6 +206,7 @@ func (s *Service) reconcileEnrollmentWith(
 	}
 
 	cutoff := now.Add(-reconcileGrace)
+	anchor := EventAnchor(campaign, enrollment)
 	var missing []scheduler.NewJob
 
 	// finished tracks whether every step ends this pass in a state the queue
@@ -209,7 +216,7 @@ func (s *Service) reconcileEnrollmentWith(
 	finished := true
 
 	for _, step := range steps {
-		want := resolveStep(campaign, step, enrollment.EnrolledAt, s.triggerDelay)
+		want := resolveStep(campaign, anchor, step, enrollment.EnrolledAt, s.triggerDelay)
 		job, found := byStep[step.ID]
 
 		if !found {
@@ -533,10 +540,11 @@ func (s *Service) needsRepair(
 	}
 
 	cutoff := now.Add(-reconcileGrace)
+	anchor := EventAnchor(campaign, enrollment)
 	finished := true
 
 	for _, step := range steps {
-		want := resolveStep(campaign, step, enrollment.EnrolledAt, s.triggerDelay)
+		want := resolveStep(campaign, anchor, step, enrollment.EnrolledAt, s.triggerDelay)
 		job, found := byStep[step.ID]
 
 		if !found {

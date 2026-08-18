@@ -469,11 +469,21 @@ func (w *Worker) renderValues(jc *JobContext) map[string]string {
 		"timezone":      jc.CampaignTimezone,
 	}
 
-	if jc.CampaignEventStart != nil {
-		values["webinar_date"] = timex.FormatIn(*jc.CampaignEventStart, jc.CampaignTimezone, "02.01.2006")
-		values["webinar_time"] = timex.FormatIn(*jc.CampaignEventStart, jc.CampaignTimezone, "15:04")
-		values["webinar_datetime"] = timex.FormatIn(*jc.CampaignEventStart, jc.CampaignTimezone, "02.01.2006 15:04")
-		values["remaining_time"] = timex.RemainingLabel(time.Now().UTC(), *jc.CampaignEventStart)
+	// The webinar this recipient is actually waiting for. A daily recurring
+	// campaign pins one occurrence per enrolment, so the same template sent on
+	// the 18th and the 19th resolves to the 18th and the 19th — the date is
+	// never baked into the copy. A one-time campaign has no occurrence and
+	// falls back to the campaign's event start, exactly as before.
+	webinar := jc.CampaignEventStart
+	if jc.EnrollmentOccurrenceAt != nil {
+		webinar = jc.EnrollmentOccurrenceAt
+	}
+
+	if webinar != nil {
+		values["webinar_date"] = timex.FormatIn(*webinar, jc.CampaignTimezone, "02.01.2006")
+		values["webinar_time"] = timex.FormatIn(*webinar, jc.CampaignTimezone, "15:04")
+		values["webinar_datetime"] = timex.FormatIn(*webinar, jc.CampaignTimezone, "02.01.2006 15:04")
+		values["remaining_time"] = timex.RemainingLabel(time.Now().UTC(), *webinar)
 	}
 
 	return values

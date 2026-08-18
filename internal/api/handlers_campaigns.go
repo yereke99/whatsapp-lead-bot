@@ -58,13 +58,19 @@ func (s *Server) handleGetCampaign(w http.ResponseWriter, r *http.Request) {
 }
 
 type campaignRequest struct {
-	Name                    string   `json:"name"`
-	Description             string   `json:"description"`
-	EventType               string   `json:"event_type"`
-	EventDate               string   `json:"event_date"`
-	EventTime               string   `json:"event_time"`
-	Timezone                string   `json:"timezone"`
-	WebinarLink             string   `json:"webinar_link"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	EventType   string `json:"event_type"`
+	EventDate   string `json:"event_date"`
+	EventTime   string `json:"event_time"`
+	Timezone    string `json:"timezone"`
+	WebinarLink string `json:"webinar_link"`
+	// The daily recurring webinar. When it is off the other two are ignored,
+	// and the campaign is scheduled from event_date/event_time exactly as
+	// before. When it is on, event_date is the day the series starts.
+	IsDailyRecurring        bool     `json:"is_daily_recurring"`
+	RecurrenceTime          string   `json:"recurrence_time"`
+	RecurrenceStartDate     string   `json:"recurrence_start_date"`
 	ExistingContactBehavior string   `json:"existing_contact_behavior"`
 	ExistingContactTemplate string   `json:"existing_contact_template_id"`
 	UnsubscribeKeywords     []string `json:"unsubscribe_keywords"`
@@ -88,6 +94,9 @@ func (req campaignRequest) toInput() (campaigns.SaveInput, error) {
 		EventTime:               req.EventTime,
 		Timezone:                req.Timezone,
 		WebinarLink:             req.WebinarLink,
+		IsDailyRecurring:        req.IsDailyRecurring,
+		RecurrenceTime:          req.RecurrenceTime,
+		RecurrenceStartDate:     req.RecurrenceStartDate,
 		ExistingContactBehavior: req.ExistingContactBehavior,
 		UnsubscribeKeywords:     req.UnsubscribeKeywords,
 		CatchUpMissedSteps:      req.CatchUpMissedSteps,
@@ -213,13 +222,18 @@ func (s *Server) handleUpdateCampaign(w http.ResponseWriter, r *http.Request) {
 		EntityID:   id.String(),
 		Summary:    summary,
 		Old: map[string]any{
-			"event_start_at": formatEvent(before),
-			"name":           before.Name,
+			"event_start_at":     formatEvent(before),
+			"name":               before.Name,
+			"is_daily_recurring": before.IsDailyRecurring,
+			"recurrence_time":    before.RecurrenceTime,
 		},
 		New: map[string]any{
-			"event_start_at":   formatEvent(result.Campaign),
-			"name":             result.Campaign.Name,
-			"rescheduled_jobs": result.Rescheduled,
+			"event_start_at":      formatEvent(result.Campaign),
+			"name":                result.Campaign.Name,
+			"is_daily_recurring":  result.Campaign.IsDailyRecurring,
+			"recurrence_time":     result.Campaign.RecurrenceTime,
+			"rescheduled_jobs":    result.Rescheduled,
+			"rebased_enrollments": result.Rebased,
 		},
 	})
 
@@ -585,14 +599,20 @@ func (req stepRequest) toInput(campaign *domain.Campaign) (campaigns.StepInput, 
 			if campaign == nil {
 				return in, errors.New("кампания табылмады")
 			}
-			if campaign.EventStartAt == nil {
+			// A recurring campaign is edited against the webinar that is
+			// coming, so "20:30" entered today means half an hour before
+			// today's webinar rather than an offset from the day the series
+			// began. The panel renders the same anchor, so what the operator
+			// types is what the row says afterwards.
+			anchor := campaigns.PreviewAnchor(campaign, time.Now().UTC())
+			if anchor == nil {
 				return in, errors.New("нақты уақыт қою үшін алдымен іс-шара күні мен уақытын белгілеңіз")
 			}
 			at, err := timex.ParseInLocation(date, req.ScheduledTime, campaign.Timezone)
 			if err != nil {
 				return in, err
 			}
-			in.OffsetSeconds = int(at.Sub(*campaign.EventStartAt).Round(time.Second) / time.Second)
+			in.OffsetSeconds = int(at.Sub(*anchor).Round(time.Second) / time.Second)
 		}
 	}
 

@@ -135,7 +135,11 @@ func Validate(campaign *domain.Campaign) []Problem {
 			"«Арнайы жауап» режимі таңдалған, бірақ жауап шаблоны көрсетілмеген", true)
 	}
 
-	if campaign.EventStartAt != nil && campaign.EventStartAt.Before(time.Now().UTC()) {
+	// A recurring series has no single event time to be late for: its start
+	// date is behind us the day after it begins, and warning about that every
+	// day afterwards would train the operator to ignore the checklist.
+	if !campaign.IsDailyRecurring &&
+		campaign.EventStartAt != nil && campaign.EventStartAt.Before(time.Now().UTC()) {
 		add("event_start_at", "Іс-шара уақыты өтіп кеткен", false)
 	}
 	if campaign.WebinarLink == "" && usesWebinarLink(campaign.Steps) {
@@ -154,7 +158,8 @@ func Validate(campaign *domain.Campaign) []Problem {
 // reported because a queue that reads 20:00, 19:00, 21:00 in the panel is
 // almost always a mistake, and the operator should see it before customers do.
 func scheduleConflicts(campaign *domain.Campaign, enabled []domain.CampaignStep) []Problem {
-	if campaign.EventStartAt == nil {
+	anchor := PreviewAnchor(campaign, time.Now().UTC())
+	if anchor == nil {
 		return nil
 	}
 
@@ -168,7 +173,7 @@ func scheduleConflicts(campaign *domain.Campaign, enabled []domain.CampaignStep)
 		if step.ScheduleKind == domain.ScheduleOnTrigger {
 			continue
 		}
-		timed = append(timed, placed{step: step, runAt: timex.Offset(*campaign.EventStartAt, step.OffsetSeconds)})
+		timed = append(timed, placed{step: step, runAt: timex.Offset(*anchor, step.OffsetSeconds)})
 	}
 
 	var problems []Problem

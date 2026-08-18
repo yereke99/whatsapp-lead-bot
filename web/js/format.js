@@ -196,13 +196,29 @@ export function buildDelaySeconds(hours, minutes, seconds) {
   return (Number(hours) || 0) * 3600 + (Number(minutes) || 0) * 60 + (Number(seconds) || 0);
 }
 
+// campaignAnchor is the instant a campaign's event-anchored steps are measured
+// from, for display and for editing.
+//
+// A daily recurring campaign is anchored to the webinar that is coming, which
+// the server derives and sends as next_occurrence_at. A one-time campaign is
+// anchored to its own event start. The server uses exactly the same rule when
+// it converts an entered clock time back into an offset, so what the operator
+// reads is what the operator gets.
+export function campaignAnchor(campaign) {
+  if (campaign?.is_daily_recurring && campaign.next_occurrence_at) {
+    return campaign.next_occurrence_at;
+  }
+  return campaign?.event_start_at || null;
+}
+
 // stepRunAt resolves an event-anchored step to the instant it will be sent.
 // Trigger-anchored steps have no single answer — each contact gets their own —
 // so they return null and are described by their delay instead.
 export function stepRunAt(campaign, step) {
-  if (!campaign?.event_start_at) return null;
+  const anchor = campaignAnchor(campaign);
+  if (!anchor) return null;
   if (step.schedule_kind === 'ON_TRIGGER') return null;
-  return new Date(new Date(campaign.event_start_at).getTime() + (step.offset_seconds || 0) * 1000);
+  return new Date(new Date(anchor).getTime() + (step.offset_seconds || 0) * 1000);
 }
 
 // formatInZone renders an instant in the campaign's own timezone. The server

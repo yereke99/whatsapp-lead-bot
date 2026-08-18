@@ -265,6 +265,9 @@ aggregate counts.
   "event_time": "21:00",
   "timezone": "Asia/Almaty",
   "webinar_link": "https://example.com/live",
+  "is_daily_recurring": false,
+  "recurrence_time": "21:00",
+  "recurrence_start_date": "2026-08-16",
   "existing_contact_behavior": "IGNORE",
   "existing_contact_template_id": "",
   "unsubscribe_keywords": ["STOP", "ТОҚТАТУ"],
@@ -280,6 +283,24 @@ aggregate counts.
 
 `event_date` and `event_time` are wall-clock values in `timezone`; the server
 converts them to a UTC instant.
+
+`is_daily_recurring` turns the single webinar into a daily one at
+`recurrence_time` in `timezone`, starting on `recurrence_start_date`. Both fall
+back to `event_time` and `event_date` when omitted, so ticking the toggle alone
+means "every day, at the hour already chosen". The campaign is not duplicated
+per day: each contact's enrolment pins the occurrence it belongs to, and the
+existing steps are scheduled relative to that — a step at `-1800` seconds is
+20:30 on the contact's own webinar day. `{{webinar_date}}`, `{{webinar_time}}`
+and `{{remaining_time}}` resolve against the same occurrence.
+
+Campaign responses carry a derived `next_occurrence_at` (UTC, omitted for
+one-time campaigns) — the webinar that is coming. It is computed, never stored,
+so `event_start_at` stays put while the day it resolves to moves.
+
+Switching recurrence off stops future occurrences; enrolments already waiting
+for a webinar keep it, and nothing already queued or sent is touched. Changing
+the time, zone or start date moves only the enrolments whose webinar has not
+happened yet, reported as `rebased_enrollments` on the update response.
 
 `resume_policy` decides what happens to messages whose moment passed while the
 campaign was paused:
@@ -314,7 +335,8 @@ funnel finish normally.
   "data": {
     "campaign": { },
     "event_time_changed": true,
-    "rescheduled_jobs": 248
+    "rescheduled_jobs": 248,
+    "rebased_enrollments": 0
   }
 }
 ```

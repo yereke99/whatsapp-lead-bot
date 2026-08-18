@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -25,7 +26,8 @@ var (
 
 const campaignColumns = `
 	c.id, c.name, c.description, c.event_type, c.event_start_at, c.timezone,
-	c.webinar_link, c.status, c.existing_contact_behavior, c.existing_contact_template_id,
+	c.webinar_link, c.is_daily_recurring, c.recurrence_time, c.recurrence_start_date,
+	c.status, c.existing_contact_behavior, c.existing_contact_template_id,
 	c.unsubscribe_keywords, c.catch_up_missed_steps, c.max_send_attempts,
 	c.resume_policy, c.pin_template_version, c.max_messages_per_hour,
 	c.max_messages_per_day, c.max_active_contacts,
@@ -122,6 +124,11 @@ func (r *Repository) List(ctx context.Context, f ListFilter) ([]domain.Campaign,
 		return nil, err
 	}
 
+	now := time.Now().UTC()
+	for i := range out {
+		out[i].NextOccurrenceAt = NextOccurrence(&out[i], now)
+	}
+
 	// Triggers are shown inline in the campaign list, so they are fetched in
 	// one extra query rather than N.
 	if err := r.attachTriggers(ctx, out); err != nil {
@@ -181,6 +188,11 @@ func (r *Repository) GetByID(ctx context.Context, q sqlite.Querier, id uuid.UUID
 		}
 		return nil, fmt.Errorf("get campaign: %w", err)
 	}
+
+	// Derived, never stored: the upcoming webinar of a recurring series. The
+	// stored configuration stays still while the day it resolves to moves,
+	// which is the whole reason recurrence does not rewrite event_start_at.
+	c.NextOccurrenceAt = NextOccurrence(&c, time.Now().UTC())
 	return &c, nil
 }
 
@@ -212,8 +224,9 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, c *domain.Cam
 			status, existing_contact_behavior, existing_contact_template_id,
 			unsubscribe_keywords, catch_up_missed_steps, max_send_attempts,
 			resume_policy, pin_template_version, max_messages_per_hour,
-			max_messages_per_day, max_active_contacts, created_by
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+			max_messages_per_day, max_active_contacts, created_by,
+			is_daily_recurring, recurrence_time, recurrence_start_date
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 		RETURNING id, created_at, updated_at`
 
 	err := r.querier(q).QueryRow(ctx, query,
@@ -222,6 +235,7 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, c *domain.Cam
 		c.UnsubscribeKeywords, c.CatchUpMissedSteps, c.MaxSendAttempts,
 		c.ResumePolicy, c.PinTemplateVersion, c.MaxMessagesPerHour,
 		c.MaxMessagesPerDay, c.MaxActiveContacts, c.CreatedBy,
+		c.IsDailyRecurring, c.RecurrenceTime, c.RecurrenceStartDate,
 	).Scan(&c.ID, &c.CreatedAt, &c.UpdatedAt)
 
 	if err != nil {
@@ -242,7 +256,9 @@ func (r *Repository) Update(ctx context.Context, q sqlite.Querier, c *domain.Cam
 			catch_up_missed_steps = $11, max_send_attempts = $12,
 			resume_policy = $13, pin_template_version = $14,
 			max_messages_per_hour = $15, max_messages_per_day = $16,
-			max_active_contacts = $17
+			max_active_contacts = $17,
+			is_daily_recurring = $18, recurrence_time = $19,
+			recurrence_start_date = $20
 		WHERE id = $1
 		RETURNING updated_at`
 
@@ -252,6 +268,7 @@ func (r *Repository) Update(ctx context.Context, q sqlite.Querier, c *domain.Cam
 		c.UnsubscribeKeywords, c.CatchUpMissedSteps, c.MaxSendAttempts,
 		c.ResumePolicy, c.PinTemplateVersion, c.MaxMessagesPerHour,
 		c.MaxMessagesPerDay, c.MaxActiveContacts,
+		c.IsDailyRecurring, c.RecurrenceTime, c.RecurrenceStartDate,
 	).Scan(&c.UpdatedAt)
 
 	if err != nil {
@@ -621,16 +638,16 @@ func (r *Repository) ReorderSteps(ctx context.Context, campaignID uuid.UUID, ord
 func (r *Repository) FindEnrollment(ctx context.Context, q sqlite.Querier, campaignID, contactID uuid.UUID) (*domain.Enrollment, error) {
 	const query = `
 		SELECT id, campaign_id, contact_id, trigger_id, trigger_keyword, status,
-		       run_number, restart_count, enrolled_at, completed_at, cancelled_at,
-		       cancel_reason, created_at, updated_at
+		       run_number, restart_count, enrolled_at, occurrence_at, completed_at,
+		       cancelled_at, cancel_reason, created_at, updated_at
 		FROM campaign_contacts
 		WHERE campaign_id = $1 AND contact_id = $2`
 
 	var e domain.Enrollment
 	err := r.querier(q).QueryRow(ctx, query, campaignID, contactID).Scan(
 		&e.ID, &e.CampaignID, &e.ContactID, &e.TriggerID, &e.TriggerKeyword, &e.Status,
-		&e.RunNumber, &e.RestartCount, &e.EnrolledAt, &e.CompletedAt, &e.CancelledAt,
-		&e.CancelReason, &e.CreatedAt, &e.UpdatedAt)
+		&e.RunNumber, &e.RestartCount, &e.EnrolledAt, &e.OccurrenceAt, &e.CompletedAt,
+		&e.CancelledAt, &e.CancelReason, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
 		if sqlite.IsNoRows(err) {
 			return nil, nil
@@ -642,14 +659,16 @@ func (r *Repository) FindEnrollment(ctx context.Context, q sqlite.Querier, campa
 
 func (r *Repository) CreateEnrollment(ctx context.Context, q sqlite.Querier, e *domain.Enrollment) error {
 	const query = `
-		INSERT INTO campaign_contacts (campaign_id, contact_id, trigger_id, trigger_keyword, status, run_number)
-		VALUES ($1,$2,$3,$4,'ACTIVE',1)
+		INSERT INTO campaign_contacts (
+			campaign_id, contact_id, trigger_id, trigger_keyword, status, run_number, occurrence_at
+		) VALUES ($1,$2,$3,$4,'ACTIVE',1,$5)
 		ON CONFLICT (campaign_id, contact_id) DO NOTHING
-		RETURNING id, status, run_number, restart_count, enrolled_at, created_at, updated_at`
+		RETURNING id, status, run_number, restart_count, enrolled_at, occurrence_at, created_at, updated_at`
 
 	err := r.querier(q).QueryRow(ctx, query,
-		e.CampaignID, e.ContactID, e.TriggerID, e.TriggerKeyword,
-	).Scan(&e.ID, &e.Status, &e.RunNumber, &e.RestartCount, &e.EnrolledAt, &e.CreatedAt, &e.UpdatedAt)
+		e.CampaignID, e.ContactID, e.TriggerID, e.TriggerKeyword, e.OccurrenceAt,
+	).Scan(&e.ID, &e.Status, &e.RunNumber, &e.RestartCount, &e.EnrolledAt,
+		&e.OccurrenceAt, &e.CreatedAt, &e.UpdatedAt)
 
 	if err != nil {
 		if sqlite.IsNoRows(err) {
@@ -667,7 +686,13 @@ var ErrAlreadyEnrolled = errors.New("contact is already enrolled in this campaig
 
 // RestartEnrollment bumps the run counter so a fresh set of jobs can be
 // created without colliding with the previous run's unique keys.
-func (r *Repository) RestartEnrollment(ctx context.Context, q sqlite.Querier, enrollmentID uuid.UUID, keyword string) (*domain.Enrollment, error) {
+//
+// occurrence re-anchors the new run: a contact restarting into a recurring
+// campaign belongs to the webinar that is next for them, not to the one their
+// previous run was waiting for. nil clears the pin, which is the correct answer
+// for a campaign that is not recurring — the new run is anchored to the
+// campaign's event start, exactly as it was before this feature existed.
+func (r *Repository) RestartEnrollment(ctx context.Context, q sqlite.Querier, enrollmentID uuid.UUID, keyword string, occurrence *time.Time) (*domain.Enrollment, error) {
 	const query = `
 		UPDATE campaign_contacts SET
 			run_number    = run_number + 1,
@@ -675,23 +700,64 @@ func (r *Repository) RestartEnrollment(ctx context.Context, q sqlite.Querier, en
 			status        = 'ACTIVE',
 			trigger_keyword = $2,
 			enrolled_at   = now(),
+			occurrence_at = $3,
 			completed_at  = NULL,
 			cancelled_at  = NULL,
 			cancel_reason = ''
 		WHERE id = $1
 		RETURNING id, campaign_id, contact_id, trigger_id, trigger_keyword, status,
-		          run_number, restart_count, enrolled_at, completed_at, cancelled_at,
-		          cancel_reason, created_at, updated_at`
+		          run_number, restart_count, enrolled_at, occurrence_at, completed_at,
+		          cancelled_at, cancel_reason, created_at, updated_at`
 
 	var e domain.Enrollment
-	err := r.querier(q).QueryRow(ctx, query, enrollmentID, keyword).Scan(
+	err := r.querier(q).QueryRow(ctx, query, enrollmentID, keyword, occurrence).Scan(
 		&e.ID, &e.CampaignID, &e.ContactID, &e.TriggerID, &e.TriggerKeyword, &e.Status,
-		&e.RunNumber, &e.RestartCount, &e.EnrolledAt, &e.CompletedAt, &e.CancelledAt,
-		&e.CancelReason, &e.CreatedAt, &e.UpdatedAt)
+		&e.RunNumber, &e.RestartCount, &e.EnrolledAt, &e.OccurrenceAt, &e.CompletedAt,
+		&e.CancelledAt, &e.CancelReason, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("restart enrollment: %w", err)
 	}
 	return &e, nil
+}
+
+// SetEnrollmentOccurrence pins the webinar occurrence one enrolment belongs to.
+//
+// It is used for a contact who re-triggers a recurring campaign under the
+// CONTINUE behaviour and has no occurrence yet — an enrolment created before
+// recurrence was switched on. Without it that contact stays anchored to a
+// series start in the past and can never receive anything again.
+func (r *Repository) SetEnrollmentOccurrence(ctx context.Context, q sqlite.Querier, id uuid.UUID, occurrence *time.Time) error {
+	_, err := r.querier(q).Exec(ctx,
+		`UPDATE campaign_contacts SET occurrence_at = $2 WHERE id = $1`, id, occurrence)
+	if err != nil {
+		return fmt.Errorf("set enrollment occurrence: %w", err)
+	}
+	return nil
+}
+
+// RebaseFutureOccurrences moves enrolments whose webinar has not happened yet
+// onto a new occurrence, after an operator changed the recurrence settings.
+//
+// The cutoff is the safety property. Only enrolments still waiting for their
+// webinar are touched: an occurrence that has already come and gone is history,
+// and rewriting it would make the queue disagree with what those contacts were
+// actually sent. The pending jobs themselves are not written here — the
+// reconciler re-derives them from the new anchor, which is the one place that
+// arithmetic lives.
+func (r *Repository) RebaseFutureOccurrences(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID, occurrence time.Time, after time.Time) (int64, error) {
+	const query = `
+		UPDATE campaign_contacts SET occurrence_at = $2
+		WHERE campaign_id = $1
+		  AND occurrence_at IS NOT NULL
+		  AND occurrence_at > $3
+		  AND occurrence_at <> $2
+		  AND status IN ('ACTIVE', 'COMPLETED')`
+
+	tag, err := r.querier(q).Exec(ctx, query, campaignID, occurrence, after)
+	if err != nil {
+		return 0, fmt.Errorf("rebase future occurrences: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (r *Repository) SetEnrollmentStatus(ctx context.Context, q sqlite.Querier, id uuid.UUID, status domain.EnrollmentStatus, reason string) error {
@@ -768,7 +834,8 @@ func (r *Repository) ListEnrollmentsForContact(ctx context.Context, contactID uu
 // contact, not about the queue, and no amount of repair should undo them.
 func (r *Repository) EnrollmentsForReconcile(ctx context.Context, q sqlite.Querier, campaignID *uuid.UUID) ([]domain.Enrollment, error) {
 	query := `
-		SELECT cc.id, cc.campaign_id, cc.contact_id, cc.status, cc.run_number, cc.enrolled_at
+		SELECT cc.id, cc.campaign_id, cc.contact_id, cc.status, cc.run_number,
+		       cc.enrolled_at, cc.occurrence_at
 		FROM campaign_contacts cc
 		JOIN contacts c ON c.id = cc.contact_id
 		WHERE cc.status IN ('ACTIVE', 'COMPLETED')
@@ -792,7 +859,7 @@ func (r *Repository) EnrollmentsForReconcile(ctx context.Context, q sqlite.Queri
 	for rows.Next() {
 		var e domain.Enrollment
 		if err := rows.Scan(&e.ID, &e.CampaignID, &e.ContactID, &e.Status,
-			&e.RunNumber, &e.EnrolledAt); err != nil {
+			&e.RunNumber, &e.EnrolledAt, &e.OccurrenceAt); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -873,7 +940,8 @@ func (r *Repository) ActiveEnrollmentIDs(ctx context.Context, q sqlite.Querier, 
 func campaignScanDest(c *domain.Campaign) []any {
 	return []any{
 		&c.ID, &c.Name, &c.Description, &c.EventType, &c.EventStartAt, &c.Timezone,
-		&c.WebinarLink, &c.Status, &c.ExistingContactBehavior, &c.ExistingContactTemplate,
+		&c.WebinarLink, &c.IsDailyRecurring, &c.RecurrenceTime, &c.RecurrenceStartDate,
+		&c.Status, &c.ExistingContactBehavior, &c.ExistingContactTemplate,
 		&c.UnsubscribeKeywords, &c.CatchUpMissedSteps, &c.MaxSendAttempts,
 		&c.ResumePolicy, &c.PinTemplateVersion, &c.MaxMessagesPerHour,
 		&c.MaxMessagesPerDay, &c.MaxActiveContacts,

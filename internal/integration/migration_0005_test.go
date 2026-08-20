@@ -35,13 +35,14 @@ import (
 //   - running the migration again does nothing, because a restart must not
 //     re-apply what is already applied.
 
-// schemaBeforeRecurrence copies migrations 0001-0004 into a temp directory, so
-// a database can be built on the schema exactly as it stands in production
-// before this feature is deployed.
-func schemaBeforeRecurrence(t *testing.T) string {
+// schemaBefore copies the migrations older than version into a temp directory,
+// so a database can be built on the schema exactly as it stands in production
+// before that feature is deployed. It also reports how many migrations were
+// held back, which is how many the upgrade under test will apply.
+func schemaBefore(t *testing.T, version string) (dir string, pending int) {
 	t.Helper()
 
-	dir := t.TempDir()
+	dir = t.TempDir()
 	entries, err := migrations.FS.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read migrations: %v", err)
@@ -51,7 +52,8 @@ func schemaBeforeRecurrence(t *testing.T) string {
 		if !strings.HasSuffix(name, ".sql") {
 			continue
 		}
-		if name >= "0005" {
+		if name >= version {
+			pending++
 			continue
 		}
 		body, err := migrations.FS.ReadFile(name)
@@ -62,7 +64,7 @@ func schemaBeforeRecurrence(t *testing.T) string {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
-	return dir
+	return dir, pending
 }
 
 func TestMigration0005PreservesExistingData(t *testing.T) {
@@ -76,7 +78,8 @@ func TestMigration0005PreservesExistingData(t *testing.T) {
 	defer db.Close()
 
 	// ---- the database as it exists in production today ----------------------
-	if err := db.Migrate(ctx, os.DirFS(schemaBeforeRecurrence(t)), discardLogger()); err != nil {
+	before005, pending := schemaBefore(t, "0005")
+	if err := db.Migrate(ctx, os.DirFS(before005), discardLogger()); err != nil {
 		t.Fatalf("migrate to the pre-feature schema: %v", err)
 	}
 
@@ -148,9 +151,12 @@ func TestMigration0005PreservesExistingData(t *testing.T) {
 	after := countAll("after")
 	for table, want := range before {
 		if table == "schema_migrations" {
-			// One new row: the migration that was just applied.
-			if after[table] != want+1 {
-				t.Errorf("schema_migrations = %d, want %d (exactly one new migration)", after[table], want+1)
+			// One new row per migration that was held back. Counted from the
+			// embedded set rather than hard-coded, so adding a later migration
+			// does not turn this into a failure about the wrong thing.
+			if after[table] != want+pending {
+				t.Errorf("schema_migrations = %d, want %d (one row per applied migration)",
+					after[table], want+pending)
 			}
 			continue
 		}

@@ -396,12 +396,40 @@ func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, cam
 		return 0, err
 	}
 
+	// A returning participant of a daily webinar is not a new lead. The queue's
+	// own unique constraint already stops the same run being scheduled twice;
+	// this is the case it cannot see, where a restart has deliberately opened a
+	// new run and the daily sequence would be recreated on a later webinar.
+	//
+	// The lookup only happens on a restart of a recurring campaign. A first
+	// enrolment — every contact who has just arrived — has no earlier run to
+	// examine and pays nothing for this.
+	dailyConsumed := false
+	if campaign.IsDailyRecurring && enrollment.RunNumber > 1 {
+		previous, err := s.jobs.JobsForEnrollment(ctx, tx, enrollment.ID)
+		if err != nil {
+			return 0, err
+		}
+		dailyConsumed = DailySequenceConsumed(campaign, steps, previous, enrollment.RunNumber)
+		if dailyConsumed {
+			s.log.Info("DAILY_SEQUENCE_SKIPPED",
+				slog.String("campaign_id", campaign.ID.String()),
+				slog.String("campaign_name", campaign.Name),
+				slog.String("enrollment_id", enrollment.ID.String()),
+				slog.String("contact_id", enrollment.ContactID.String()),
+				slog.Int("run_number", enrollment.RunNumber),
+				slog.Int("daily_steps", len(DailySequence(steps))),
+				slog.String("reason", "contact has already received this campaign's daily webinar sequence"))
+		}
+	}
+
 	now := time.Now().UTC()
 	plan := BuildPlan(EventAnchor(campaign, enrollment), steps, PlanOptions{
-		EnrolledAt:   at,
-		Now:          now,
-		CatchUp:      campaign.CatchUpMissedSteps,
-		TriggerDelay: s.triggerDelay,
+		EnrolledAt:            at,
+		Now:                   now,
+		CatchUp:               campaign.CatchUpMissedSteps,
+		TriggerDelay:          s.triggerDelay,
+		DailySequenceConsumed: dailyConsumed,
 	})
 
 	jobs := make([]scheduler.NewJob, 0, len(plan))
@@ -901,6 +929,10 @@ func (s *Service) Duplicate(ctx context.Context, id uuid.UUID, adminID *uuid.UUI
 				Enabled:       step.Enabled,
 				OrderIndex:    step.OrderIndex,
 				ScheduleKind:  step.ScheduleKind,
+				// Which steps form the daily webinar sequence is part of the
+				// campaign's shape, not of one contact's history, so a copy is
+				// the same campaign and keeps it.
+				IncludeInDailyWebinar: step.IncludeInDailyWebinar,
 			}
 			if err := s.repo.CreateStep(ctx, tx, &newStep); err != nil {
 				return err
@@ -935,6 +967,9 @@ type StepInput struct {
 	// AudienceMinJoinedAt is the cutoff in UTC. The handler converts it from
 	// the operator's local date, time and zone before it gets here.
 	AudienceMinJoinedAt *time.Time
+	// IncludeInDailyWebinar marks this step as part of the campaign's daily
+	// webinar sequence, which a contact receives exactly once.
+	IncludeInDailyWebinar bool
 }
 
 func (in StepInput) validate() error {
@@ -979,6 +1014,7 @@ func (s *Service) AddStep(ctx context.Context, campaignID uuid.UUID, in StepInpu
 		ScheduleKind:          domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent))),
 		AudienceFilterEnabled: in.AudienceFilterEnabled,
 		AudienceMinJoinedAt:   in.AudienceMinJoinedAt,
+		IncludeInDailyWebinar: in.IncludeInDailyWebinar,
 	}
 
 	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
@@ -1055,6 +1091,7 @@ func (s *Service) UpdateStep(ctx context.Context, stepID uuid.UUID, in StepInput
 		ScheduleKind:          domain.ScheduleKind(defaultIfEmpty(in.ScheduleKind, string(domain.ScheduleRelativeToEvent))),
 		AudienceFilterEnabled: in.AudienceFilterEnabled,
 		AudienceMinJoinedAt:   in.AudienceMinJoinedAt,
+		IncludeInDailyWebinar: in.IncludeInDailyWebinar,
 	}
 
 	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {

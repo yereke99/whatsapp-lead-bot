@@ -1,0 +1,59 @@
+-- Marking which steps make up the daily webinar sequence, and making that
+-- sequence reach a contact exactly once.
+--
+-- The business rule this serves, in full:
+--
+--   ONE USER -> ONE ENROLMENT -> ONE WEBINAR OCCURRENCE -> ONE SEQUENCE
+--
+-- "The webinar repeats every day" is a statement about the *event*, not about
+-- the audience. A contact who went through the sequence for the 20 August
+-- webinar is an existing participant on 21 August, and must receive nothing
+-- again; the 21 August webinar exists for the people who arrive on 21 August.
+--
+-- Most of that guarantee is already in the schema and is deliberately left
+-- alone here:
+--
+--   campaign_contacts_unique UNIQUE (campaign_id, contact_id)   (0001)
+--       one enrolment per contact per campaign, enforced by the database, so
+--       two trigger deliveries racing cannot produce two enrolments. Nothing
+--       is added for that; the constraint that exists is the right one.
+--
+--   scheduled_messages_unique_step
+--       UNIQUE (enrollment_id, campaign_step_id, run_number)    (0001)
+--       one delivery per step per enrolment per run, so a scheduler that runs
+--       ten times a minute cannot queue a step twice.
+--
+--   campaign_contacts.occurrence_at                             (0005)
+--       the webinar an enrolment belongs to, written once and never rolled
+--       forward, so tomorrow's occurrence does not re-anchor yesterday's
+--       contacts.
+--
+-- What was missing is the operator's half: which steps *are* the daily webinar
+-- sequence. A campaign holds welcome messages, follow-ups and administrative
+-- notes alongside the reminders, and only the reminders belong to the webinar.
+-- Guessing that from the offset would be wrong the first time somebody adds a
+-- post-webinar message.
+--
+-- Rollback (this project applies migrations forward only; run by hand if ever
+-- needed, after stopping the service):
+--
+--   ALTER TABLE campaign_steps DROP COLUMN include_in_daily_webinar;
+
+-- Off for every existing row, which is what makes this opt-in and what keeps
+-- this migration a no-op for behaviour: with no step marked, the daily
+-- sequence is empty and every campaign, enrolment and queued message in the
+-- database keeps working exactly as it does today. The feature starts doing
+-- something when an operator ticks the box on a specific step.
+--
+-- Meaning: this step is part of the campaign's daily webinar sequence. On a
+-- campaign with is_daily_recurring = 1, such a step is scheduled for a contact
+-- once -- for the occurrence their enrolment is pinned to -- and is never
+-- re-armed afterwards, not by a repeat trigger, not by a restart, not by the
+-- next day's occurrence. A step without the flag is untouched by any of this
+-- and keeps the scheduling behaviour it already has.
+ALTER TABLE campaign_steps ADD COLUMN include_in_daily_webinar INTEGER NOT NULL DEFAULT 0;
+
+-- No new index. The flag is read from campaign_steps rows the planner and the
+-- reconciler have already loaded for the campaign they are working on -- it is
+-- never a search key -- and an index that is never the chosen plan still costs
+-- every write.

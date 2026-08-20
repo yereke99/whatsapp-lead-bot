@@ -45,6 +45,7 @@ const stepColumns = `
 	s.id, s.campaign_id, s.name, s.offset_seconds, s.message_template_id,
 	s.enabled, s.order_index, s.schedule_kind,
 	s.audience_filter_enabled, s.audience_min_joined_at,
+	s.include_in_daily_webinar,
 	s.created_at, s.updated_at`
 
 // Aggregates every campaign query reports alongside the row itself. The
@@ -509,6 +510,7 @@ func (r *Repository) ListSteps(ctx context.Context, q sqlite.Querier, campaignID
 		if err := rows.Scan(&s.ID, &s.CampaignID, &s.Name, &s.OffsetSeconds,
 			&s.TemplateID, &s.Enabled, &s.OrderIndex, &s.ScheduleKind,
 			&s.AudienceFilterEnabled, &s.AudienceMinJoinedAt,
+			&s.IncludeInDailyWebinar,
 			&s.CreatedAt, &s.UpdatedAt,
 			&s.TemplateName, &s.TemplateType, &s.TemplatePreview,
 			&s.TemplateVersion, &s.TemplateHasMedia, &s.TemplateArchived); err != nil {
@@ -527,6 +529,7 @@ func (r *Repository) GetStep(ctx context.Context, id uuid.UUID) (*domain.Campaig
 		&s.ID, &s.CampaignID, &s.Name, &s.OffsetSeconds, &s.TemplateID,
 		&s.Enabled, &s.OrderIndex, &s.ScheduleKind,
 		&s.AudienceFilterEnabled, &s.AudienceMinJoinedAt,
+		&s.IncludeInDailyWebinar,
 		&s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		if sqlite.IsNoRows(err) {
@@ -551,14 +554,15 @@ func (r *Repository) CreateStep(ctx context.Context, q sqlite.Querier, s *domain
 	const query = `
 		INSERT INTO campaign_steps (
 			campaign_id, name, offset_seconds, message_template_id, enabled,
-			order_index, schedule_kind, audience_filter_enabled, audience_min_joined_at
+			order_index, schedule_kind, audience_filter_enabled, audience_min_joined_at,
+			include_in_daily_webinar
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		RETURNING id, created_at, updated_at`
 
 	err := querier.QueryRow(ctx, query,
 		s.CampaignID, s.Name, s.OffsetSeconds, s.TemplateID, s.Enabled, s.OrderIndex, s.ScheduleKind,
-		s.AudienceFilterEnabled, s.AudienceMinJoinedAt,
+		s.AudienceFilterEnabled, s.AudienceMinJoinedAt, s.IncludeInDailyWebinar,
 	).Scan(&s.ID, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("insert step: %w", err)
@@ -571,13 +575,14 @@ func (r *Repository) UpdateStep(ctx context.Context, q sqlite.Querier, s *domain
 		UPDATE campaign_steps SET
 			name = $2, offset_seconds = $3, message_template_id = $4,
 			enabled = $5, schedule_kind = $6,
-			audience_filter_enabled = $7, audience_min_joined_at = $8
+			audience_filter_enabled = $7, audience_min_joined_at = $8,
+			include_in_daily_webinar = $9
 		WHERE id = $1
 		RETURNING campaign_id, order_index, created_at, updated_at`
 
 	err := r.querier(q).QueryRow(ctx, query,
 		s.ID, s.Name, s.OffsetSeconds, s.TemplateID, s.Enabled, s.ScheduleKind,
-		s.AudienceFilterEnabled, s.AudienceMinJoinedAt,
+		s.AudienceFilterEnabled, s.AudienceMinJoinedAt, s.IncludeInDailyWebinar,
 	).Scan(&s.CampaignID, &s.OrderIndex, &s.CreatedAt, &s.UpdatedAt)
 
 	if err != nil {

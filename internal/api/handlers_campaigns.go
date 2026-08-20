@@ -557,6 +557,10 @@ type stepRequest struct {
 	AudienceJoinedDate    string `json:"audience_joined_date"`
 	AudienceJoinedTime    string `json:"audience_joined_time"`
 	AudienceTimezone      string `json:"audience_timezone"`
+	// IncludeInDailyWebinar marks the step as part of the campaign's daily
+	// webinar sequence: the set of messages a contact receives once, for the
+	// webinar they joined for, and never again on a later day.
+	IncludeInDailyWebinar bool `json:"include_in_daily_webinar"`
 }
 
 func (req stepRequest) toInput(campaign *domain.Campaign) (campaigns.StepInput, error) {
@@ -566,6 +570,7 @@ func (req stepRequest) toInput(campaign *domain.Campaign) (campaigns.StepInput, 
 		Enabled:               req.Enabled,
 		ScheduleKind:          req.ScheduleKind,
 		AudienceFilterEnabled: req.AudienceFilterEnabled,
+		IncludeInDailyWebinar: req.IncludeInDailyWebinar,
 	}
 
 	// The cutoff is entered as a wall-clock moment in a named zone and stored as

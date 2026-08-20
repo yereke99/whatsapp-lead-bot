@@ -312,8 +312,22 @@ type CampaignStep struct {
 	// AudienceMinJoinedAt is the inclusive cutoff, in UTC. A contact who
 	// enrolled exactly at this instant is eligible.
 	AudienceMinJoinedAt *time.Time `json:"audience_min_joined_at"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	// IncludeInDailyWebinar marks this step as part of the campaign's daily
+	// webinar sequence.
+	//
+	// It answers a question only the operator can: a campaign holds the
+	// webinar reminders *and* the greeting, the follow-ups and the
+	// administrative notes, and "repeats every day" applies to the reminders
+	// alone. Marked steps are delivered to a contact once — for the occurrence
+	// their enrolment is pinned to — and are never re-armed by a later webinar,
+	// a repeat trigger or a restart. Unmarked steps keep the behaviour they
+	// already have, so the flag never disables anything.
+	//
+	// Off by default, which makes the daily sequence empty until an operator
+	// fills it in and keeps every existing campaign behaving exactly as before.
+	IncludeInDailyWebinar bool      `json:"include_in_daily_webinar"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 
 	// Template details joined in by list queries, so the queue can be rendered
 	// and validated without a second round trip per row.
@@ -583,6 +597,11 @@ const (
 	// never stop being true — an enrolment's entry time does not move — so the
 	// row is written once and never reconsidered.
 	SkipNotEligible = "skip:recipient_not_eligible"
+	// SkipDailySequenceDone: the step belongs to a daily webinar sequence this
+	// contact has already been through. The webinar repeats; the sequence does
+	// not. This is what stops an existing participant receiving the same seven
+	// reminders again tomorrow, and the day after.
+	SkipDailySequenceDone = "skip:daily_sequence_done"
 )
 
 // IsSkipReason reports whether a cancel reason marks a deliberate skip rather
@@ -590,7 +609,7 @@ const (
 func IsSkipReason(reason string) bool {
 	switch reason {
 	case SkipStepExpired, SkipStepDisabled, SkipNoEventAnchor, SkipCampaignClosed,
-		SkipNotEligible:
+		SkipNotEligible, SkipDailySequenceDone:
 		return true
 	}
 	return false

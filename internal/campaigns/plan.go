@@ -35,6 +35,11 @@ type PlanOptions struct {
 	// and a step anchored to it. It stops the greeting landing in the same
 	// instant as the message that asked for it.
 	TriggerDelay time.Duration
+	// DailySequenceConsumed says this contact has already been through the
+	// campaign's daily webinar sequence on an earlier run, so the steps that
+	// make up that sequence are not owed to them a second time. See
+	// DailySequenceConsumed, which is what decides it.
+	DailySequenceConsumed bool
 }
 
 // BuildPlan resolves a campaign's steps into absolute send times.
@@ -80,6 +85,16 @@ func BuildPlan(eventStart *time.Time, steps []domain.CampaignStep, opts PlanOpti
 		entry := PlanEntry{Step: step}
 
 		switch {
+		// The daily webinar sequence is checked first, because it is a
+		// statement about this contact's history rather than about the step's
+		// clock: a participant who already received the sequence is finished
+		// with it whatever the offsets now say, and no later branch — not
+		// catch-up, not the audience filter — should get a chance to revive it.
+		case opts.DailySequenceConsumed && step.IncludeInDailyWebinar:
+			entry.Skipped = true
+			entry.Reason = "күнделікті вебинар тізбегі бұл клиентке бір рет жіберілген"
+			entry.SkipCode = domain.SkipDailySequenceDone
+
 		case !step.Enabled:
 			entry.Skipped = true
 			entry.Reason = "қадам өшірілген"

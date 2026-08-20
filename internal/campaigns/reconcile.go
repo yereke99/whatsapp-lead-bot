@@ -105,7 +105,10 @@ func (d desired) isSkip() bool { return d.skipReason != "" }
 // start otherwise. It is passed in rather than read from the campaign so that
 // the recurring case cannot be forgotten by one caller and honoured by another
 // — see EventAnchor.
-func resolveStep(campaign *domain.Campaign, anchor *time.Time, step domain.CampaignStep, enrolledAt time.Time, triggerDelay time.Duration) desired {
+//
+// dailyConsumed says this enrolment has already been through the campaign's
+// daily webinar sequence, which retires every step that belongs to it.
+func resolveStep(campaign *domain.Campaign, anchor *time.Time, step domain.CampaignStep, enrolledAt time.Time, triggerDelay time.Duration, dailyConsumed bool) desired {
 	// A finished or archived campaign will not send again — the worker refuses
 	// such jobs on the way out. Recording the step as skipped rather than
 	// queueing it keeps reconciliation from creating work that would only be
@@ -113,6 +116,17 @@ func resolveStep(campaign *domain.Campaign, anchor *time.Time, step domain.Campa
 	if campaign.Status == domain.CampaignCompleted || campaign.Status == domain.CampaignArchived {
 		return desired{skipReason: domain.SkipCampaignClosed}
 	}
+
+	// The daily webinar sequence, already delivered. A webinar that repeats
+	// every day does not make yesterday's participants new again, so the steps
+	// that make up the sequence are retired for this contact — permanently,
+	// which is why nothing below can reach them and why the recorded skip is
+	// never revived: run_number does not go backwards and a SENT row does not
+	// un-send itself.
+	if dailyConsumed && step.IncludeInDailyWebinar {
+		return desired{skipReason: domain.SkipDailySequenceDone}
+	}
+
 	if !step.Enabled {
 		return desired{skipReason: domain.SkipStepDisabled}
 	}
@@ -207,6 +221,9 @@ func (s *Service) reconcileEnrollmentWith(
 
 	cutoff := now.Add(-reconcileGrace)
 	anchor := EventAnchor(campaign, enrollment)
+	// Derived from the jobs already loaded above, so the sweep pays no extra
+	// query to know whether this contact is a returning participant.
+	dailyConsumed := DailySequenceConsumed(campaign, steps, existing, enrollment.RunNumber)
 	var missing []scheduler.NewJob
 
 	// finished tracks whether every step ends this pass in a state the queue
@@ -216,7 +233,7 @@ func (s *Service) reconcileEnrollmentWith(
 	finished := true
 
 	for _, step := range steps {
-		want := resolveStep(campaign, anchor, step, enrollment.EnrolledAt, s.triggerDelay)
+		want := resolveStep(campaign, anchor, step, enrollment.EnrolledAt, s.triggerDelay, dailyConsumed)
 		job, found := byStep[step.ID]
 
 		if !found {
@@ -265,6 +282,29 @@ func (s *Service) reconcileEnrollmentWith(
 		if job.Status == domain.JobCancelled && domain.IsSkipReason(job.CancelReason) {
 			if want.isSkip() || want.runAt.Before(cutoff) {
 				continue // still not applicable; leave the record as it stands
+			}
+			// ...and only for a contact who is still in the funnel.
+			//
+			// This is the second production incident: an operator moved the
+			// webinar time, and every contact who had ever been through the
+			// campaign received the whole run-up again. Every one of them
+			// carried skip:step_expired rows — that is what joining after a
+			// reminder has passed records — and moving the anchor forward made
+			// all of those rows applicable at once, for everybody, at every
+			// past enrolment.
+			//
+			// Reviving is meant for the operator correcting a step the people
+			// waiting for the event have not received yet. It is not a way to
+			// reach back into finished participations: a contact whose
+			// enrolment has completed has been through this campaign, and an
+			// edit made for tomorrow's audience must not be delivered to
+			// yesterday's. Their record stands as it is.
+			//
+			// A step that never existed for them is a different matter and is
+			// still created above: that is a message they were never
+			// considered for, not one they were considered for and declined.
+			if enrollment.Status != domain.EnrollmentActive {
+				continue
 			}
 			revived, err := s.jobs.ReviveSkipped(ctx, tx, job.ID, want.runAt)
 			if err != nil {
@@ -541,10 +581,11 @@ func (s *Service) needsRepair(
 
 	cutoff := now.Add(-reconcileGrace)
 	anchor := EventAnchor(campaign, enrollment)
+	dailyConsumed := DailySequenceConsumed(campaign, steps, existing, enrollment.RunNumber)
 	finished := true
 
 	for _, step := range steps {
-		want := resolveStep(campaign, anchor, step, enrollment.EnrolledAt, s.triggerDelay)
+		want := resolveStep(campaign, anchor, step, enrollment.EnrolledAt, s.triggerDelay, dailyConsumed)
 		job, found := byStep[step.ID]
 
 		if !found {
@@ -552,7 +593,12 @@ func (s *Service) needsRepair(
 		}
 
 		if job.Status == domain.JobCancelled && domain.IsSkipReason(job.CancelReason) {
-			if !want.isSkip() && !want.runAt.Before(cutoff) {
+			// Mirrors the reviving rule above, completed enrolments included:
+			// deciding here that there is nothing to do is what keeps a
+			// campaign-wide time edit from taking the write lock once per
+			// historical contact.
+			if enrollment.Status == domain.EnrollmentActive &&
+				!want.isSkip() && !want.runAt.Before(cutoff) {
 				return true // a skip that has become applicable again
 			}
 			continue

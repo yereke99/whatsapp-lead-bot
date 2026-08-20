@@ -488,6 +488,15 @@ export async function renderCampaignDetail(root, { params, navigate }) {
                 hour: '2-digit', minute: '2-digit',
               }) + ' немесе одан кейін қосылған клиенттерге жіберіледі' },
               'тек жаңа қосылғандарға')
+          : null,
+        // Which steps make up the daily sequence is the answer to "why did this
+        // person not get today's reminder?", so it belongs on the list rather
+        // than only inside the form.
+        step.include_in_daily_webinar
+          ? el('div', { class: 'small subtle nowrap',
+              title: 'Күнделікті вебинар тізбегіне кіреді. Әр клиент бұл хабарламаны '
+                + 'өзі қосылған вебинар үшін бір рет қана алады.' },
+              'күнделікті тізбек')
           : null),
       el('td', {},
         el('div', { class: 'table__actions' },
@@ -673,6 +682,27 @@ export async function renderCampaignDetail(root, { params, navigate }) {
       audienceBox,
       audienceFields);
 
+    // The daily webinar sequence. "The webinar repeats every day" is a fact
+    // about the event; it must not turn into "everybody gets these messages
+    // every day". Marking a step puts it in the sequence a contact receives
+    // once, for the webinar they signed up for. A greeting, a follow-up or an
+    // administrative note is left unmarked and keeps behaving as it does now,
+    // which is why this is a decision and not something derived from offsets.
+    const dailyBox = checkbox('Күнделікті вебинар тізбегіне кіреді', {
+      checked: step?.include_in_daily_webinar ?? false,
+    });
+    const dailyBlock = el('div', { class: 'field' },
+      dailyBox,
+      el('p', { class: 'muted small' },
+        campaign.is_daily_recurring
+          ? 'Белгіленген хабарламалар — күнделікті вебинардың тізбегі. Әр клиент бұл '
+            + 'тізбекті өзі қосылған вебинар үшін бір рет қана алады: ертең вебинар қайта '
+            + 'өтсе де, кешегі қатысушыға қайта жіберілмейді. Ертеңгі вебинарды жаңадан '
+            + 'қосылған клиенттер алады.'
+          : 'Бұл кампанияда «Вебинар күн сайын қайталанады» баптауы өшірулі, сондықтан '
+            + 'белгі әзірге ештеңені өзгертпейді. Қайталануды қоссаңыз, белгіленген '
+            + 'хабарламалар әр клиентке бір рет қана жіберіледі.'));
+
     const exactBlock = el('div', {},
       el('p', { class: 'muted small' },
         'Хабарлама күнтізбедегі осы нақты сәтте жіберіледі. Барлық клиент оны бір уақытта алады. '
@@ -725,6 +755,7 @@ export async function renderCampaignDetail(root, { params, navigate }) {
         }),
         exactBlock,
         delayBlock,
+        dailyBlock,
         audienceBlock,
         el('div', { class: 'field' }, enabledBox)),
       footer: [
@@ -743,6 +774,7 @@ export async function renderCampaignDetail(root, { params, navigate }) {
         enabled: enabledBox.input.checked,
         offset_seconds: 0,
         audience_filter_enabled: audienceBox.input.checked,
+        include_in_daily_webinar: dailyBox.input.checked,
       };
 
       if (audienceBox.input.checked) {
@@ -791,6 +823,26 @@ export async function renderCampaignDetail(root, { params, navigate }) {
 
   // --------------------------------------------------------- row actions --
 
+  // stepSettings re-sends the per-step switches that are not part of the action
+  // being performed.
+  //
+  // The step endpoint replaces the row rather than patching it, so a field left
+  // out of the payload is a field cleared. Enabling a step must not silently
+  // drop its audience cutoff or take it out of the daily webinar sequence.
+  function stepSettings(step) {
+    const carried = {
+      include_in_daily_webinar: Boolean(step.include_in_daily_webinar),
+      audience_filter_enabled: Boolean(step.audience_filter_enabled),
+    };
+    if (step.audience_filter_enabled && step.audience_min_joined_at) {
+      const at = new Date(step.audience_min_joined_at);
+      carried.audience_joined_date = dateInZone(at, campaign.timezone);
+      carried.audience_joined_time = timeInZone(at, campaign.timezone) || '00:00:00';
+      carried.audience_timezone = campaign.timezone;
+    }
+    return carried;
+  }
+
   async function toggleStep(step) {
     try {
       await api.updateStep(campaignId, step.id, {
@@ -799,6 +851,7 @@ export async function renderCampaignDetail(root, { params, navigate }) {
         offset_seconds: step.offset_seconds,
         message_template_id: step.message_template_id,
         enabled: !step.enabled,
+        ...stepSettings(step),
       });
       notify.success(step.enabled ? 'Хабарлама өшірілді' : 'Хабарлама қосылды');
       await reload();
@@ -815,6 +868,7 @@ export async function renderCampaignDetail(root, { params, navigate }) {
         offset_seconds: step.offset_seconds,
         message_template_id: step.message_template_id,
         enabled: false,
+        ...stepSettings(step),
       });
       notify.success('Көшірілді (өшірулі күйде)');
       await reload();

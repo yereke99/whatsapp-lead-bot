@@ -87,6 +87,15 @@ type Step struct {
 	// uploaded. It is recorded in the template description rather than applied,
 	// because the schema will not accept a media type without a media file.
 	IntendedType string
+	// DailyWebinar marks the step as part of the daily webinar sequence: the
+	// messages a contact receives once, for the webinar they signed up for.
+	//
+	// Every reminder anchored to the event is in it; the greeting is not,
+	// because it answers the contact's own message rather than the schedule.
+	// The campaign is seeded as a one-time webinar, so this changes nothing
+	// until an operator turns on "repeats every day" — at which point the
+	// sequence is already described correctly instead of being empty.
+	DailyWebinar bool
 	Body         string
 }
 
@@ -115,6 +124,7 @@ func Steps() []Step {
 			Name:         "5 сағат бұрын",
 			OffsetSec:    -5 * 3600,
 			ScheduleKind: domain.ScheduleRelativeToEvent,
+			DailyWebinar: true,
 			TemplateName: "02. Airan — 5 сағат бұрын",
 			IntendedType: "IMAGE_WITH_CAPTION",
 			Body: "Осы жылдың соңғы тегін сабағы! Бұдан кейін тегін сабақ өткізбейміз! " +
@@ -132,6 +142,7 @@ func Steps() []Step {
 			Name:         "3 сағат бұрын",
 			OffsetSec:    -3 * 3600,
 			ScheduleKind: domain.ScheduleRelativeToEvent,
+			DailyWebinar: true,
 			TemplateName: "03. Airan — 3 сағат бұрын",
 			IntendedType: "VOICE",
 			Body: "Күніне кемінде 40 мың пайда алып келетін Түрік айраны мен Қаймақ кәсібін " +
@@ -145,6 +156,7 @@ func Steps() []Step {
 			Name:         "2 сағат бұрын",
 			OffsetSec:    -2 * 3600,
 			ScheduleKind: domain.ScheduleRelativeToEvent,
+			DailyWebinar: true,
 			TemplateName: "04. Airan — 2 сағат бұрын",
 			IntendedType: "IMAGE_WITH_CAPTION",
 			Body: "Қаржылық жағдайыңыз тұрақсыз болып жүрсе, Түрік айраны мен Қаймақ кәсібі оны " +
@@ -159,6 +171,7 @@ func Steps() []Step {
 			Name:         "1 сағат бұрын",
 			OffsetSec:    -3600,
 			ScheduleKind: domain.ScheduleRelativeToEvent,
+			DailyWebinar: true,
 			TemplateName: "05. Airan — 1 сағат бұрын",
 			IntendedType: "IMAGE_WITH_CAPTION",
 			Body: "Бүгін сабақта Түрік айраны мен Қаймақ бизнесін нөлден бастап қалай бастауға " +
@@ -174,6 +187,7 @@ func Steps() []Step {
 			Name:         "30 минут бұрын",
 			OffsetSec:    -30 * 60,
 			ScheduleKind: domain.ScheduleRelativeToEvent,
+			DailyWebinar: true,
 			TemplateName: "06. Airan — 30 минут бұрын",
 			IntendedType: "VOICE",
 			Body: "Бүгінгі сабақ — жай әңгіме емес.\n\n" +
@@ -188,6 +202,7 @@ func Steps() []Step {
 			Name:         "15 минут бұрын",
 			OffsetSec:    -15 * 60,
 			ScheduleKind: domain.ScheduleRelativeToEvent,
+			DailyWebinar: true,
 			TemplateName: "07. Airan — 15 минут бұрын, сілтеме",
 			IntendedType: "IMAGE_WITH_CAPTION",
 			Body: "15 минуттан кейін сабағымызды бастаймыз!\n\n" +
@@ -202,6 +217,7 @@ func Steps() []Step {
 			Name:         "5 минут бұрын",
 			OffsetSec:    -5 * 60,
 			ScheduleKind: domain.ScheduleRelativeToEvent,
+			DailyWebinar: true,
 			TemplateName: "08. Airan — 5 минут бұрын, сілтеме",
 			IntendedType: "IMAGE_WITH_CAPTION",
 			Body: "Болашақ кәсіпкерлер жиналып жатыр, сізді күтіп отырмыз!\n\n" +
@@ -217,6 +233,7 @@ func Steps() []Step {
 			Name:         "Сабақ басталды",
 			OffsetSec:    0,
 			ScheduleKind: domain.ScheduleRelativeToEvent,
+			DailyWebinar: true,
 			TemplateName: "09. Airan — сабақ басталды",
 			IntendedType: "IMAGE_WITH_CAPTION",
 			Body: "Таяқ жерге тасталды, көптен күткен тегін сабағымыз басталды! 🥳\n\n" +
@@ -377,6 +394,9 @@ func install(ctx context.Context, deps Deps, opts Options) (*Result, error) {
 			TemplateID:    templateIDs[step.TemplateName],
 			Enabled:       true,
 			ScheduleKind:  string(step.ScheduleKind),
+			// Recorded on the step so that switching the campaign to a daily
+			// webinar later needs no second pass over the funnel.
+			IncludeInDailyWebinar: step.DailyWebinar,
 		}); err != nil {
 			return nil, fmt.Errorf("create step %q: %w", step.Name, err)
 		}

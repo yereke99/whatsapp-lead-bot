@@ -259,12 +259,38 @@ export async function renderContacts(root, { navigate }) {
     });
   }
 
-  function exportCsv() {
+  async function exportCsv() {
     const query = { ...filters };
     delete query.limit;
     delete query.offset;
-    // A plain navigation lets the browser handle the download and keeps the
-    // session cookie attached.
-    window.location.href = api.exportContactsUrl(query);
+    // Fetch (instead of a plain navigation) so a refusal is shown as a toast
+    // with the server's message rather than dumping a raw JSON error page into
+    // the browser window. The session cookie rides along automatically.
+    try {
+      const res = await fetch(api.exportContactsUrl(query), { credentials: 'same-origin' });
+      if (!res.ok) {
+        let message = 'Экспорт қол жетімді емес';
+        try {
+          const body = await res.json();
+          if (body?.error?.message) message = body.error.message;
+        } catch {
+          // Error body was not JSON; keep the generic message.
+        }
+        notify.error(message);
+        return;
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename="?([^"]+)"?/i);
+      const filename = match ? match[1] : 'contacts.csv';
+      const url = URL.createObjectURL(blob);
+      const link = el('a', { href: url, download: filename });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      notify.error('Экспорт орындалмады');
+    }
   }
 }

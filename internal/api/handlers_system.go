@@ -181,31 +181,14 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------- export --
 
 func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
-	filter := s.contactFilterFrom(r)
-	// The export covers the whole filtered set, not the current page.
-	filter.Limit = 0
-	filter.Offset = 0
-
-	tz := s.cfg.App.DefaultTimezone
-	filename := exportsFilename("contacts", tz)
-
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
-	w.Header().Set("Cache-Control", "no-store")
-
-	count, err := s.deps.Exports.Contacts(r.Context(), w, filter, tz)
-	if err != nil {
-		// Headers are already sent, so the error can only be logged.
-		s.log.Error("contact export failed", "error", err, "rows_written", count)
-		return
-	}
-
-	s.deps.Audit.Record(r.Context(), s.actorFrom(r), audit.Entry{
-		Action:     audit.ActionExport,
-		EntityType: "contact",
-		Summary:    "Байланыстар экспортталды",
-		New:        map[string]any{"rows": count, "filters": r.URL.RawQuery},
-	})
+	// Contact export is disabled. Downloading the full contact database
+	// (phone numbers, names, activity) from the admin panel is not allowed,
+	// so this endpoint refuses every request with 403 instead of streaming a
+	// file. The route stays registered so the UI gets an explicit, honest
+	// refusal rather than a broken or silently failing download.
+	s.log.Warn("contact export blocked", "query", r.URL.RawQuery)
+	httpx.Fail(w, http.StatusForbidden, httpx.CodeForbidden,
+		"Байланыстар экспорты өшірілген.")
 }
 
 // ------------------------------------------------------------ diagnostics --

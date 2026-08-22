@@ -188,7 +188,7 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 	// refusal rather than a broken or silently failing download.
 	s.log.Warn("contact export blocked", "query", r.URL.RawQuery)
 	httpx.Fail(w, http.StatusForbidden, httpx.CodeForbidden,
-		"Байланыстар экспорты өшірілген.")
+		"Серверде қате.")
 }
 
 // ------------------------------------------------------------ diagnostics --

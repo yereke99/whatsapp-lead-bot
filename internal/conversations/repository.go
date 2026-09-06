@@ -17,7 +17,7 @@ import (
 )
 
 const messageColumns = `
-	m.id, m.contact_id, m.campaign_id, m.enrollment_id, m.campaign_step_id,
+	m.id, m.contact_id, m.whatsapp_instance_id, m.campaign_id, m.enrollment_id, m.campaign_step_id,
 	m.scheduled_message_id, m.direction, m.type, m.text, m.media_file_id,
 	m.media_url, m.file_name, m.mime_type, m.external_id, m.status, m.error,
 	m.is_manual, m.sent_by_admin_id, m.template_id, m.template_version,
@@ -52,9 +52,10 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, m *domain.Mes
 			contact_id, campaign_id, enrollment_id, campaign_step_id, scheduled_message_id,
 			direction, type, text, media_file_id, media_url, file_name, mime_type,
 			external_id, status, error, is_manual, sent_by_admin_id, template_id,
-			template_version, media_download_status, sent_at, delivered_at, read_at
+			template_version, media_download_status, sent_at, delivered_at, read_at,
+			whatsapp_instance_id
 		) VALUES (
-			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24
 		)
 		RETURNING id, created_at, updated_at`
 
@@ -68,6 +69,7 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, m *domain.Mes
 		m.Direction, m.Type, m.Text, m.MediaFileID, m.MediaURL, m.FileName, m.MimeType,
 		m.ExternalID, m.Status, m.Error, m.IsManual, m.SentByAdminID, m.TemplateID,
 		m.TemplateVersion, downloadState, m.SentAt, m.DeliveredAt, m.ReadAt,
+		domain.InstanceIDOrPrimary(m.WhatsAppInstanceID),
 	).Scan(&m.ID, &m.CreatedAt, &m.UpdatedAt)
 
 	if err != nil {
@@ -327,7 +329,7 @@ type scanner interface {
 
 func scanMessage(row scanner, m *domain.Message, extra ...any) error {
 	dest := []any{
-		&m.ID, &m.ContactID, &m.CampaignID, &m.EnrollmentID, &m.CampaignStepID,
+		&m.ID, &m.ContactID, &m.WhatsAppInstanceID, &m.CampaignID, &m.EnrollmentID, &m.CampaignStepID,
 		&m.ScheduledMessageID, &m.Direction, &m.Type, &m.Text, &m.MediaFileID,
 		&m.MediaURL, &m.FileName, &m.MimeType, &m.ExternalID, &m.Status, &m.Error,
 		&m.IsManual, &m.SentByAdminID, &m.TemplateID, &m.TemplateVersion,

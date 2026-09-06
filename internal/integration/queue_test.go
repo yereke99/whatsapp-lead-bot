@@ -25,7 +25,7 @@ func TestClaimSerialisesPerContact(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestClaimSkipsContactsWithWorkInFlight(t *testing.T) {
 
 	busy := f.createContact(t, "77011234567")
 	other := f.createContact(t, "77017654321")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 
 	for _, contact := range []*domain.Contact{busy, other} {
 		if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
@@ -147,7 +147,7 @@ func TestStuckJobDoesNotStallTheContactsQueue(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestTriggerRelativeCampaignGivesEachContactTheirOwnSchedule(t *testing.T) {
 
 	campaign := f.createTriggerCampaign(t, "Drip", []int{0, 10 * 60, 30 * 60, 3600})
 	f.addTrigger(t, campaign.ID, "Айран")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 
 	first := f.createContact(t, "77011111111")
 	firstAt := time.Now().UTC()
@@ -266,7 +266,7 @@ func TestResumeSkipsExpiredJobs(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestResumeSendsNextValidKeepsOneMessage(t *testing.T) {
 	f.setResumePolicy(t, campaign.ID, domain.ResumeSendNextValid)
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestQueueRecordsTemplateVersion(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestRestartLosesNothing(t *testing.T) {
 	campaign := f.createCampaign(t, "Webinar", eventStart, []int{0})
 	f.addTrigger(t, campaign.ID, "Айран")
 
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	for i := 0; i < 6; i++ {
 		contact := f.createContact(t, formatPhone(i))
 		if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {

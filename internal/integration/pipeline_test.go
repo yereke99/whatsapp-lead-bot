@@ -109,7 +109,7 @@ func TestFullPipelineDeliversEveryStep(t *testing.T) {
 	campaign := f.createCampaign(t, "Webinar", eventStart, offsets)
 	f.addTrigger(t, campaign.ID, "Айран")
 
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	const contacts = 10
 	for i := 0; i < contacts; i++ {
 		contact := f.createContact(t, fmt.Sprintf("7701555%04d", i))
@@ -206,7 +206,7 @@ func TestRestartResumesQueueWithoutResending(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestCrashDuringProcessingIsRecovered(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestProviderFailureRetainsJobAndBlocksCompletion(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}

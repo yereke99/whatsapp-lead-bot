@@ -241,7 +241,7 @@ func TestSeededTriggerEnrollsAndSchedulesEverything(t *testing.T) {
 		"АЙРАН/ҚАЙМАҚ КӘСІБІ БОЙЫНША ТЕГІН САБАҚҚА ҚАТЫСҚЫМ КЕЛЕДІ",
 		"  Айран/Қаймақ   кәсібі бойынша тегін сабаққа қатысқым келеді  ",
 	} {
-		match, err := f.campaignSvc.MatchTrigger(ctx, nil, text)
+		match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, text)
 		if err != nil {
 			t.Fatalf("MatchTrigger(%q): %v", text, err)
 		}
@@ -253,7 +253,7 @@ func TestSeededTriggerEnrollsAndSchedulesEverything(t *testing.T) {
 	// An unrelated message must not enrol anyone. EXACT means exactly this
 	// sentence — the bare word no longer opts anybody in.
 	for _, text := range []string{"АЙРАН", "айран ішкім келеді", "сәлем", "айрандар"} {
-		match, err := f.campaignSvc.MatchTrigger(ctx, nil, text)
+		match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, text)
 		if err != nil {
 			t.Fatalf("MatchTrigger(%q): %v", text, err)
 		}
@@ -263,7 +263,7 @@ func TestSeededTriggerEnrollsAndSchedulesEverything(t *testing.T) {
 	}
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, seed.TriggerPhrase)
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, seed.TriggerPhrase)
 	enroll, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
@@ -317,7 +317,7 @@ func TestSeededCampaignSkipsPastStepsButKeepsFutureOnes(t *testing.T) {
 	}
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, seed.TriggerPhrase)
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, seed.TriggerPhrase)
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}

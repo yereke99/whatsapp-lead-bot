@@ -74,29 +74,57 @@ func NewProcessor(
 // happen on the background workers. Keeping this to a single insert is what
 // lets the poller acknowledge a notification immediately and move on, instead
 // of holding the provider's queue open for the length of a campaign enrollment.
-func (p *Processor) Ingest(ctx context.Context, body []byte) (accepted bool, err error) {
+func (p *Processor) Ingest(ctx context.Context, instanceID int64, instanceKey string, body []byte) (accepted bool, err error) {
 	event, err := greenapi.ParseWebhook(body)
 	if err != nil {
 		return false, err
 	}
 
-	_, inserted, err := p.repo.Insert(ctx, "greenapi", event.RawType, event.DedupeKey,
-		event.ExternalID, body, event.Timestamp)
+	_, inserted, err := p.repo.Insert(ctx, instanceID, "greenapi", event.RawType,
+		scopedDedupeKey(instanceKey, event.DedupeKey), event.ExternalID, body, event.Timestamp)
 	if err != nil {
 		return false, err
 	}
 
 	if !inserted {
 		p.log.Debug("duplicate notification ignored",
+			slog.Int64("whatsapp_instance_id", instanceID),
 			slog.String("type", event.RawType),
 			slog.String("dedupe_key", event.DedupeKey))
 		return false, nil
 	}
 
-	p.log.Info("notification stored",
+	p.log.Info("[WHATSAPP] notification stored",
+		slog.Int64("whatsapp_instance_id", instanceID),
+		slog.String("instance", instanceKey),
 		slog.String("type", event.RawType),
 		slog.String("external_id", event.ExternalID))
 	return true, nil
+}
+
+// scopedDedupeKey namespaces a provider's deduplication key with the account
+// that produced it.
+//
+// Green API's own identifiers are unique inside one instance, not across
+// instances, and the fallback key for an event carrying no message id is a
+// hash of the payload -- two accounts reporting the same state change produce
+// the same bytes. Prefixing with the account key makes the existing
+// UNIQUE (provider, dedupe_key) index per-account without rebuilding the
+// table, so a notification handled on one number can no longer silently
+// suppress an identical-looking one on the other.
+//
+// Rows stored before this existed keep their unprefixed keys. That cannot
+// collide with anything, and the only consequence is that a notification which
+// was stored but whose delete call failed at the moment of the upgrade may be
+// stored a second time under the new key. Reprocessing an inbound message is
+// already safe -- the unique index on messages.external_id catches it and the
+// handler returns before any trigger runs -- so nothing is sent twice.
+func scopedDedupeKey(instanceKey, dedupeKey string) string {
+	instanceKey = strings.TrimSpace(instanceKey)
+	if instanceKey == "" {
+		instanceKey = domain.InstanceKeyPrimary
+	}
+	return instanceKey + ":" + dedupeKey
 }
 
 // Start launches the processing loops.
@@ -203,7 +231,12 @@ func (p *Processor) handle(ctx context.Context, stored StoredEvent) {
 		return
 	}
 
-	handlerErr := p.apply(ctx, event)
+	// The account is read from the stored row, not from whichever poller
+	// happens to be running. A notification that outlives a restart is applied
+	// to the same account it arrived on.
+	instanceID := domain.InstanceIDOrPrimary(&stored.WhatsAppInstanceID)
+
+	handlerErr := p.apply(ctx, instanceID, event)
 	if handlerErr == nil {
 		p.finish(ctx, stored.ID, domain.WebhookProcessed, "")
 		return
@@ -233,19 +266,23 @@ func (p *Processor) finish(ctx context.Context, id uuid.UUID, status domain.Webh
 	}
 }
 
-func (p *Processor) apply(ctx context.Context, event *whatsapp.Event) error {
+func (p *Processor) apply(ctx context.Context, instanceID int64, event *whatsapp.Event) error {
 	switch event.Kind {
 	case whatsapp.EventIncomingMessage:
-		return p.handleIncoming(ctx, event)
+		return p.handleIncoming(ctx, instanceID, event)
 	case whatsapp.EventOutgoingMessage:
-		return p.handleOutgoingEcho(ctx, event)
+		return p.handleOutgoingEcho(ctx, instanceID, event)
 	case whatsapp.EventOutgoingStatus:
 		return p.handleStatus(ctx, event)
 	case whatsapp.EventStateChanged:
-		p.log.Info("provider state changed", slog.String("state", event.State))
+		p.log.Info("[WHATSAPP] provider state changed",
+			slog.Int64("whatsapp_instance_id", instanceID),
+			slog.String("state", event.State))
 		return nil
 	case whatsapp.EventIncomingCall:
-		p.log.Info("incoming call ignored", slog.String("from", event.ChatID))
+		p.log.Info("incoming call ignored",
+			slog.Int64("whatsapp_instance_id", instanceID),
+			slog.String("from", event.ChatID))
 		return nil
 	default:
 		return nil
@@ -253,7 +290,12 @@ func (p *Processor) apply(ctx context.Context, event *whatsapp.Event) error {
 }
 
 // handleIncoming is the entry point of the whole funnel.
-func (p *Processor) handleIncoming(ctx context.Context, event *whatsapp.Event) error {
+//
+// instanceID is the number the customer wrote to, and it is carried through
+// every decision below: which campaigns may claim the message, which stop
+// words count, and which enrolments an unsubscribe ends. Nothing here ever
+// looks at the installation as a whole.
+func (p *Processor) handleIncoming(ctx context.Context, instanceID int64, event *whatsapp.Event) error {
 	if event.Message == nil {
 		return nil
 	}
@@ -281,15 +323,16 @@ func (p *Processor) handleIncoming(ctx context.Context, event *whatsapp.Event) e
 	}
 
 	message := &domain.Message{
-		ContactID: contact.ID,
-		Direction: domain.DirectionIncoming,
-		Type:      string(event.Message.Type),
-		Text:      event.Message.Text,
-		MediaURL:  event.Message.DownloadURL,
-		FileName:  event.Message.FileName,
-		MimeType:  event.Message.MimeType,
-		Status:    domain.MessageStatusReceived,
-		CreatedAt: event.Timestamp,
+		ContactID:          contact.ID,
+		WhatsAppInstanceID: &instanceID,
+		Direction:          domain.DirectionIncoming,
+		Type:               string(event.Message.Type),
+		Text:               event.Message.Text,
+		MediaURL:           event.Message.DownloadURL,
+		FileName:           event.Message.FileName,
+		MimeType:           event.Message.MimeType,
+		Status:             domain.MessageStatusReceived,
+		CreatedAt:          event.Timestamp,
 	}
 	if event.ExternalID != "" {
 		id := event.ExternalID
@@ -322,7 +365,7 @@ func (p *Processor) handleIncoming(ctx context.Context, event *whatsapp.Event) e
 	}
 
 	// Unsubscribe wins over everything else, including a trigger match.
-	stopped, err := p.handleUnsubscribe(ctx, contact, event.Message.Text)
+	stopped, err := p.handleUnsubscribe(ctx, instanceID, contact, event.Message.Text)
 	if err != nil {
 		return err
 	}
@@ -330,11 +373,24 @@ func (p *Processor) handleIncoming(ctx context.Context, event *whatsapp.Event) e
 		return nil
 	}
 
-	return p.handleTrigger(ctx, contact, event.Message.Text, event.Timestamp)
+	return p.handleTrigger(ctx, instanceID, contact, event.Message.Text, event.Timestamp)
 }
 
-func (p *Processor) handleUnsubscribe(ctx context.Context, contact *domain.Contact, text string) (bool, error) {
-	isStop, err := p.campaigns.IsUnsubscribe(ctx, nil, contact.ID, text)
+// handleUnsubscribe applies a stop word to the account that received it.
+//
+// The scope is the point. "STOP" written to one of the installation's numbers
+// is an instruction about that number's messages: it ends those enrolments and
+// cancels those queued jobs, and it leaves the other number's alone. Somebody
+// who signed up for two different webinars through two different numbers can
+// leave one without losing the other.
+//
+// The whole-person columns on contacts -- opted_out, opted_out_at, status --
+// are still written exactly as before, so the panel, its filters, the exports
+// and the analytics see no change. They are the "asked us to stop somewhere"
+// view; the per-account row written here is what the send path actually asks
+// before delivering anything.
+func (p *Processor) handleUnsubscribe(ctx context.Context, instanceID int64, contact *domain.Contact, text string) (bool, error) {
+	isStop, err := p.campaigns.IsUnsubscribe(ctx, nil, contact.ID, instanceID, text)
 	if err != nil {
 		return false, fmt.Errorf("check unsubscribe keywords: %w", err)
 	}
@@ -342,23 +398,30 @@ func (p *Processor) handleUnsubscribe(ctx context.Context, contact *domain.Conta
 		return false, nil
 	}
 
+	if err := p.contacts.OptOutOn(ctx, nil, instanceID, contact.ID,
+		"contact sent an unsubscribe keyword"); err != nil {
+		return false, fmt.Errorf("record opt out: %w", err)
+	}
 	if err := p.contacts.SetOptOut(ctx, nil, contact.ID, true); err != nil {
 		return false, fmt.Errorf("record opt out: %w", err)
 	}
-	if err := p.campaigns.StopForContact(ctx, contact.ID,
+	if err := p.campaigns.StopForContactOnInstance(ctx, contact.ID, instanceID,
 		domain.EnrollmentUnsubscribed, "contact sent an unsubscribe keyword"); err != nil {
 		return false, fmt.Errorf("stop enrollments: %w", err)
 	}
 
-	p.log.Info("contact unsubscribed",
+	p.log.Info("[WHATSAPP] contact unsubscribed",
+		slog.Int64("whatsapp_instance_id", instanceID),
 		slog.String("contact_id", contact.ID.String()),
 		slog.String("phone", contact.Phone))
 
 	return true, nil
 }
 
-func (p *Processor) handleTrigger(ctx context.Context, contact *domain.Contact, text string, at time.Time) error {
-	match, err := p.campaigns.MatchTrigger(ctx, nil, text)
+func (p *Processor) handleTrigger(ctx context.Context, instanceID int64, contact *domain.Contact, text string, at time.Time) error {
+	// Only this account's campaigns are candidates. A word configured on the
+	// other number is not a trigger here, however exactly it matches.
+	match, err := p.campaigns.MatchTrigger(ctx, nil, instanceID, text)
 	if err != nil {
 		return fmt.Errorf("match trigger: %w", err)
 	}
@@ -373,8 +436,15 @@ func (p *Processor) handleTrigger(ctx context.Context, contact *domain.Contact, 
 		return fmt.Errorf("handle trigger: %w", err)
 	}
 
+	p.log.Info("[TRIGGER] matched",
+		slog.Int64("whatsapp_instance_id", instanceID),
+		slog.String("campaign", match.CampaignName),
+		slog.String("campaign_id", match.CampaignID.String()),
+		slog.String("contact_id", contact.ID.String()),
+		slog.String("action", string(result.Action)))
+
 	if result.Action == campaigns.ActionSpecialMessage && result.SpecialTemplateID != nil {
-		if err := p.sendSpecialReply(ctx, contact, result); err != nil {
+		if err := p.sendSpecialReply(ctx, instanceID, contact, result); err != nil {
 			// The enrollment decision already stands; a failed courtesy reply
 			// must not cause the whole event to be retried.
 			p.log.Error("repeat-trigger reply failed", slog.String("error", err.Error()))
@@ -384,8 +454,9 @@ func (p *Processor) handleTrigger(ctx context.Context, contact *domain.Contact, 
 	return nil
 }
 
-// sendSpecialReply answers a repeat trigger with the configured template.
-func (p *Processor) sendSpecialReply(ctx context.Context, contact *domain.Contact, result *campaigns.EnrollResult) error {
+// sendSpecialReply answers a repeat trigger with the configured template,
+// through the account the trigger arrived on.
+func (p *Processor) sendSpecialReply(ctx context.Context, instanceID int64, contact *domain.Contact, result *campaigns.EnrollResult) error {
 	spec, err := p.templates.ResolveForSend(ctx, nil, *result.SpecialTemplateID)
 	if err != nil {
 		return err
@@ -410,6 +481,8 @@ func (p *Processor) sendSpecialReply(ctx context.Context, contact *domain.Contac
 	}
 
 	out := messaging.Outbound{
+		WhatsAppInstanceID: instanceID,
+
 		Type:            spec.Type,
 		Text:            render.Render(spec.Body, render.NewContext(values)),
 		LinkPreview:     spec.LinkPreview,
@@ -434,7 +507,7 @@ func (p *Processor) sendSpecialReply(ctx context.Context, contact *domain.Contac
 
 // handleOutgoingEcho records messages the operator sent from the linked phone
 // so the admin conversation view matches what the customer sees.
-func (p *Processor) handleOutgoingEcho(ctx context.Context, event *whatsapp.Event) error {
+func (p *Processor) handleOutgoingEcho(ctx context.Context, instanceID int64, event *whatsapp.Event) error {
 	if event.Message == nil || event.ExternalID == "" {
 		return nil
 	}
@@ -470,16 +543,17 @@ func (p *Processor) handleOutgoingEcho(ctx context.Context, event *whatsapp.Even
 	id := event.ExternalID
 	sentAt := event.Timestamp
 	message := &domain.Message{
-		ContactID:  contact.ID,
-		Direction:  domain.DirectionOutgoing,
-		Type:       string(event.Message.Type),
-		Text:       event.Message.Text,
-		MediaURL:   event.Message.DownloadURL,
-		FileName:   event.Message.FileName,
-		MimeType:   event.Message.MimeType,
-		ExternalID: &id,
-		Status:     domain.MessageStatusSent,
-		SentAt:     &sentAt,
+		ContactID:          contact.ID,
+		WhatsAppInstanceID: &instanceID,
+		Direction:          domain.DirectionOutgoing,
+		Type:               string(event.Message.Type),
+		Text:               event.Message.Text,
+		MediaURL:           event.Message.DownloadURL,
+		FileName:           event.Message.FileName,
+		MimeType:           event.Message.MimeType,
+		ExternalID:         &id,
+		Status:             domain.MessageStatusSent,
+		SentAt:             &sentAt,
 	}
 	if event.Message.Type.IsMedia() && event.Message.DownloadURL != "" {
 		message.MediaDownloadState = "PENDING"

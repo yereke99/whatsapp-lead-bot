@@ -16,14 +16,33 @@ const TIMEZONES = [
 export async function renderCampaigns(root, { navigate }) {
   const grid = el('div', { class: 'stack' });
 
+  // The WhatsApp accounts this installation owns. Loaded once: the filter and
+  // every campaign card label read from it. An older server that does not
+  // serve this endpoint yields an empty list, and the page then renders
+  // exactly as it did before accounts existed.
+  let accounts = [];
+  try {
+    accounts = await api.whatsappInstances();
+  } catch {
+    accounts = [];
+  }
+
+  const accountFilter = select(
+    [{ value: '', label: 'Барлық нөмірлер' },
+      ...accounts.map((a) => ({ value: String(a.id), label: accountLabel(a) }))],
+    { value: '' },
+  );
+  accountFilter.addEventListener('change', () => load());
+
   mount(root,
     el('div', { class: 'page-head' },
       el('div', { class: 'page-head__text' },
         el('h1', {}, 'Кампаниялар'),
         el('p', { class: 'page-head__desc' },
-          'Әр кампанияның өз триггері, уақыты және автоматтандыру тізбегі бар')),
+          'Әр кампанияның өз нөмірі, триггері, уақыты және автоматтандыру тізбегі бар')),
       el('div', { class: 'page-head__actions' },
-        button('Жаңа кампания', { iconName: 'plus', variant: 'primary', onClick: () => openCampaignForm(null, load) }))),
+        accounts.length > 1 ? accountFilter : null,
+        button('Жаңа кампания', { iconName: 'plus', variant: 'primary', onClick: () => openCampaignForm(null, load, accounts) }))),
     grid,
   );
 
@@ -35,14 +54,17 @@ export async function renderCampaigns(root, { navigate }) {
       el('div', { class: 'skeleton mt-3', style: { width: '75%' } }))));
 
     try {
-      const campaigns = await api.campaigns({ include_archived: 'true' });
+      const query = { include_archived: 'true' };
+      if (accountFilter.value) query.whatsapp_instance_id = accountFilter.value;
+
+      const campaigns = await api.campaigns(query);
       clear(grid);
 
       if (!campaigns || campaigns.length === 0) {
         grid.append(el('div', { class: 'card' }, el('div', { class: 'card__body' },
           emptyState('Кампания жоқ',
             'Кампания құрып, триггер сөзін және вебинар уақытын белгілеңіз.',
-            button('Жаңа кампания', { variant: 'primary', iconName: 'plus', onClick: () => openCampaignForm(null, load) })))));
+            button('Жаңа кампания', { variant: 'primary', iconName: 'plus', onClick: () => openCampaignForm(null, load, accounts) })))));
         return;
       }
 
@@ -68,7 +90,7 @@ export async function renderCampaigns(root, { navigate }) {
 
     actions.append(
       button('Ашу', { size: 'sm', iconName: 'eye', onClick: () => navigate(`/campaigns/${campaign.id}`) }),
-      button('', { size: 'sm', iconName: 'edit', title: 'Өңдеу', onClick: () => openCampaignForm(campaign, load) }),
+      button('', { size: 'sm', iconName: 'edit', title: 'Өңдеу', onClick: () => openCampaignForm(campaign, load, accounts) }),
       button('', { size: 'sm', iconName: 'copy', title: 'Көшіру', onClick: () => duplicate(campaign) }),
     );
 
@@ -81,7 +103,13 @@ export async function renderCampaigns(root, { navigate }) {
         el('div', { style: { flex: '1', minWidth: '0' } },
           el('div', { class: 'row' },
             el('span', { class: 'card__title' }, campaign.name),
-            badge(status.label, status.tone)),
+            badge(status.label, status.tone),
+            // Which number this campaign sends through. Shown on every card,
+            // including when there is only one account, so an operator never
+            // has to remember which is which before editing or activating.
+            campaign.whatsapp_instance_name
+              ? badge(campaign.whatsapp_instance_name, 'info')
+              : null),
           el('div', { class: 'card__sub' }, campaignSchedule(campaign))),
         el('div', { class: 'card__actions' }, actions)),
       el('div', { class: 'card__body' },
@@ -169,7 +197,11 @@ function miniStat(label, value) {
 }
 
 // openCampaignForm handles both create and edit.
-export async function openCampaignForm(campaign, onSaved) {
+//
+// accounts may be passed in by a caller that already has the list; anything
+// else -- the campaign detail page's settings button, for instance -- leaves it
+// out and the form fetches it itself.
+export async function openCampaignForm(campaign, onSaved, accounts = null) {
   const isEdit = Boolean(campaign);
 
   let templates = [];
@@ -178,6 +210,42 @@ export async function openCampaignForm(campaign, onSaved) {
   } catch {
     templates = [];
   }
+
+  if (!Array.isArray(accounts)) {
+    try {
+      accounts = await api.whatsappInstances();
+    } catch {
+      accounts = [];
+    }
+  }
+
+  // Which WhatsApp number this campaign sends through.
+  //
+  // Chosen once, at creation, and fixed afterwards. The campaign's queued
+  // messages, its enrolments and its trigger words all resolve the sending
+  // number through this field, so changing it later would send messages that
+  // are already scheduled -- to people who opted in on one number -- out
+  // through a different one. The server refuses the change; the form does not
+  // offer it, and shows the number instead so it is still visible.
+  const accountOptions = accounts.map((a) => ({
+    value: String(a.id),
+    label: accountLabel(a) + (a.configured ? '' : ' — қосылмаған'),
+  }));
+
+  const defaultAccount = accounts.find((a) => a.enabled && a.configured) || accounts[0];
+  const accountSelect = select(
+    accountOptions.length > 0 ? accountOptions : [{ value: '1', label: 'Primary WhatsApp' }],
+    { value: String(campaign?.whatsapp_instance_id || defaultAccount?.id || 1) },
+  );
+
+  const accountField = isEdit
+    ? field('WhatsApp нөмірі',
+        el('div', { class: 'row' },
+          badge(campaign?.whatsapp_instance_name || 'Primary WhatsApp', 'info')),
+        { hint: 'Кампания құрылғаннан кейін нөмірді ауыстыруға болмайды. Басқа нөмір үшін жаңа кампания құрыңыз.' })
+    : field('WhatsApp нөмірі', accountSelect, {
+        hint: 'Осы кампанияның барлық хабарламалары дәл осы нөмірден жіберіледі.',
+      });
 
   const nameInput = input({ value: campaign?.name || '', placeholder: 'Мысалы: Түрік айраны вебинары', required: true });
   const descInput = textarea({ placeholder: 'Кампанияның қысқаша сипаттамасы' });
@@ -286,6 +354,7 @@ export async function openCampaignForm(campaign, onSaved) {
 
   const body = el('div', {},
     errorBox,
+    accounts.length > 0 ? accountField : null,
     field('Атауы', nameInput),
     field('Сипаттама', descInput),
     el('div', { class: 'form-grid form-grid--3' },
@@ -333,6 +402,10 @@ export async function openCampaignForm(campaign, onSaved) {
     errorBox.classList.add('hidden');
 
     const payload = {
+      // Sent on create only. On edit the server keeps the campaign's stored
+      // account and rejects any attempt to change it, so the form does not
+      // send a value it is not allowed to set.
+      whatsapp_instance_id: isEdit ? undefined : Number(accountSelect.value) || 1,
       name: nameInput.value.trim(),
       description: descInput.value.trim(),
       event_type: 'WEBINAR',
@@ -402,4 +475,13 @@ function optionalLimit(value) {
   if (trimmed === '') return null;
   const parsed = Number(trimmed);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+}
+
+// accountLabel is what an operator should see for a WhatsApp account: its name
+// and, when configured, the phone label beside it. Never a credential -- the
+// payload this reads does not contain one.
+function accountLabel(account) {
+  if (!account) return 'Primary WhatsApp';
+  const name = account.name || account.instance_key || 'WhatsApp';
+  return account.phone_label ? `${name} · ${account.phone_label}` : name;
 }

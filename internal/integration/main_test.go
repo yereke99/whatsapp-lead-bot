@@ -38,6 +38,12 @@ import (
 
 var testDB *sqlite.DB
 
+// primaryInstance is the WhatsApp account every fixture in this package
+// belongs to. Trigger routing, unsubscribe keywords and sending are all scoped
+// by account, so a test that does not say otherwise is testing the account
+// this installation has always had.
+const primaryInstance = domain.PrimaryInstanceID
+
 // discardLogger keeps test output readable.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -81,11 +87,15 @@ func TestMain(m *testing.M) {
 
 // resetTables lists every table child-first, so deleting in order never trips a
 // foreign key even though the schema also cascades.
+//
+// whatsapp_instances is deliberately absent: those rows are created by
+// migration 0007 and are configuration, not test data. Deleting them would
+// strand every campaign's owner and make each test depend on recreating them.
 var resetTables = []string{
 	"scheduled_messages", "messages", "campaign_contacts", "campaign_steps",
 	"campaign_triggers", "campaigns", "message_template_versions", "message_templates",
-	"contact_tags", "tags", "contacts", "media_files", "webhook_events", "audit_logs",
-	"admin_sessions", "login_attempts", "admins",
+	"contact_tags", "tags", "contact_instance_optouts", "contacts", "media_files",
+	"webhook_events", "audit_logs", "admin_sessions", "login_attempts", "admins",
 }
 
 // reset clears every table between tests so cases stay independent.
@@ -152,12 +162,21 @@ func (f *fixture) createTemplate(t *testing.T, name, body string) uuid.UUID {
 	return tpl.ID
 }
 
-// createCampaign builds an active campaign anchored at the given event time.
+// createCampaign builds an active campaign anchored at the given event time,
+// owned by the account this installation has always had.
 func (f *fixture) createCampaign(t *testing.T, name string, eventStart time.Time, offsets []int) *domain.Campaign {
+	t.Helper()
+	return f.createCampaignOn(t, primaryInstance, name, eventStart, offsets)
+}
+
+// createCampaignOn is createCampaign for a specific WhatsApp account.
+func (f *fixture) createCampaignOn(t *testing.T, instanceID int64, name string, eventStart time.Time, offsets []int) *domain.Campaign {
 	t.Helper()
 	ctx := context.Background()
 
+	owner := instanceID
 	campaign := &domain.Campaign{
+		WhatsAppInstanceID:      &owner,
 		Name:                    name,
 		EventType:               "WEBINAR",
 		EventStartAt:            &eventStart,

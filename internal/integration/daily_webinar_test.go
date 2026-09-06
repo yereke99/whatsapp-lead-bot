@@ -104,7 +104,7 @@ func trigger(t *testing.T, f *fixture, contact *domain.Contact, at time.Time) *c
 	t.Helper()
 	ctx := context.Background()
 
-	match, err := f.campaignSvc.MatchTrigger(ctx, nil, dailyKeyword)
+	match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, dailyKeyword)
 	if err != nil {
 		t.Fatalf("MatchTrigger: %v", err)
 	}
@@ -583,7 +583,7 @@ func TestConcurrentTriggersProduceOneEnrollment(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			ctx := context.Background()
-			match, err := f.campaignSvc.MatchTrigger(ctx, nil, dailyKeyword)
+			match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, dailyKeyword)
 			if err != nil || match == nil {
 				return
 			}

@@ -25,7 +25,17 @@ var (
 )
 
 const campaignColumns = `
-	c.id, c.name, c.description, c.event_type, c.event_start_at, c.timezone,
+	c.id,
+	-- The account this campaign sends through. Nullable only because SQLite
+	-- cannot add a NOT NULL column to a populated table; migration 0007
+	-- backfilled every row that existed to Primary, and the application reads
+	-- a null as Primary so a row written by hand stays routable.
+	c.whatsapp_instance_id,
+	-- Resolved here rather than through a join so that adding the label did
+	-- not have to touch the FROM clause of every campaign query.
+	COALESCE((SELECT i.name FROM whatsapp_instances i
+	          WHERE i.id = COALESCE(c.whatsapp_instance_id, 1)), ''),
+	c.name, c.description, c.event_type, c.event_start_at, c.timezone,
 	c.webinar_link, c.is_daily_recurring,
 	-- COALESCE, because these columns are nullable and every row that predates
 	-- migration 0005 holds NULL in them. The model carries them as strings —
@@ -82,6 +92,10 @@ type ListFilter struct {
 	Search          string
 	Status          string
 	IncludeArchived bool
+	// WhatsAppInstanceID narrows the list to one account. Nil means every
+	// account, which is what the panel shows by default and what every caller
+	// that predates multi-account support gets.
+	WhatsAppInstanceID *int64
 }
 
 func (r *Repository) List(ctx context.Context, f ListFilter) ([]domain.Campaign, error) {
@@ -98,6 +112,10 @@ func (r *Repository) List(ctx context.Context, f ListFilter) ([]domain.Campaign,
 	if f.Status != "" {
 		args = append(args, f.Status)
 		clauses = append(clauses, fmt.Sprintf("c.status = $%d", len(args)))
+	}
+	if f.WhatsAppInstanceID != nil {
+		args = append(args, *f.WhatsAppInstanceID)
+		clauses = append(clauses, fmt.Sprintf("COALESCE(c.whatsapp_instance_id, 1) = $%d", len(args)))
 	}
 
 	where := "TRUE"
@@ -172,7 +190,7 @@ func (r *Repository) attachTriggers(ctx context.Context, list []domain.Campaign)
 
 	for rows.Next() {
 		var t domain.CampaignTrigger
-		if err := rows.Scan(&t.ID, &t.CampaignID, &t.Keyword, &t.Normalized,
+		if err := rows.Scan(&t.ID, &t.CampaignID, &t.WhatsAppInstanceID, &t.Keyword, &t.Normalized,
 			&t.MatchMode, &t.IsActive, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return err
 		}
@@ -234,8 +252,9 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, c *domain.Cam
 			unsubscribe_keywords, catch_up_missed_steps, max_send_attempts,
 			resume_policy, pin_template_version, max_messages_per_hour,
 			max_messages_per_day, max_active_contacts, created_by,
-			is_daily_recurring, recurrence_time, recurrence_start_date
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+			is_daily_recurring, recurrence_time, recurrence_start_date,
+			whatsapp_instance_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 		RETURNING id, created_at, updated_at`
 
 	err := r.querier(q).QueryRow(ctx, query,
@@ -245,6 +264,7 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, c *domain.Cam
 		c.ResumePolicy, c.PinTemplateVersion, c.MaxMessagesPerHour,
 		c.MaxMessagesPerDay, c.MaxActiveContacts, c.CreatedBy,
 		c.IsDailyRecurring, c.RecurrenceTime, c.RecurrenceStartDate,
+		domain.InstanceIDOrPrimary(c.WhatsAppInstanceID),
 	).Scan(&c.ID, &c.CreatedAt, &c.UpdatedAt)
 
 	if err != nil {
@@ -256,6 +276,14 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, c *domain.Cam
 	return nil
 }
 
+// Update saves a campaign's settings.
+//
+// whatsapp_instance_id is deliberately absent from the statement. A campaign's
+// account is immutable once the campaign exists: its queued jobs, its
+// enrolments and its triggers all resolve the sending number through it, and
+// repointing it would send messages that are already scheduled -- to people
+// who opted in on one number -- out through a different one. The API refuses
+// the change; this is the second lock, at the layer that would carry it out.
 func (r *Repository) Update(ctx context.Context, q sqlite.Querier, c *domain.Campaign) error {
 	const query = `
 		UPDATE campaigns SET
@@ -339,33 +367,51 @@ func (r *Repository) Delete(ctx context.Context, id uuid.UUID) error {
 
 // TriggerMatch is an active trigger considered during routing.
 type TriggerMatch struct {
-	TriggerID    uuid.UUID
-	CampaignID   uuid.UUID
-	CampaignName string
-	Keyword      string
-	Normalized   string
-	MatchMode    string
+	TriggerID  uuid.UUID
+	CampaignID uuid.UUID
+	// WhatsAppInstanceID is the account whose campaigns this match was drawn
+	// from. It is carried on the match, rather than looked up again later, so
+	// that the account a message arrived on and the account it will be
+	// answered from are the same value all the way down the funnel.
+	WhatsAppInstanceID int64
+	CampaignName       string
+	Keyword            string
+	Normalized         string
+	MatchMode          string
 }
 
-// ActiveTriggers returns every trigger belonging to a campaign that is
-// currently accepting enrollments.
+// ActiveTriggers returns every trigger belonging to a campaign of this account
+// that is currently accepting enrollments.
+//
+// The account filter is the isolation boundary of the whole inbound funnel. A
+// message only ever reaches the number it was sent to, so the campaigns that
+// may claim it are exactly that number's campaigns -- never every campaign in
+// the installation. Without this clause a word configured on the second number
+// would enrol people who wrote it to the first, which is the failure this
+// design exists to make impossible.
+//
+// The scope is taken from the campaign rather than from the trigger's own
+// copy, so the answer stays correct even if the denormalised column on
+// campaign_triggers were ever wrong.
 //
 // Ordering is deterministic: exact matches first, then longer keywords before
 // shorter ones, so an ambiguous message always resolves the same way.
-func (r *Repository) ActiveTriggers(ctx context.Context, q sqlite.Querier) ([]TriggerMatch, error) {
+func (r *Repository) ActiveTriggers(ctx context.Context, q sqlite.Querier, instanceID int64) ([]TriggerMatch, error) {
 	const query = `
-		SELECT t.id, t.campaign_id, c.name, t.keyword, t.normalized_keyword, t.match_mode
+		SELECT t.id, t.campaign_id, COALESCE(c.whatsapp_instance_id, 1), c.name,
+		       t.keyword, t.normalized_keyword, t.match_mode
 		FROM campaign_triggers t
 		JOIN campaigns c ON c.id = t.campaign_id
 		WHERE t.is_active
 		  AND c.status = 'ACTIVE'
 		  AND c.archived_at IS NULL
+		  AND COALESCE(c.whatsapp_instance_id, 1) = $1
 		ORDER BY
 			CASE t.match_mode WHEN 'EXACT' THEN 0 WHEN 'STARTS_WITH' THEN 1 ELSE 2 END,
 			length(t.normalized_keyword) DESC,
 			t.created_at`
 
-	rows, err := r.querier(q).Query(ctx, query)
+	rows, err := r.querier(q).Query(ctx, query, instanceID)
 	if err != nil {
 		return nil, fmt.Errorf("load active triggers: %w", err)
 	}
@@ -374,7 +420,7 @@ func (r *Repository) ActiveTriggers(ctx context.Context, q sqlite.Querier) ([]Tr
 	var out []TriggerMatch
 	for rows.Next() {
 		var t TriggerMatch
-		if err := rows.Scan(&t.TriggerID, &t.CampaignID, &t.CampaignName,
+		if err := rows.Scan(&t.TriggerID, &t.CampaignID, &t.WhatsAppInstanceID, &t.CampaignName,
 			&t.Keyword, &t.Normalized, &t.MatchMode); err != nil {
 			return nil, err
 		}
@@ -385,7 +431,8 @@ func (r *Repository) ActiveTriggers(ctx context.Context, q sqlite.Querier) ([]Tr
 
 func (r *Repository) ListTriggers(ctx context.Context, campaignID uuid.UUID) ([]domain.CampaignTrigger, error) {
 	const query = `
-		SELECT id, campaign_id, keyword, normalized_keyword, match_mode, is_active, created_at, updated_at
+		SELECT id, campaign_id, whatsapp_instance_id, keyword, normalized_keyword,
+		       match_mode, is_active, created_at, updated_at
 		FROM campaign_triggers WHERE campaign_id = $1 ORDER BY created_at`
 
 	rows, err := r.db.Query(ctx, query, campaignID)
@@ -409,7 +456,8 @@ func (r *Repository) ListTriggers(ctx context.Context, campaignID uuid.UUID) ([]
 // AllTriggers lists triggers across campaigns for the trigger admin page.
 func (r *Repository) AllTriggers(ctx context.Context) ([]domain.CampaignTrigger, error) {
 	const query = `
-		SELECT t.id, t.campaign_id, t.keyword, t.normalized_keyword, t.match_mode,
+		SELECT t.id, t.campaign_id, COALESCE(t.whatsapp_instance_id, c.whatsapp_instance_id, 1),
+		       t.keyword, t.normalized_keyword, t.match_mode,
 		       t.is_active, t.created_at, t.updated_at, c.name
 		FROM campaign_triggers t
 		JOIN campaigns c ON c.id = t.campaign_id
@@ -425,7 +473,7 @@ func (r *Repository) AllTriggers(ctx context.Context) ([]domain.CampaignTrigger,
 	var out []domain.CampaignTrigger
 	for rows.Next() {
 		var t domain.CampaignTrigger
-		if err := rows.Scan(&t.ID, &t.CampaignID, &t.Keyword, &t.Normalized,
+		if err := rows.Scan(&t.ID, &t.CampaignID, &t.WhatsAppInstanceID, &t.Keyword, &t.Normalized,
 			&t.MatchMode, &t.IsActive, &t.CreatedAt, &t.UpdatedAt, &t.CampaignRef); err != nil {
 			return nil, err
 		}
@@ -434,15 +482,24 @@ func (r *Repository) AllTriggers(ctx context.Context) ([]domain.CampaignTrigger,
 	return out, rows.Err()
 }
 
+// CreateTrigger inserts a trigger and stamps it with its campaign's account.
+//
+// The account is read from the campaign inside the same statement rather than
+// taken from the caller, so the copy on the trigger cannot disagree with the
+// campaign it belongs to no matter who is calling. That copy is what the
+// uniqueness index below is built on: an index cannot follow a foreign key, so
+// scoping "one keyword, one campaign" per account needs the value on the row.
 func (r *Repository) CreateTrigger(ctx context.Context, q sqlite.Querier, t *domain.CampaignTrigger) error {
 	const query = `
-		INSERT INTO campaign_triggers (campaign_id, keyword, normalized_keyword, match_mode, is_active)
-		VALUES ($1,$2,$3,$4,$5)
-		RETURNING id, created_at, updated_at`
+		INSERT INTO campaign_triggers (campaign_id, whatsapp_instance_id, keyword,
+			normalized_keyword, match_mode, is_active)
+		SELECT $1, COALESCE(c.whatsapp_instance_id, 1), $2, $3, $4, $5
+		FROM campaigns c WHERE c.id = $1
+		RETURNING id, whatsapp_instance_id, created_at, updated_at`
 
 	err := r.querier(q).QueryRow(ctx, query,
 		t.CampaignID, t.Keyword, t.Normalized, t.MatchMode, t.IsActive,
-	).Scan(&t.ID, &t.CreatedAt, &t.UpdatedAt)
+	).Scan(&t.ID, &t.WhatsAppInstanceID, &t.CreatedAt, &t.UpdatedAt)
 
 	if err != nil {
 		if sqlite.IsUniqueViolation(err, "campaign_triggers_unique_active") {
@@ -786,8 +843,12 @@ func (r *Repository) SetEnrollmentStatus(ctx context.Context, q sqlite.Querier, 
 	return err
 }
 
-// StopAllForContact ends every active enrollment, used when a contact
-// unsubscribes or is blocked.
+// StopAllForContact ends every active enrollment, used when an administrator
+// unsubscribes or blocks a contact.
+//
+// This is the whole-person form and it stays: an operator blocking somebody is
+// making a statement about the person, not about one of the installation's
+// numbers.
 func (r *Repository) StopAllForContact(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, status domain.EnrollmentStatus, reason string) error {
 	const query = `
 		UPDATE campaign_contacts SET
@@ -795,6 +856,29 @@ func (r *Repository) StopAllForContact(ctx context.Context, q sqlite.Querier, co
 		WHERE contact_id = $1 AND status = 'ACTIVE'`
 
 	_, err := r.querier(q).Exec(ctx, query, contactID, status, reason)
+	return err
+}
+
+// StopForContactOnInstance ends the contact's active enrollments in campaigns
+// belonging to one account, and leaves every other account's alone.
+//
+// This is what an unsubscribe keyword means. The customer wrote "STOP" to one
+// of the installation's numbers; they were talking about that number's
+// messages. Cancelling their enrolments on the other number would silently
+// stop a sequence they never asked to leave -- and on an installation with a
+// single account it cancels exactly the same rows the whole-person form does,
+// so nothing about today's behaviour changes.
+func (r *Repository) StopForContactOnInstance(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, instanceID int64, status domain.EnrollmentStatus, reason string) error {
+	const query = `
+		UPDATE campaign_contacts SET
+			status = $2, cancelled_at = COALESCE(cancelled_at, now()), cancel_reason = $3
+		WHERE contact_id = $1
+		  AND status = 'ACTIVE'
+		  AND campaign_id IN (
+			SELECT c.id FROM campaigns c WHERE COALESCE(c.whatsapp_instance_id, 1) = $4
+		  )`
+
+	_, err := r.querier(q).Exec(ctx, query, contactID, status, reason, instanceID)
 	return err
 }
 
@@ -846,14 +930,25 @@ func (r *Repository) ListEnrollmentsForContact(ctx context.Context, contactID uu
 // CANCELLED and UNSUBSCRIBED are never returned. Those are decisions about the
 // contact, not about the queue, and no amount of repair should undo them.
 func (r *Repository) EnrollmentsForReconcile(ctx context.Context, q sqlite.Querier, campaignID *uuid.UUID) ([]domain.Enrollment, error) {
+	// The unsubscribe check is scoped to the account that owns the enrolment,
+	// not to the whole-person flag. Reading the flag here would mean that
+	// somebody who left the second number's funnel quietly stopped being
+	// repaired on the first: their enrolment would go unreconciled, a step
+	// added later would never reach them, and nothing would report it. Blocking
+	// stays global, because blocking is a decision about the person.
 	query := `
 		SELECT cc.id, cc.campaign_id, cc.contact_id, cc.status, cc.run_number,
 		       cc.enrolled_at, cc.occurrence_at
 		FROM campaign_contacts cc
 		JOIN contacts c ON c.id = cc.contact_id
+		JOIN campaigns camp ON camp.id = cc.campaign_id
 		WHERE cc.status IN ('ACTIVE', 'COMPLETED')
-		  AND NOT c.opted_out
-		  AND c.blocked_at IS NULL`
+		  AND c.blocked_at IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM contact_instance_optouts o
+			WHERE o.contact_id = cc.contact_id
+			  AND o.whatsapp_instance_id = COALESCE(camp.whatsapp_instance_id, 1)
+		  )`
 
 	var args []any
 	if campaignID != nil {
@@ -923,14 +1018,22 @@ func (r *Repository) ReconcilableCampaignIDs(ctx context.Context) ([]uuid.UUID, 
 // ActiveEnrollmentIDs lists enrollments still running in a campaign, used when
 // a newly enabled step must be back-filled.
 func (r *Repository) ActiveEnrollmentIDs(ctx context.Context, q sqlite.Querier, campaignID uuid.UUID) ([]domain.Enrollment, error) {
+	// Scoped by account for the same reason EnrollmentsForReconcile is: a step
+	// enabled on this campaign must reach everybody still running in it,
+	// including somebody who unsubscribed from a different number entirely.
 	const query = `
 		SELECT cc.id, cc.contact_id, cc.run_number, cc.enrolled_at
 		FROM campaign_contacts cc
 		JOIN contacts c ON c.id = cc.contact_id
+		JOIN campaigns camp ON camp.id = cc.campaign_id
 		WHERE cc.campaign_id = $1
 		  AND cc.status = 'ACTIVE'
-		  AND NOT c.opted_out
-		  AND c.blocked_at IS NULL`
+		  AND c.blocked_at IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM contact_instance_optouts o
+			WHERE o.contact_id = cc.contact_id
+			  AND o.whatsapp_instance_id = COALESCE(camp.whatsapp_instance_id, 1)
+		  )`
 
 	rows, err := r.querier(q).Query(ctx, query, campaignID)
 	if err != nil {
@@ -952,7 +1055,8 @@ func (r *Repository) ActiveEnrollmentIDs(ctx context.Context, q sqlite.Querier, 
 
 func campaignScanDest(c *domain.Campaign) []any {
 	return []any{
-		&c.ID, &c.Name, &c.Description, &c.EventType, &c.EventStartAt, &c.Timezone,
+		&c.ID, &c.WhatsAppInstanceID, &c.WhatsAppInstanceName,
+		&c.Name, &c.Description, &c.EventType, &c.EventStartAt, &c.Timezone,
 		&c.WebinarLink, &c.IsDailyRecurring, &c.RecurrenceTime, &c.RecurrenceStartDate,
 		&c.Status, &c.ExistingContactBehavior, &c.ExistingContactTemplate,
 		&c.UnsubscribeKeywords, &c.CatchUpMissedSteps, &c.MaxSendAttempts,
@@ -977,20 +1081,28 @@ func (r *Repository) ActiveEnrollmentCount(ctx context.Context, q sqlite.Querier
 	return count, nil
 }
 
-func (r *Repository) UnsubscribeKeywordsFor(ctx context.Context, q sqlite.Querier, contactID uuid.UUID) ([]string, error) {
+// UnsubscribeKeywordsFor returns the stop words that are meaningful for this
+// contact on this account.
+//
+// Scoped by account for the same reason routing is: a word only counts as an
+// instruction if it was configured on the number the customer sent it to.
+// Otherwise a stop word invented for the second number's campaigns would
+// silently unsubscribe people from the first one's.
+func (r *Repository) UnsubscribeKeywordsFor(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, instanceID int64) ([]string, error) {
 	// unsubscribe_keywords is a JSON array; json_each expands it into rows the
 	// same way unnest did.
 	const query = `
 		SELECT DISTINCT keyword.value
 		FROM campaigns c, json_each(c.unsubscribe_keywords) AS keyword
 		WHERE c.archived_at IS NULL
+		  AND COALESCE(c.whatsapp_instance_id, 1) = $2
 		  AND (
 			c.status = 'ACTIVE'
 			OR EXISTS (SELECT 1 FROM campaign_contacts cc
 			           WHERE cc.campaign_id = c.id AND cc.contact_id = $1)
 		  )`
 
-	rows, err := r.querier(q).Query(ctx, query, contactID)
+	rows, err := r.querier(q).Query(ctx, query, contactID, instanceID)
 	if err != nil {
 		return nil, err
 	}

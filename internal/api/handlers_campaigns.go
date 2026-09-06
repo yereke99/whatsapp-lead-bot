@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,16 @@ func (s *Server) handleListCampaigns(w http.ResponseWriter, r *http.Request) {
 		Search:          httpx.QueryString(r, "search"),
 		Status:          strings.ToUpper(httpx.QueryString(r, "status")),
 		IncludeArchived: httpx.QueryBool(r, "include_archived"),
+	}
+	// Absent means every account, which is what the panel shows by default and
+	// what every caller written before multi-account support sends.
+	if raw := strings.TrimSpace(httpx.QueryString(r, "whatsapp_instance_id")); raw != "" {
+		id, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || id <= 0 {
+			httpx.Fail(w, http.StatusBadRequest, httpx.CodeValidation, "WhatsApp аккаунт идентификаторы жарамсыз")
+			return
+		}
+		filter.WhatsAppInstanceID = &id
 	}
 	if filter.Status != "" && !domain.ValidCampaignStatus(filter.Status) {
 		filter.Status = ""
@@ -58,13 +69,21 @@ func (s *Server) handleGetCampaign(w http.ResponseWriter, r *http.Request) {
 }
 
 type campaignRequest struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	EventType   string `json:"event_type"`
-	EventDate   string `json:"event_date"`
-	EventTime   string `json:"event_time"`
-	Timezone    string `json:"timezone"`
-	WebinarLink string `json:"webinar_link"`
+	// WhatsAppInstanceID is which number the campaign sends through. It is
+	// read on create and ignored on update: see handleUpdateCampaign.
+	//
+	// A pointer so that "not supplied" is distinguishable from "account 0". A
+	// request that omits it -- an older panel build, a script written before
+	// this existed -- creates the campaign on Primary, which is where every
+	// campaign lived until now.
+	WhatsAppInstanceID *int64 `json:"whatsapp_instance_id"`
+	Name               string `json:"name"`
+	Description        string `json:"description"`
+	EventType          string `json:"event_type"`
+	EventDate          string `json:"event_date"`
+	EventTime          string `json:"event_time"`
+	Timezone           string `json:"timezone"`
+	WebinarLink        string `json:"webinar_link"`
 	// The daily recurring webinar. When it is off the other two are ignored,
 	// and the campaign is scheduled from event_date/event_time exactly as
 	// before. When it is on, event_date is the day the series starts.
@@ -87,6 +106,7 @@ type campaignRequest struct {
 
 func (req campaignRequest) toInput() (campaigns.SaveInput, error) {
 	in := campaigns.SaveInput{
+		WhatsAppInstanceID:      req.WhatsAppInstanceID,
 		Name:                    req.Name,
 		Description:             req.Description,
 		EventType:               req.EventType,
@@ -139,6 +159,22 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.Fail(w, http.StatusBadRequest, httpx.CodeValidation, err.Error())
 		return
+	}
+
+	// The account has to exist and be switched on, or the campaign would be
+	// created holding a pointer to nothing and every message it queues would
+	// fail at send time with an error about an account nobody configured.
+	if in.WhatsAppInstanceID != nil {
+		ok, err := s.deps.Instances.Exists(r.Context(), nil, *in.WhatsAppInstanceID)
+		if err != nil {
+			httpx.Internal(w, s.log, err, "check whatsapp account")
+			return
+		}
+		if !ok {
+			httpx.Fail(w, http.StatusBadRequest, httpx.CodeValidation,
+				"Таңдалған WhatsApp аккаунты табылмады немесе өшірілген")
+			return
+		}
 	}
 
 	campaign, err := s.deps.Campaigns.Create(r.Context(), in, adminID(r))
@@ -194,6 +230,21 @@ func (s *Server) handleUpdateCampaign(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, http.StatusNotFound, httpx.CodeNotFound, "Кампания табылмады")
 		return
 	}
+
+	// A campaign's WhatsApp account is immutable. Its queued jobs, enrolments
+	// and triggers all resolve the sending number through it, so repointing it
+	// would send messages that are already scheduled -- to people who opted in
+	// on one number -- out through a different one, and would leave the
+	// triggers' uniqueness scoped to an account they no longer belong to. The
+	// request is refused rather than silently ignored, so an operator who
+	// thought they were moving a campaign finds out that they were not.
+	if req.WhatsAppInstanceID != nil &&
+		*req.WhatsAppInstanceID != domain.InstanceIDOrPrimary(before.WhatsAppInstanceID) {
+		httpx.Fail(w, http.StatusConflict, httpx.CodeConflict,
+			"Кампанияның WhatsApp аккаунтын өзгертуге болмайды. Басқа нөмір үшін жаңа кампания құрыңыз.")
+		return
+	}
+	in.WhatsAppInstanceID = before.WhatsAppInstanceID
 
 	result, err := s.deps.Campaigns.Update(r.Context(), id, in)
 	if err != nil {

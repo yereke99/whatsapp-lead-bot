@@ -198,7 +198,7 @@ func TestMigrationReplacesOldTrigger(t *testing.T) {
 	}
 
 	// The new phrase matches; the old word no longer does.
-	match, err := f.campaignSvc.MatchTrigger(ctx, nil, newTriggerKeyword)
+	match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, newTriggerKeyword)
 	if err != nil {
 		t.Fatalf("MatchTrigger: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestMigrationReplacesOldTrigger(t *testing.T) {
 	}
 
 	for _, text := range []string{oldTriggerKeyword, "айран", "Айран"} {
-		match, err := f.campaignSvc.MatchTrigger(ctx, nil, text)
+		match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, text)
 		if err != nil {
 			t.Fatalf("MatchTrigger(%q): %v", text, err)
 		}
@@ -221,7 +221,7 @@ func TestMigrationReplacesOldTrigger(t *testing.T) {
 
 	// Unrelated messages, including ones that mention the word, stay out.
 	for _, text := range []string{"Сәлем", "айран ішкім келеді", "қаймақ"} {
-		match, err := f.campaignSvc.MatchTrigger(ctx, nil, text)
+		match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, text)
 		if err != nil {
 			t.Fatalf("MatchTrigger(%q): %v", text, err)
 		}
@@ -338,7 +338,7 @@ func TestMigrationDeactivatesDuplicateOldTrigger(t *testing.T) {
 	if len(all) != 2 {
 		t.Errorf("%d trigger rows, want 2 — the old one is deactivated, not deleted", len(all))
 	}
-	if _, err := f.campaignSvc.MatchTrigger(ctx, nil, oldTriggerKeyword); err != nil {
+	if _, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, oldTriggerKeyword); err != nil {
 		t.Fatalf("MatchTrigger: %v", err)
 	}
 }
@@ -378,7 +378,7 @@ func TestMigrationPreservesEverythingElse(t *testing.T) {
 	// A contact goes through the funnel first, so there is real history to
 	// preserve: an enrolment, and a queue of scheduled messages.
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, oldTriggerKeyword)
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, oldTriggerKeyword)
 	if match == nil {
 		t.Fatal("the old trigger does not match before the migration")
 	}

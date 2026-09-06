@@ -216,6 +216,14 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		w.retryOrFail(ctx, job, 5, fmt.Errorf("load context: %w", err), log)
 		return
 	}
+	if jobCtx != nil {
+		// From here on every line about this job says which number it belongs
+		// to, so a message that did not arrive can be traced to an account
+		// from the log alone.
+		log = log.With(
+			slog.Int64("whatsapp_instance_id", jobCtx.CampaignInstanceID),
+			slog.String("instance", jobCtx.CampaignInstanceKey))
+	}
 	if jobCtx == nil {
 		// The campaign, step or contact was deleted after the job was queued.
 		if err := w.repo.Cancel(ctx, job.ID, "related records no longer exist"); err != nil {
@@ -397,7 +405,11 @@ func shouldSkip(jc *JobContext) (string, bool) {
 		return domain.SkipNotEligible, true
 	case jc.EnrollmentStatus != domain.EnrollmentActive:
 		return "enrollment is no longer active", true
-	case jc.ContactOptedOut:
+	// The unsubscribe that counts is the one given to *this job's* number.
+	// Reading the whole-person flag here would let a customer who left the
+	// other number's funnel silently cancel the messages they are still
+	// waiting for from this one.
+	case jc.ContactOptedOutHere:
 		return "contact unsubscribed", true
 	case jc.ContactBlocked:
 		return "contact is blocked", true
@@ -425,6 +437,11 @@ func (w *Worker) buildOutbound(jc *JobContext, spec *templates.SendSpec, job dom
 	body := render.Render(spec.Body, render.NewContext(ctxValues))
 
 	out := messaging.Outbound{
+		// Resolved from the campaign this job belongs to, on every attempt.
+		// This is what makes a retry -- including one picked up by a different
+		// process after a restart -- go out through the same number the first
+		// attempt would have used. There is no default sender to fall back to.
+		WhatsAppInstanceID: jc.CampaignInstanceID,
 		Type:               spec.Type,
 		Text:               body,
 		LinkPreview:        spec.LinkPreview,
@@ -539,14 +556,19 @@ func contactFromJob(jc *JobContext) *domain.Contact {
 	}
 
 	return &domain.Contact{
-		ID:             jc.Job.ContactID,
-		Phone:          jc.ContactPhone,
-		PhoneDisplay:   phone.Display(jc.ContactPhone),
-		ChatID:         jc.ContactChatID,
-		Name:           jc.ContactName,
-		PushName:       jc.ContactPushName,
-		Status:         jc.ContactStatus,
-		OptedOut:       jc.ContactOptedOut,
+		ID:           jc.Job.ContactID,
+		Phone:        jc.ContactPhone,
+		PhoneDisplay: phone.Display(jc.ContactPhone),
+		ChatID:       jc.ContactChatID,
+		Name:         jc.ContactName,
+		PushName:     jc.ContactPushName,
+		Status:       jc.ContactStatus,
+		// The account-scoped answer, not the whole-person flag. This object
+		// exists to send one message through one number, so the unsubscribe it
+		// should carry is the one given to that number. Handing over the
+		// whole-person flag would make the object read as "opted out" for
+		// somebody who only ever left the other number's funnel.
+		OptedOut:       jc.ContactOptedOutHere,
 		BlockedAt:      blockedAt,
 		FirstContactAt: jc.ContactConsentAt,
 	}

@@ -63,9 +63,14 @@ export async function renderSettings(root) {
 // ------------------------------------------------------------------ system --
 
 async function renderSystem(panel) {
-  const [settings, provider] = await Promise.all([
+  const [settings, provider, accounts] = await Promise.all([
     api.systemSettings(),
     api.providerState().catch(() => ({ configured: false, state: 'error' })),
+    // Every WhatsApp account and its live connection state. One account being
+    // unreachable is that account's problem: the list still renders, so an
+    // operator can see that the first number is authorised while the second
+    // one is not.
+    api.whatsappInstanceStates().catch(() => []),
   ]);
 
   const providerTone = provider.authorized ? 'success' : provider.configured ? 'warn' : 'neutral';
@@ -90,6 +95,7 @@ async function renderSystem(panel) {
                   el('div', {}, 'GREEN_API_INSTANCE_ID және GREEN_API_TOKEN ' +
                     'айнымалыларын енгізіп, серверді қайта іске қосыңыз.')))
             : null,
+          accountsBlock(accounts),
           el('div', { class: 'alert alert--info mt-3' },
             icon('link', 16),
             el('div', {},
@@ -444,4 +450,50 @@ async function renderAccount(panel) {
           saveButton),
       })),
   );
+}
+
+// accountsBlock lists every WhatsApp number this installation talks through.
+//
+// It shows a name, an optional phone label and a connection state, and nothing
+// else. Credentials are not part of the payload this renders and never reach
+// the browser: an account that is not connected is reported by naming the
+// environment variables the server expects, not by showing what is in them.
+function accountsBlock(accounts) {
+  if (!Array.isArray(accounts) || accounts.length === 0) return null;
+
+  const rows = accounts.map((account) => {
+    let tone = 'neutral';
+    let label = account.state || 'белгісіз';
+
+    if (!account.configured) {
+      tone = 'neutral';
+      label = 'Қосылмаған';
+    } else if (!account.enabled) {
+      tone = 'warn';
+      label = 'Өшірілген';
+    } else if (account.authorized) {
+      tone = 'success';
+      label = 'Авторизацияланған';
+    } else {
+      tone = 'warn';
+    }
+
+    return el('div', { class: 'row mt-2', style: { justifyContent: 'space-between', gap: '12px' } },
+      el('div', { style: { minWidth: '0' } },
+        el('div', {}, account.name || account.instance_key),
+        account.phone_label
+          ? el('div', { class: 'muted small' }, account.phone_label)
+          : el('div', { class: 'muted small mono' }, account.instance_key)),
+      badge(label, tone));
+  });
+
+  const notConnected = accounts.filter((a) => !a.configured);
+
+  return el('div', { class: 'mt-3' },
+    el('div', { class: 'label' }, 'WhatsApp аккаунттары'),
+    ...rows,
+    notConnected.length > 0
+      ? el('p', { class: 'muted small mt-2' },
+          'Қосылмаған аккаунттың кампаниялары мен деректері сақталады, тек жіберу мен қабылдау тоқтап тұрады.')
+      : null);
 }

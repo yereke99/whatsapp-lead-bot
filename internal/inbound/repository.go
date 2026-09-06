@@ -23,12 +23,19 @@ func NewRepository(db *sqlite.DB) *Repository { return &Repository{db: db} }
 
 // StoredEvent is a queued notification awaiting processing.
 type StoredEvent struct {
-	ID        uuid.UUID
-	Provider  string
-	EventType string
-	DedupeKey string
-	Payload   json.RawMessage
-	Attempts  int
+	ID uuid.UUID
+	// WhatsAppInstanceID is the account whose queue this notification came out
+	// of. It travels with the event all the way to trigger matching, so a
+	// message received on one number can never be answered as though it had
+	// arrived on the other -- including after a restart, when the event is
+	// picked up from the database by a worker that never saw the poller.
+	WhatsAppInstanceID int64
+	InstanceKey        string
+	Provider           string
+	EventType          string
+	DedupeKey          string
+	Payload            json.RawMessage
+	Attempts           int
 }
 
 // Insert records an event, returning false when it is a replay.
@@ -36,16 +43,25 @@ type StoredEvent struct {
 // The unique index on (provider, dedupe_key) is what makes webhook processing
 // idempotent: Green API retries deliveries, and a retried delivery must not
 // produce a second contact, a second message or a second campaign enrollment.
-func (r *Repository) Insert(ctx context.Context, provider, eventType, dedupeKey, externalID string, payload []byte, receivedAt time.Time) (uuid.UUID, bool, error) {
+//
+// With more than one account that index also has to be per-account, because a
+// Green API receipt id is only unique inside its own instance and because the
+// fallback key for an event without a message id is a hash of the payload --
+// and two accounts can genuinely produce byte-identical payloads, a state
+// change being the obvious one. Rather than rebuild the table to widen the
+// constraint, the caller namespaces dedupeKey with the account key before it
+// gets here, which makes the existing index per-account without touching a
+// single stored row. This column carries the same fact in queryable form.
+func (r *Repository) Insert(ctx context.Context, instanceID int64, provider, eventType, dedupeKey, externalID string, payload []byte, receivedAt time.Time) (uuid.UUID, bool, error) {
 	const query = `
-		INSERT INTO webhook_events (provider, event_type, dedupe_key, external_id, payload, received_at)
-		VALUES ($1,$2,$3,$4,$5,$6)
+		INSERT INTO webhook_events (provider, event_type, dedupe_key, external_id, payload, received_at, whatsapp_instance_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
 		ON CONFLICT (provider, dedupe_key) DO NOTHING
 		RETURNING id`
 
 	var id uuid.UUID
 	err := r.db.QueryRow(ctx, query,
-		provider, eventType, dedupeKey, externalID, payload, receivedAt).Scan(&id)
+		provider, eventType, dedupeKey, externalID, payload, receivedAt, instanceID).Scan(&id)
 
 	if err != nil {
 		if sqlite.IsNoRows(err) {
@@ -74,7 +90,8 @@ func (r *Repository) Claim(ctx context.Context, limit int) ([]StoredEvent, error
 			LIMIT $1
 		) queued
 		WHERE we.id = queued.id
-		RETURNING id, provider, event_type, dedupe_key, payload, attempts`
+		RETURNING id, provider, event_type, dedupe_key, payload, attempts,
+		          COALESCE(whatsapp_instance_id, 1)`
 
 	rows, err := r.db.Query(ctx, query, limit)
 	if err != nil {
@@ -85,7 +102,8 @@ func (r *Repository) Claim(ctx context.Context, limit int) ([]StoredEvent, error
 	var out []StoredEvent
 	for rows.Next() {
 		var e StoredEvent
-		if err := rows.Scan(&e.ID, &e.Provider, &e.EventType, &e.DedupeKey, &e.Payload, &e.Attempts); err != nil {
+		if err := rows.Scan(&e.ID, &e.Provider, &e.EventType, &e.DedupeKey, &e.Payload,
+			&e.Attempts, &e.WhatsAppInstanceID); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

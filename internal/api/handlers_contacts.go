@@ -250,12 +250,25 @@ func (s *Server) handleUnsubscribeContact(w http.ResponseWriter, r *http.Request
 		httpx.Internal(w, s.log, err, "set opt out")
 		return
 	}
+
+	// An administrator unsubscribing somebody is a decision about the person,
+	// not about one of the installation's numbers, so it is mirrored onto
+	// every account. That is also what keeps the whole-person flag and the
+	// per-account rows in agreement on an installation running one number.
 	if req.OptedOut {
+		if err := s.deps.Contacts.OptOutEverywhere(r.Context(), nil, id,
+			"unsubscribed by an administrator"); err != nil {
+			httpx.Internal(w, s.log, err, "set opt out")
+			return
+		}
 		if err := s.deps.Campaigns.StopForContact(r.Context(), id,
 			domain.EnrollmentUnsubscribed, "unsubscribed by administrator"); err != nil {
 			httpx.Internal(w, s.log, err, "stop enrollments")
 			return
 		}
+	} else if err := s.deps.Contacts.ResubscribeEverywhere(r.Context(), nil, id); err != nil {
+		httpx.Internal(w, s.log, err, "clear opt out")
+		return
 	}
 
 	action := audit.ActionContactResubscribed
@@ -325,6 +338,9 @@ func (s *Server) handleBulkAction(w http.ResponseWriter, r *http.Request) {
 		affected, err = s.deps.Contacts.BulkSetOptOut(r.Context(), ids, true)
 		summary = "Топтық жазылымнан шығару"
 		if err == nil {
+			if optErr := s.deps.Contacts.BulkSetOptOutEverywhere(r.Context(), ids, true); optErr != nil {
+				s.log.Warn("bulk unsubscribe: recording per-account opt-out failed", "error", optErr)
+			}
 			for _, id := range ids {
 				if stopErr := s.deps.Campaigns.StopForContact(r.Context(), id,
 					domain.EnrollmentUnsubscribed, "bulk unsubscribe"); stopErr != nil {
@@ -337,6 +353,11 @@ func (s *Server) handleBulkAction(w http.ResponseWriter, r *http.Request) {
 	case "resubscribe":
 		affected, err = s.deps.Contacts.BulkSetOptOut(r.Context(), ids, false)
 		summary = "Топтық жазылымды қалпына келтіру"
+		if err == nil {
+			if optErr := s.deps.Contacts.BulkSetOptOutEverywhere(r.Context(), ids, false); optErr != nil {
+				s.log.Warn("bulk resubscribe: clearing per-account opt-out failed", "error", optErr)
+			}
+		}
 
 	case "block":
 		affected, err = s.deps.Contacts.BulkSetBlocked(r.Context(), ids, true)

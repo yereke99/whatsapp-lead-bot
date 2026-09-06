@@ -65,17 +65,24 @@ func (f *fakeClient) deletedIDs() []int64 {
 
 // fakeIngester records bodies and can be told to fail.
 type fakeIngester struct {
-	mu       sync.Mutex
-	bodies   [][]byte
-	err      error
-	accepted bool
+	mu     sync.Mutex
+	bodies [][]byte
+	// instanceIDs records the account each body was ingested under, so a test
+	// can assert that a poller stamps its own identity on what it reads and
+	// never another account's.
+	instanceIDs []int64
+	keys        []string
+	err         error
+	accepted    bool
 }
 
-func (f *fakeIngester) Ingest(ctx context.Context, body []byte) (bool, error) {
+func (f *fakeIngester) Ingest(ctx context.Context, instanceID int64, instanceKey string, body []byte) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.bodies = append(f.bodies, body)
+	f.instanceIDs = append(f.instanceIDs, instanceID)
+	f.keys = append(f.keys, instanceKey)
 	return f.accepted, f.err
 }
 
@@ -138,7 +145,7 @@ func TestReceiverDeletesAfterSuccessfulIngest(t *testing.T) {
 	client := &fakeClient{queue: []*greenapi.Notification{notification(11, "A"), notification(12, "B")}}
 	processor := &fakeIngester{accepted: true}
 
-	receiver := NewReceiver(client, processor, testConfig(), discardLogger())
+	receiver := NewReceiver(1, "primary", client, processor, testConfig(), discardLogger())
 	runUntil(t, receiver, func() bool { return len(client.deletedIDs()) == 2 })
 
 	if got := client.deletedIDs(); got[0] != 11 || got[1] != 12 {
@@ -156,7 +163,7 @@ func TestReceiverKeepsNotificationWhenIngestFails(t *testing.T) {
 	client := &fakeClient{queue: []*greenapi.Notification{notification(21, "A")}}
 	processor := &fakeIngester{err: errors.New("database is locked")}
 
-	receiver := NewReceiver(client, processor, testConfig(), discardLogger())
+	receiver := NewReceiver(1, "primary", client, processor, testConfig(), discardLogger())
 	runUntil(t, receiver, func() bool { return processor.count() >= 1 })
 
 	if deleted := client.deletedIDs(); len(deleted) != 0 {
@@ -170,7 +177,7 @@ func TestReceiverDeletesDuplicates(t *testing.T) {
 	client := &fakeClient{queue: []*greenapi.Notification{notification(31, "A")}}
 	processor := &fakeIngester{accepted: false} // already seen
 
-	receiver := NewReceiver(client, processor, testConfig(), discardLogger())
+	receiver := NewReceiver(1, "primary", client, processor, testConfig(), discardLogger())
 	runUntil(t, receiver, func() bool { return len(client.deletedIDs()) == 1 })
 }
 
@@ -180,7 +187,7 @@ func TestReceiverDropsUnparseableNotification(t *testing.T) {
 	client := &fakeClient{queue: []*greenapi.Notification{{ReceiptID: 41, Body: []byte(`{`)}}}
 	processor := &fakeIngester{err: &greenapi.ParseError{Err: errors.New("bad json")}}
 
-	receiver := NewReceiver(client, processor, testConfig(), discardLogger())
+	receiver := NewReceiver(1, "primary", client, processor, testConfig(), discardLogger())
 	runUntil(t, receiver, func() bool { return len(client.deletedIDs()) == 1 })
 
 	if got := client.deletedIDs(); got[0] != 41 {
@@ -197,7 +204,7 @@ func TestReceiverRecoversFromProviderErrors(t *testing.T) {
 	processor := &fakeIngester{accepted: true}
 
 	cfg := testConfig()
-	receiver := NewReceiver(client, processor, cfg, discardLogger())
+	receiver := NewReceiver(1, "primary", client, processor, cfg, discardLogger())
 	receiver.backoffFloor = time.Millisecond // keep the test quick
 
 	runUntil(t, receiver, func() bool { return len(client.deletedIDs()) == 1 })
@@ -208,7 +215,7 @@ func TestReceiverHandlesEmptyQueue(t *testing.T) {
 	client := &fakeClient{}
 	processor := &fakeIngester{accepted: true}
 
-	receiver := NewReceiver(client, processor, testConfig(), discardLogger())
+	receiver := NewReceiver(1, "primary", client, processor, testConfig(), discardLogger())
 	runUntil(t, receiver, func() bool {
 		client.mu.Lock()
 		defer client.mu.Unlock()
@@ -222,7 +229,7 @@ func TestReceiverHandlesEmptyQueue(t *testing.T) {
 
 func TestReceiverStopsOnContextCancellation(t *testing.T) {
 	client := &fakeClient{}
-	receiver := NewReceiver(client, &fakeIngester{}, testConfig(), discardLogger())
+	receiver := NewReceiver(1, "primary", client, &fakeIngester{}, testConfig(), discardLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

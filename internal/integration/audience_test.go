@@ -34,7 +34,7 @@ func enrollAt(t *testing.T, f *fixture, campaignID uuid.UUID, phone string, join
 	ctx := context.Background()
 
 	contact := f.createContact(t, phone)
-	match, err := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if err != nil || match == nil {
 		t.Fatalf("MatchTrigger: %v (match=%v)", err, match)
 	}
@@ -257,7 +257,7 @@ func TestAudienceFilterIgnoresLaterMessages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)
 	}
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}

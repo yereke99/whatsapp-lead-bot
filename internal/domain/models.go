@@ -120,12 +120,29 @@ func (c *Contact) DisplayName() string {
 
 // CanReceiveMessages reports whether the platform is permitted to send to this
 // contact. Consent requires an inbound message: the platform never initiates.
+//
+// This is the whole-person view and it stays the one the admin panel uses. The
+// send path uses CanBeContacted plus the per-account opt-out instead, because
+// "stop writing to me" said to one of the installation's numbers is an
+// instruction about that number, not about the person -- see
+// contact_instance_optouts in migration 0007.
 func (c *Contact) CanReceiveMessages() bool {
-	return c.FirstContactAt != nil &&
+	return c.CanBeContacted() &&
 		!c.OptedOut &&
-		c.BlockedAt == nil &&
-		c.Status != ContactBlocked &&
 		c.Status != ContactUnsubscribed
+}
+
+// CanBeContacted reports the account-independent half of the consent rule:
+// they wrote to us first, and nobody has blocked them.
+//
+// Blocking stays global on purpose. An operator blocking a contact is a
+// statement about the person -- abuse, a wrong number, a request to be removed
+// entirely -- and it must hold on every number the installation owns. Only the
+// unsubscribe keyword is scoped to the account that received it.
+func (c *Contact) CanBeContacted() bool {
+	return c.FirstContactAt != nil &&
+		c.BlockedAt == nil &&
+		c.Status != ContactBlocked
 }
 
 type Tag struct {
@@ -200,13 +217,25 @@ func ValidResumePolicy(s string) bool {
 }
 
 type Campaign struct {
-	ID           uuid.UUID  `json:"id"`
-	Name         string     `json:"name"`
-	Description  string     `json:"description"`
-	EventType    string     `json:"event_type"`
-	EventStartAt *time.Time `json:"event_start_at"`
-	Timezone     string     `json:"timezone"`
-	WebinarLink  string     `json:"webinar_link"`
+	ID uuid.UUID `json:"id"`
+	// WhatsAppInstanceID is the account this campaign sends through, and the
+	// only place that answer is stored. Its triggers, steps, enrolments,
+	// queued jobs and retries all derive the account from here, which is why
+	// it is immutable once the campaign exists: moving it would repoint
+	// messages that are already queued at a different number.
+	//
+	// A pointer because the column is nullable for rows that predate
+	// migration 0007; read it through domain.InstanceIDOrPrimary.
+	WhatsAppInstanceID *int64 `json:"whatsapp_instance_id"`
+	// WhatsAppInstanceName is filled in by list and detail queries so the
+	// panel can label a campaign with its number. Never stored.
+	WhatsAppInstanceName string     `json:"whatsapp_instance_name,omitempty"`
+	Name                 string     `json:"name"`
+	Description          string     `json:"description"`
+	EventType            string     `json:"event_type"`
+	EventStartAt         *time.Time `json:"event_start_at"`
+	Timezone             string     `json:"timezone"`
+	WebinarLink          string     `json:"webinar_link"`
 	// IsDailyRecurring makes the webinar happen every day at RecurrenceTime in
 	// Timezone, instead of once at EventStartAt. It changes one thing only:
 	// which instant a contact's RELATIVE_TO_EVENT steps are measured from. Off
@@ -259,15 +288,21 @@ func (c *Campaign) AcceptsEnrollments() bool {
 }
 
 type CampaignTrigger struct {
-	ID          uuid.UUID `json:"id"`
-	CampaignID  uuid.UUID `json:"campaign_id"`
-	Keyword     string    `json:"keyword"`
-	Normalized  string    `json:"normalized_keyword"`
-	MatchMode   string    `json:"match_mode"`
-	IsActive    bool      `json:"is_active"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	CampaignRef string    `json:"campaign_name,omitempty"`
+	ID         uuid.UUID `json:"id"`
+	CampaignID uuid.UUID `json:"campaign_id"`
+	// WhatsAppInstanceID mirrors the owning campaign's account. It is a copy,
+	// kept only because a partial UNIQUE index cannot read a column through a
+	// foreign key, and it is what lets the same keyword mean different things
+	// on two different numbers. Written from the campaign at insert time; a
+	// campaign's account never changes, so the copy cannot drift.
+	WhatsAppInstanceID *int64    `json:"whatsapp_instance_id"`
+	Keyword            string    `json:"keyword"`
+	Normalized         string    `json:"normalized_keyword"`
+	MatchMode          string    `json:"match_mode"`
+	IsActive           bool      `json:"is_active"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+	CampaignRef        string    `json:"campaign_name,omitempty"`
 }
 
 // ScheduleKind selects which anchor a step's offset is measured from.
@@ -471,8 +506,12 @@ const (
 )
 
 type Message struct {
-	ID                 uuid.UUID     `json:"id"`
-	ContactID          uuid.UUID     `json:"contact_id"`
+	ID        uuid.UUID `json:"id"`
+	ContactID uuid.UUID `json:"contact_id"`
+	// WhatsAppInstanceID is the number this message went through. It is
+	// recorded for traceability and for the conversation view; routing is
+	// decided by the campaign, never by this column.
+	WhatsAppInstanceID *int64        `json:"whatsapp_instance_id"`
 	CampaignID         *uuid.UUID    `json:"campaign_id"`
 	EnrollmentID       *uuid.UUID    `json:"enrollment_id"`
 	CampaignStepID     *uuid.UUID    `json:"campaign_step_id"`

@@ -27,7 +27,7 @@ func TestEnrollmentCreatesFullSchedule(t *testing.T) {
 
 	contact := f.createContact(t, "77011234567")
 
-	match, err := f.campaignSvc.MatchTrigger(ctx, nil, "  АЙРАН  ")
+	match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "  АЙРАН  ")
 	if err != nil {
 		t.Fatalf("MatchTrigger: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestDuplicateTriggerDoesNotDuplicateJobs(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 
 	for i := 0; i < 3; i++ {
 		if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
@@ -100,7 +100,7 @@ func TestConcurrentTriggersEnrollOnce(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 
 	var wg sync.WaitGroup
 	errs := make([]error, 8)
@@ -151,7 +151,7 @@ func TestClaimIsExclusive(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	// Enrol twenty contacts so there is a real batch to fight over.
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	for i := 0; i < 20; i++ {
 		contact := f.createContact(t, formatPhone(i))
 		if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
@@ -207,7 +207,7 @@ func TestReleaseStaleRequeuesOrphanedJobs(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func TestRescheduleOnlyMovesPendingJobs(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -344,12 +344,12 @@ func TestUnsubscribeCancelsPendingJobs(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
-	isStop, err := f.campaignSvc.IsUnsubscribe(ctx, nil, contact.ID, "ТОҚТАТУ")
+	isStop, err := f.campaignSvc.IsUnsubscribe(ctx, nil, contact.ID, primaryInstance, "ТОҚТАТУ")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestCompleteFinishedEnrollments(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +436,7 @@ func TestUniqueConstraintBlocksDuplicateStepDelivery(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}

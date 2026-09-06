@@ -46,6 +46,12 @@ export async function renderCampaignDetail(root, { params, navigate }) {
           el('div', { class: 'row' },
             el('h1', {}, campaign.name),
             badge(status.label, status.tone),
+            // Which number this campaign sends through. Shown here as well as
+            // on the list so an operator about to activate or edit a campaign
+            // can see the phone it will speak from.
+            campaign.whatsapp_instance_name
+              ? badge(campaign.whatsapp_instance_name, 'info')
+              : null,
             campaign.is_daily_recurring ? badge('Күн сайын', 'info') : null),
           el('p', { class: 'page-head__desc' }, scheduleSummary()))),
       el('div', { class: 'page-head__actions' },

@@ -37,6 +37,12 @@ var (
 
 // Outbound describes one message to deliver.
 type Outbound struct {
+	// WhatsAppInstanceID names the account this message leaves through, and it
+	// is required. There is no default: a zero here resolves to Primary only
+	// through domain.InstanceIDOrPrimary, and every caller inside the platform
+	// sets it explicitly from the campaign that owns the message.
+	WhatsAppInstanceID int64
+
 	Type        domain.TemplateType
 	Text        string
 	LinkPreview bool
@@ -57,8 +63,19 @@ type Outbound struct {
 	AdminID  *uuid.UUID
 }
 
+// ProviderRegistry resolves an account id to the transport bound to that
+// account's credentials.
+//
+// Sender depends on this rather than on a provider so that no send path can
+// hold a client for one number and use it for another: the client is looked up
+// per message, from the id the message itself carries. An unknown, disabled or
+// unconfigured account returns an error, never a different account's client.
+type ProviderRegistry interface {
+	ProviderFor(instanceID int64) (whatsapp.Provider, error)
+}
+
 type Sender struct {
-	provider   whatsapp.Provider
+	providers  ProviderRegistry
 	messages   *conversations.Repository
 	contacts   *contacts.Repository
 	mediaStore *media.Store
@@ -66,14 +83,14 @@ type Sender struct {
 }
 
 func NewSender(
-	provider whatsapp.Provider,
+	providers ProviderRegistry,
 	messages *conversations.Repository,
 	contactRepo *contacts.Repository,
 	mediaStore *media.Store,
 	log *slog.Logger,
 ) *Sender {
 	return &Sender{
-		provider:   provider,
+		providers:  providers,
 		messages:   messages,
 		contacts:   contactRepo,
 		mediaStore: mediaStore,
@@ -95,7 +112,18 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 	if contact == nil {
 		return nil, errors.New("contact is required")
 	}
-	if err := s.checkConsent(contact); err != nil {
+
+	instanceID := domain.InstanceIDOrPrimary(&out.WhatsAppInstanceID)
+
+	// Resolve the transport before anything is written. A message that cannot
+	// leave through the account it belongs to must not be recorded as pending
+	// and must never be retried through another account.
+	provider, err := s.providers.ProviderFor(instanceID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.checkConsent(ctx, contact, instanceID); err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(contact.ChatID) == "" {
@@ -109,6 +137,7 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 
 	record := &domain.Message{
 		ContactID:          contact.ID,
+		WhatsAppInstanceID: &instanceID,
 		CampaignID:         out.CampaignID,
 		EnrollmentID:       out.EnrollmentID,
 		CampaignStepID:     out.CampaignStepID,
@@ -130,7 +159,7 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 		return nil, fmt.Errorf("record outgoing message: %w", err)
 	}
 
-	result, sendErr := s.deliver(ctx, contact.ChatID, out)
+	result, sendErr := s.deliver(ctx, provider, contact.ChatID, out)
 	if sendErr != nil {
 		if markErr := s.messages.MarkFailed(ctx, nil, record.ID, sendErr.Error()); markErr != nil {
 			s.log.Error("could not mark message failed",
@@ -164,6 +193,7 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 	}
 
 	s.log.Info("message sent",
+		slog.Int64("whatsapp_instance_id", instanceID),
 		slog.String("contact_id", contact.ID.String()),
 		slog.String("type", string(msgType)),
 		slog.String("external_id", result.ExternalID),
@@ -173,40 +203,64 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 }
 
 // checkConsent is the single gate protecting the "never message first" rule.
-func (s *Sender) checkConsent(contact *domain.Contact) error {
-	if contact.FirstContactAt == nil {
-		return ErrNoConsent
+//
+// Two halves, and they have different scopes on purpose:
+//
+//   - having written to us first, and not being blocked, are facts about the
+//     person. They hold on every number the installation owns.
+//   - having unsubscribed is an instruction given to one number. Somebody who
+//     sent STOP to the second number is still waiting for the first number's
+//     messages, and stopping those would be the platform deciding something
+//     the customer did not ask for.
+//
+// The per-account lookup is a primary-key read on a table with one row per
+// unsubscribe, and sends are paced seconds apart, so asking every time costs
+// nothing and removes any chance of a stale copy being carried into a retry.
+func (s *Sender) checkConsent(ctx context.Context, contact *domain.Contact, instanceID int64) error {
+	if !contact.CanBeContacted() {
+		if contact.FirstContactAt == nil {
+			return ErrNoConsent
+		}
+		return ErrOptedOut
 	}
-	if contact.OptedOut || contact.BlockedAt != nil ||
-		contact.Status == domain.ContactUnsubscribed || contact.Status == domain.ContactBlocked {
+
+	optedOut, err := s.contacts.IsOptedOutOn(ctx, nil, instanceID, contact.ID)
+	if err != nil {
+		return fmt.Errorf("check unsubscribe state: %w", err)
+	}
+	if optedOut {
 		return ErrOptedOut
 	}
 	return nil
 }
 
-func (s *Sender) deliver(ctx context.Context, chatID string, out Outbound) (*whatsapp.SendResult, error) {
+// deliver hands the message to the account's own client. The provider is
+// passed in rather than read from the Sender, which is what makes it
+// impossible for two accounts sending concurrently to reach each other's
+// credentials.
+func (s *Sender) deliver(ctx context.Context, provider whatsapp.Provider, chatID string, out Outbound) (*whatsapp.SendResult, error) {
 	switch out.Type {
 	case domain.TemplateText:
-		return s.provider.SendText(ctx, whatsapp.TextMessage{
+		return provider.SendText(ctx, whatsapp.TextMessage{
 			ChatID:      chatID,
 			Text:        out.Text,
 			LinkPreview: out.LinkPreview,
 		})
 
 	case domain.TemplateImage, domain.TemplateImageWithCaption:
-		return s.provider.SendImage(ctx, s.mediaMessage(chatID, whatsapp.MediaImage, out))
+		return provider.SendImage(ctx, s.mediaMessage(chatID, whatsapp.MediaImage, out))
 
 	case domain.TemplateVideo, domain.TemplateVideoWithCaption:
-		return s.provider.SendVideo(ctx, s.mediaMessage(chatID, whatsapp.MediaVideo, out))
+		return provider.SendVideo(ctx, s.mediaMessage(chatID, whatsapp.MediaVideo, out))
 
 	case domain.TemplateAudio:
-		return s.provider.SendAudio(ctx, s.mediaMessage(chatID, whatsapp.MediaAudio, out))
+		return provider.SendAudio(ctx, s.mediaMessage(chatID, whatsapp.MediaAudio, out))
 
 	case domain.TemplateVoice:
-		return s.provider.SendVoice(ctx, s.mediaMessage(chatID, whatsapp.MediaVoice, out))
+		return provider.SendVoice(ctx, s.mediaMessage(chatID, whatsapp.MediaVoice, out))
 
 	case domain.TemplateDocument:
-		return s.provider.SendDocument(ctx, s.mediaMessage(chatID, whatsapp.MediaDocument, out))
+		return provider.SendDocument(ctx, s.mediaMessage(chatID, whatsapp.MediaDocument, out))
 
 	default:
 		return nil, fmt.Errorf("unsupported message type %q", out.Type)

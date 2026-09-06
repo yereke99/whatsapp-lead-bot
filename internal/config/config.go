@@ -10,15 +10,56 @@ import (
 )
 
 type Config struct {
-	App       App
-	HTTP      HTTP
-	Database  Database
-	Auth      Auth
+	App      App
+	HTTP     HTTP
+	Database Database
+	Auth     Auth
+	// GreenAPI and Outbound are the Primary account's settings, read from the
+	// variables this service has always used. They are kept as their own
+	// fields rather than folded into Instances because everything that is not
+	// about a specific account -- the admin panel's provider check, the
+	// documented defaults, the existing deployment -- refers to them.
 	GreenAPI  GreenAPI
 	Media     Media
 	Scheduler Scheduler
 	Outbound  Outbound
+
+	// Instances is every WhatsApp account this process should serve, Primary
+	// first. It always holds at least the Primary entry, even when no
+	// credentials are configured for it, so that startup can report the
+	// account as present-but-not-connected rather than missing.
+	Instances []WhatsAppInstance
 }
+
+// WhatsAppInstance is one account's runtime configuration: which Green API
+// instance backs it, and how fast it is allowed to send.
+//
+// Each account gets its own immutable copy. Nothing in the process mutates a
+// live client's credentials, and no two accounts share a rate limiter, so a
+// burst on one number cannot delay the other and a misconfigured second
+// account cannot corrupt the first one's requests.
+type WhatsAppInstance struct {
+	// ID matches whatsapp_instances.id in the database; Key matches
+	// whatsapp_instances.instance_key and is what the two are joined on.
+	ID  int64
+	Key string
+	// Name and PhoneLabel are display-only, shown in logs and in the panel.
+	Name       string
+	PhoneLabel string
+	// Enabled switches an account off without removing anything it owns: no
+	// poller, no new sends, all of its data left exactly where it is.
+	Enabled  bool
+	GreenAPI GreenAPI
+	Outbound Outbound
+}
+
+// Configured reports whether credentials are present for this account.
+func (i WhatsAppInstance) Configured() bool {
+	return strings.TrimSpace(i.GreenAPI.InstanceID) != "" && strings.TrimSpace(i.GreenAPI.Token) != ""
+}
+
+// Active reports whether the process should poll and send for this account.
+func (i WhatsAppInstance) Active() bool { return i.Enabled && i.Configured() }
 
 type App struct {
 	Env             string
@@ -236,10 +277,129 @@ func Load() (*Config, error) {
 		},
 	}
 
+	instances, err := loadInstances(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Instances = instances
+
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// maxInstances bounds how many accounts the environment may describe. It
+// exists so a typo in a variable name cannot make startup scan forever, and it
+// is deliberately generous: adding a third or fourth number needs no code
+// change, only another block of _3 / _4 variables.
+const maxInstances = 8
+
+// instanceDefaults describes the accounts the database bootstraps in migration
+// 0007. Slot 1 is the account this installation has always used, and its
+// variables carry no suffix so an existing .env keeps working untouched.
+var instanceDefaults = []struct {
+	id   int64
+	key  string
+	name string
+}{
+	{1, "primary", "Primary WhatsApp"},
+	{2, "secondary", "Secondary WhatsApp"},
+}
+
+// loadInstances reads one configuration block per account.
+//
+// Slot 1 reads GREEN_API_INSTANCE_ID / GREEN_API_TOKEN / WHATSAPP_MIN_SEND_DELAY_MS
+// and so on. Every further slot reads the same names with an _N suffix:
+// GREEN_API_INSTANCE_ID_2, WHATSAPP_MIN_SEND_DELAY_MS_2, and so on. Anything a
+// slot does not set falls back to the Primary value, so a second number needs
+// two variables in practice and can override the rest when its pacing should
+// differ.
+//
+// Validation, per account beyond the first:
+//
+//	both id and token set    -> the account is configured and will run
+//	neither set              -> the account is not configured; the process
+//	                            starts without it and its stored data is left
+//	                            untouched
+//	exactly one of the two   -> a configuration error, refused at startup
+//
+// The last case is the one worth being strict about: half a credential pair is
+// always a mistake, and starting anyway would leave an account that looks
+// present in the panel and silently never sends.
+func loadInstances(cfg *Config) ([]WhatsAppInstance, error) {
+	var out []WhatsAppInstance
+
+	for slot := 1; slot <= maxInstances; slot++ {
+		suffix := suffixFor(slot)
+
+		id := envStr("GREEN_API_INSTANCE_ID"+suffix, "")
+		token := envStr("GREEN_API_TOKEN"+suffix, "")
+
+		if slot > 1 {
+			switch {
+			case id == "" && token == "":
+				// Not configured. Keep scanning: an operator may have set up
+				// slot 3 and left slot 2 for later.
+				continue
+			case id == "" || token == "":
+				return nil, fmt.Errorf(
+					"invalid configuration:\n  - GREEN_API_INSTANCE_ID%s and GREEN_API_TOKEN%s must be set together (one of them is missing)",
+					suffix, suffix)
+			}
+		}
+
+		def := struct {
+			id   int64
+			key  string
+			name string
+		}{int64(slot), fmt.Sprintf("instance_%d", slot), fmt.Sprintf("WhatsApp #%d", slot)}
+		if slot <= len(instanceDefaults) {
+			def = instanceDefaults[slot-1]
+		}
+
+		inst := WhatsAppInstance{
+			ID:         def.id,
+			Key:        envStr("WHATSAPP_INSTANCE_KEY"+suffix, def.key),
+			Name:       envStr("WHATSAPP_INSTANCE_NAME"+suffix, def.name),
+			PhoneLabel: envStr("WHATSAPP_INSTANCE_PHONE"+suffix, ""),
+			Enabled:    envBool("WHATSAPP_INSTANCE_ENABLED"+suffix, true),
+			GreenAPI: GreenAPI{
+				InstanceID: id,
+				Token:      token,
+				// The endpoints, timeouts and pacing default to Primary's, so a
+				// second account on the same Green API region needs nothing but
+				// its credentials.
+				BaseURL:        strings.TrimRight(envStr("GREEN_API_URL"+suffix, cfg.GreenAPI.BaseURL), "/"),
+				MediaURL:       strings.TrimRight(envStr("GREEN_API_MEDIA_URL"+suffix, cfg.GreenAPI.MediaURL), "/"),
+				Timeout:        envDuration("GREEN_API_TIMEOUT"+suffix, cfg.GreenAPI.Timeout),
+				RateInterval:   envDuration("GREEN_API_RATE_INTERVAL"+suffix, cfg.GreenAPI.RateInterval),
+				ReceiveTimeout: envDuration("GREEN_API_RECEIVE_TIMEOUT"+suffix, cfg.GreenAPI.ReceiveTimeout),
+				PollInterval: time.Duration(envInt("GREEN_API_POLL_INTERVAL_MS"+suffix,
+					int(cfg.GreenAPI.PollInterval/time.Millisecond))) * time.Millisecond,
+			},
+			Outbound: Outbound{
+				Workers: envInt("WHATSAPP_SEND_WORKERS"+suffix, cfg.Outbound.Workers),
+				MinDelay: time.Duration(envInt("WHATSAPP_MIN_SEND_DELAY_MS"+suffix,
+					int(cfg.Outbound.MinDelay/time.Millisecond))) * time.Millisecond,
+				MaxDelay: time.Duration(envInt("WHATSAPP_MAX_SEND_DELAY_MS"+suffix,
+					int(cfg.Outbound.MaxDelay/time.Millisecond))) * time.Millisecond,
+			},
+		}
+
+		if slot == 1 {
+			// Primary's settings are the ones validate() already checks and the
+			// ones the panel reports, so they are taken verbatim rather than
+			// re-read. This keeps exactly one source of truth for the account
+			// that is already in production.
+			inst.GreenAPI = cfg.GreenAPI
+			inst.Outbound = cfg.Outbound
+		}
+
+		out = append(out, inst)
+	}
+
+	return out, nil
 }
 
 func (c *Config) validate() error {
@@ -296,6 +456,53 @@ func (c *Config) validate() error {
 		problems = append(problems, "SECURE_COOKIES must be true when APP_ENV=production")
 	}
 
+	// Additional accounts get the same limits as Primary. They are checked
+	// separately, and named by their suffix, so a bad value in the second
+	// block cannot be mistaken for a problem with the first: the account
+	// already in production must never be blamed for a newcomer's typo.
+	for i, inst := range c.Instances {
+		if i == 0 {
+			continue // Primary is covered by the checks above.
+		}
+		suffix := fmt.Sprintf("_%d", i+1)
+
+		if inst.Outbound.Workers < 1 || inst.Outbound.Workers > 4 {
+			problems = append(problems, "WHATSAPP_SEND_WORKERS"+suffix+" must be between 1 and 4; prefer 1 for a single account")
+		}
+		if inst.Outbound.MinDelay < time.Second {
+			problems = append(problems, "WHATSAPP_MIN_SEND_DELAY_MS"+suffix+" must be at least 1000")
+		}
+		if inst.Outbound.MaxDelay < inst.Outbound.MinDelay {
+			problems = append(problems, "WHATSAPP_MAX_SEND_DELAY_MS"+suffix+" must be greater than or equal to WHATSAPP_MIN_SEND_DELAY_MS"+suffix)
+		}
+		if inst.GreenAPI.Timeout <= inst.GreenAPI.ReceiveTimeout {
+			problems = append(problems, fmt.Sprintf(
+				"GREEN_API_TIMEOUT%s (%s) must be greater than GREEN_API_RECEIVE_TIMEOUT%s (%s)",
+				suffix, inst.GreenAPI.Timeout, suffix, inst.GreenAPI.ReceiveTimeout))
+		}
+		if strings.TrimSpace(inst.Key) == "" {
+			problems = append(problems, "WHATSAPP_INSTANCE_KEY"+suffix+" must not be blank")
+		}
+	}
+
+	// Two accounts pointing at the same Green API instance would poll the same
+	// queue and steal each other's notifications, which looks exactly like
+	// messages going missing at random. It is always a copy-paste mistake.
+	seen := map[string]int{}
+	for i, inst := range c.Instances {
+		id := strings.TrimSpace(inst.GreenAPI.InstanceID)
+		if id == "" {
+			continue
+		}
+		if prev, dup := seen[id]; dup {
+			problems = append(problems, fmt.Sprintf(
+				"GREEN_API_INSTANCE_ID%s repeats the value used by slot %d; each WhatsApp account needs its own Green API instance",
+				suffixFor(i+1), prev+1))
+			continue
+		}
+		seen[id] = i
+	}
+
 	if len(problems) > 0 {
 		return fmt.Errorf("invalid configuration:\n  - %s", strings.Join(problems, "\n  - "))
 	}
@@ -304,10 +511,40 @@ func (c *Config) validate() error {
 
 func (c *Config) IsProduction() bool { return c.App.Env == "production" }
 
-// WhatsAppConfigured reports whether outbound Green API calls can be attempted.
-// The platform still boots without credentials so the admin panel stays usable.
+// WhatsAppConfigured reports whether outbound Green API calls can be attempted
+// on the Primary account. The platform still boots without credentials so the
+// admin panel stays usable.
 func (c *Config) WhatsAppConfigured() bool {
 	return c.GreenAPI.InstanceID != "" && c.GreenAPI.Token != ""
+}
+
+// ActiveInstances returns the accounts that should poll and send.
+func (c *Config) ActiveInstances() []WhatsAppInstance {
+	var out []WhatsAppInstance
+	for _, inst := range c.Instances {
+		if inst.Active() {
+			out = append(out, inst)
+		}
+	}
+	return out
+}
+
+// InstanceByID finds a configured account by its database id.
+func (c *Config) InstanceByID(id int64) (WhatsAppInstance, bool) {
+	for _, inst := range c.Instances {
+		if inst.ID == id {
+			return inst, true
+		}
+	}
+	return WhatsAppInstance{}, false
+}
+
+// suffixFor renders the environment-variable suffix for a 1-based slot.
+func suffixFor(slot int) string {
+	if slot <= 1 {
+		return ""
+	}
+	return fmt.Sprintf("_%d", slot)
 }
 
 func envStr(key, def string) string {

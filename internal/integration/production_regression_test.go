@@ -47,7 +47,7 @@ func TestProductionSequenceAiranCampaign(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран/Қаймақ кәсібі бойынша тегін сабаққа қатысқым келеді")
 
 	contact := f.createContact(t, "77011234567")
-	match, err := f.campaignSvc.MatchTrigger(ctx, nil,
+	match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance,
 		"Айран/Қаймақ кәсібі бойынша тегін сабаққа қатысқым келеді")
 	if err != nil || match == nil {
 		t.Fatalf("MatchTrigger: %v (match=%v)", err, match)

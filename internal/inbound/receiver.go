@@ -21,7 +21,7 @@ type notificationClient interface {
 
 // ingester is the half of Processor the receiver drives.
 type ingester interface {
-	Ingest(ctx context.Context, body []byte) (bool, error)
+	Ingest(ctx context.Context, instanceID int64, instanceKey string, body []byte) (bool, error)
 }
 
 // Receiver drains the provider's notification queue.
@@ -31,6 +31,12 @@ type ingester interface {
 // therefore needs no inbound connectivity, no TLS certificate and no public
 // hostname to receive WhatsApp messages.
 type Receiver struct {
+	// instanceID and instanceKey identify the account this loop serves. One
+	// Receiver polls exactly one Green API queue with exactly one client, and
+	// it stamps everything it ingests with this identity.
+	instanceID  int64
+	instanceKey string
+
 	client    notificationClient
 	processor ingester
 	cfg       config.GreenAPI
@@ -41,12 +47,25 @@ type Receiver struct {
 	backoffFloor time.Duration
 }
 
-func NewReceiver(client notificationClient, processor ingester, cfg config.GreenAPI, log *slog.Logger) *Receiver {
+// NewReceiver builds the polling loop for one account.
+//
+// Each account gets its own Receiver, its own client and -- because backoff
+// lives on this struct rather than anywhere shared -- its own failure state.
+// That is the whole of inbound failure isolation: a second number whose
+// subscription lapsed backs off on its own timer and logs its own errors,
+// while the first number keeps draining its queue at full speed, in a
+// different goroutine, through a different HTTP client.
+func NewReceiver(instanceID int64, instanceKey string, client notificationClient, processor ingester, cfg config.GreenAPI, log *slog.Logger) *Receiver {
 	return &Receiver{
-		client:       client,
-		processor:    processor,
-		cfg:          cfg,
-		log:          log.With(slog.String("component", "greenapi_receiver")),
+		instanceID:  instanceID,
+		instanceKey: instanceKey,
+		client:      client,
+		processor:   processor,
+		cfg:         cfg,
+		log: log.With(
+			slog.String("component", "greenapi_receiver"),
+			slog.Int64("whatsapp_instance_id", instanceID),
+			slog.String("instance", instanceKey)),
 		backoffFloor: minBackoff,
 	}
 }
@@ -127,7 +146,7 @@ func (r *Receiver) handle(ctx context.Context, notification *greenapi.Notificati
 	log := r.log.With(slog.Int64("receipt_id", notification.ReceiptID))
 	log.Debug("[GREENAPI] notification received")
 
-	accepted, err := r.processor.Ingest(ctx, notification.Body)
+	accepted, err := r.processor.Ingest(ctx, r.instanceID, r.instanceKey, notification.Body)
 	switch {
 	case err != nil && isMalformed(err):
 		// A payload we cannot parse will never become parseable. Leaving it in

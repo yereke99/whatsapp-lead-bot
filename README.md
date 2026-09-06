@@ -23,6 +23,7 @@ record every outbound path checks.
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Green API setup](#green-api-setup)
+- [Running several WhatsApp numbers](#running-several-whatsapp-numbers)
 - [Using the admin panel](#using-the-admin-panel)
 - [Architecture](#architecture)
 - [Design decisions](#design-decisions)
@@ -279,6 +280,97 @@ curl -s "$GREEN_API_URL/waInstance$GREEN_API_INSTANCE_ID/getSettings/$GREEN_API_
 ```
 
 The panel reports the same state under **Баптаулар → Жүйе**.
+
+---
+
+## Running several WhatsApp numbers
+
+One process, one database, several WhatsApp accounts. Adding a second number
+changes nothing about the first one.
+
+### Adding a number
+
+Put its credentials in `.env` beside the ones already there and restart:
+
+```dotenv
+# account 1 — the number this installation has always used, unchanged
+GREEN_API_INSTANCE_ID=1101234567
+GREEN_API_TOKEN=...
+
+# account 2
+GREEN_API_INSTANCE_ID_2=1109876543
+GREEN_API_TOKEN_2=...
+WHATSAPP_INSTANCE_NAME_2=Sales WhatsApp        # optional, shown in the panel
+WHATSAPP_INSTANCE_PHONE_2=+7 700 000 00 00     # optional, shown in the panel
+```
+
+```bash
+make run-restart
+```
+
+That is the whole change. Everything else — the endpoints, timeouts and sending
+pace — defaults to the first account's settings, so a second number on the same
+Green API shard needs only those two lines. A third number is `_3`, a fourth
+`_4`; no code changes, but each also needs a row in `whatsapp_instances`.
+
+Both variables of a pair must be set together. Setting only one is refused at
+startup: half a credential pair silently never sends, which is worse than not
+booting. Setting neither is fine — the service runs on one number and the panel
+shows the second account as not connected.
+
+### What each account owns
+
+A campaign belongs to exactly one number, chosen when it is created and fixed
+afterwards. Everything downstream follows from that single fact:
+
+```
+whatsapp_instances
+        │
+        └── campaigns ──┬── triggers
+                        ├── steps and templates
+                        ├── enrolments
+                        └── scheduled messages ── retries
+```
+
+So each number has its own campaigns, its own trigger words, its own schedules,
+its own polling loop, its own rate limiter and its own unsubscribes. Message
+templates stay a shared library — a template is inert content, and which number
+sends it is decided by the campaign.
+
+**A campaign's number cannot be changed after creation.** Its queued messages
+and enrolments all resolve the sending number through it, so moving it would
+send messages people opted into on one number out through another. Create a new
+campaign for the other number instead.
+
+### What isolation means in practice
+
+| Situation | What happens |
+|---|---|
+| The same trigger word on both numbers | Allowed. The number a customer wrote to decides which campaign starts. |
+| A word from number 2 sent to number 1 | Nothing. Number 1 has never heard of it, and inventing an enrolment would put someone in a funnel they did not join. |
+| One person writes to both numbers | One contact, two independent enrolments. Joining one funnel does not disqualify them from the other. |
+| `STOP` sent to number 2 | Ends number 2's sequence only. The reminders they are waiting for from number 1 keep arriving. |
+| An administrator unsubscribes someone in the panel | Applies to every number — that is a decision about the person, not about one number. |
+| Blocking a contact | Applies to every number, for the same reason. |
+| Both numbers have messages due at 20:45 | Each sends through its own client on its own pace. Neither waits for the other. |
+| Number 2's subscription lapses | Its poller backs off and logs; number 1 keeps receiving, scheduling and sending, and the panel stays up. |
+
+### Switching a number off
+
+```dotenv
+WHATSAPP_INSTANCE_ENABLED_2=false
+```
+
+The account stops polling and stops sending. Its campaigns, contacts, history
+and queued jobs stay exactly where they are — this is a pause, never a delete.
+
+### Where credentials live
+
+In the environment, and nowhere else. The `whatsapp_instances` table records
+ownership and display labels; it has no column for an instance id or a token.
+The admin API returns names, phone labels and connection state only, so no
+change to the panel can start leaking a credential, and none is ever written to
+a log.
 
 ---
 

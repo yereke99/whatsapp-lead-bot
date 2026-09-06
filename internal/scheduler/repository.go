@@ -342,6 +342,14 @@ func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now 
 type JobContext struct {
 	Job domain.ScheduledMessage
 
+	// CampaignInstanceID is the account this job must leave through. It is
+	// read from the campaign every time the job is processed, so a retry --
+	// even one picked up by a different process after a restart -- resolves
+	// the same number the original send would have used. There is no fallback
+	// to a default sender anywhere on this path.
+	CampaignInstanceID  int64
+	CampaignInstanceKey string
+
 	CampaignName        string
 	CampaignStatus      domain.CampaignStatus
 	CampaignTimezone    string
@@ -361,14 +369,20 @@ type JobContext struct {
 	StepAudienceFilter      bool
 	StepAudienceMinJoinedAt *time.Time
 
-	ContactPhone     string
-	ContactChatID    string
-	ContactName      string
-	ContactPushName  string
-	ContactOptedOut  bool
-	ContactBlocked   bool
-	ContactStatus    domain.ContactStatus
-	ContactConsentAt *time.Time
+	ContactPhone    string
+	ContactChatID   string
+	ContactName     string
+	ContactPushName string
+	// ContactOptedOut is the whole-person flag, kept for the panel and for
+	// reporting. It is deliberately NOT what the send path decides on.
+	ContactOptedOut bool
+	// ContactOptedOutHere is the answer that matters: has this contact
+	// unsubscribed from *this job's account*. Somebody who left the other
+	// number's funnel is still waiting for this one's messages.
+	ContactOptedOutHere bool
+	ContactBlocked      bool
+	ContactStatus       domain.ContactStatus
+	ContactConsentAt    *time.Time
 
 	EnrollmentStatus   domain.EnrollmentStatus
 	EnrollmentJoinedAt time.Time
@@ -384,12 +398,20 @@ type JobContext struct {
 func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobContext, error) {
 	query := `
 		SELECT ` + jobColumns + `,
+			COALESCE(camp.whatsapp_instance_id, 1),
+			COALESCE((SELECT i.instance_key FROM whatsapp_instances i
+			          WHERE i.id = COALESCE(camp.whatsapp_instance_id, 1)), 'primary'),
 			camp.name, camp.status, camp.timezone, camp.webinar_link, camp.event_start_at,
 			camp.max_send_attempts, camp.pin_template_version,
 			camp.max_messages_per_hour, camp.max_messages_per_day,
 			cs.name, cs.offset_seconds, cs.message_template_id, cs.enabled,
 			cs.audience_filter_enabled, cs.audience_min_joined_at,
 			c.phone, c.chat_id, c.name, c.push_name, c.opted_out, (c.blocked_at IS NOT NULL), c.status, c.first_contact_at,
+			-- The unsubscribe that matters for this job: the one recorded
+			-- against the account the job's campaign belongs to.
+			EXISTS (SELECT 1 FROM contact_instance_optouts o
+			        WHERE o.contact_id = sm.contact_id
+			          AND o.whatsapp_instance_id = COALESCE(camp.whatsapp_instance_id, 1)),
 			cc.status, cc.enrolled_at, cc.occurrence_at
 		FROM scheduled_messages sm
 		JOIN campaigns camp        ON camp.id = sm.campaign_id
@@ -403,6 +425,7 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 
 	dest := jobScanDest(&jc.Job)
 	dest = append(dest,
+		&jc.CampaignInstanceID, &jc.CampaignInstanceKey,
 		&jc.CampaignName, &jc.CampaignStatus, &jc.CampaignTimezone, &jc.CampaignLink,
 		&jc.CampaignEventStart, &jc.CampaignMaxAttempts, &jc.CampaignPinVersion,
 		&jc.CampaignMaxPerHour, &jc.CampaignMaxPerDay,
@@ -410,6 +433,7 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 		&jc.StepAudienceFilter, &jc.StepAudienceMinJoinedAt,
 		&jc.ContactPhone, &jc.ContactChatID, &jc.ContactName, &jc.ContactPushName,
 		&jc.ContactOptedOut, &jc.ContactBlocked, &jc.ContactStatus, &jc.ContactConsentAt,
+		&jc.ContactOptedOutHere,
 		&jc.EnrollmentStatus, &jc.EnrollmentJoinedAt, &jc.EnrollmentOccurrenceAt,
 	)
 
@@ -624,6 +648,30 @@ func (r *Repository) CancelPendingForContact(ctx context.Context, q sqlite.Queri
 		WHERE contact_id = $1 AND status = 'PENDING'`
 
 	tag, err := r.querier(q).Exec(ctx, query, contactID, reason)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// CancelPendingForContactOnInstance cancels the contact's pending jobs that
+// belong to campaigns of one account, and leaves the rest of their queue
+// alone.
+//
+// The account is reached through the job's campaign rather than stored on the
+// job, which keeps one answer to "who owns this" and makes it impossible for a
+// job to disagree with the campaign that created it.
+func (r *Repository) CancelPendingForContactOnInstance(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, instanceID int64, reason string) (int64, error) {
+	const query = `
+		UPDATE scheduled_messages SET
+			status = 'CANCELLED', cancelled_at = now(), cancel_reason = $2, updated_at = now()
+		WHERE contact_id = $1
+		  AND status = 'PENDING'
+		  AND campaign_id IN (
+			SELECT c.id FROM campaigns c WHERE COALESCE(c.whatsapp_instance_id, 1) = $3
+		  )`
+
+	tag, err := r.querier(q).Exec(ctx, query, contactID, reason, instanceID)
 	if err != nil {
 		return 0, err
 	}

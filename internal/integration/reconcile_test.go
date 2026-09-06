@@ -116,7 +116,7 @@ func TestStepsAddedAfterEnrollmentAreScheduled(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestCompletionRequiresEveryStep(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestCompletedEnrollmentReopensForNewStep(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestReconcileIsIdempotent(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestStepEditMovesPendingJob(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestStepEditIntoFutureRevivesMissingJob(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestDisabledStepIsSkippedNotLost(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestReconcileRepairsDeletedJobs(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -511,7 +511,7 @@ func TestSentJobsAreNeverRecreated(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -555,7 +555,7 @@ func TestConcurrentReconcileCreatesNoDuplicates(t *testing.T) {
 	f.addTrigger(t, campaign.ID, "Айран")
 
 	contact := f.createContact(t, "77011234567")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}
@@ -612,7 +612,7 @@ func TestFullCampaignQueueIsComplete(t *testing.T) {
 	campaign := f.createCampaign(t, "Webinar", eventStart, offsets)
 	f.addTrigger(t, campaign.ID, "Айран")
 
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	for i := 0; i < 10; i++ {
 		contact := f.createContact(t, fmt.Sprintf("7701123%04d", i))
 		if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {

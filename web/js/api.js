@@ -215,6 +215,12 @@ export const api = {
   auditLogs: (query) => get('/api/audit-logs', query),
   webhookEvents: (query) => get('/api/webhook-events', query),
   providerState: () => get('/api/system/provider'),
+
+  // WhatsApp accounts. These endpoints return labels and connection state
+  // only; the Green API instance id and token never leave the server, are
+  // never part of these responses, and are never stored in the browser.
+  whatsappInstances: () => get('/api/whatsapp-instances'),
+  whatsappInstanceStates: () => get('/api/whatsapp-instances/states'),
   systemSettings: () => get('/api/system/settings'),
 
   // admins

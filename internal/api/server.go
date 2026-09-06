@@ -14,6 +14,7 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/conversations"
 	"github.com/ayran/whatsapp-automation/internal/exports"
 	"github.com/ayran/whatsapp-automation/internal/inbound"
+	"github.com/ayran/whatsapp-automation/internal/instances"
 	"github.com/ayran/whatsapp-automation/internal/media"
 	"github.com/ayran/whatsapp-automation/internal/messaging"
 	"github.com/ayran/whatsapp-automation/internal/scheduler"
@@ -41,7 +42,14 @@ type Dependencies struct {
 	NotificationRepo *inbound.Repository
 	Analytics        *analytics.Service
 	Exports          *exports.Service
-	Provider         *greenapi.Client
+	// Provider is the Primary account's client, kept because the existing
+	// health and provider-state endpoints report on it by name. Anything that
+	// needs "the client for this campaign" goes through Registry instead.
+	Provider *greenapi.Client
+	// Instances reads the stored accounts; Registry knows which of them this
+	// process can actually reach. Neither exposes a credential.
+	Instances *instances.Repository
+	Registry  *instances.Registry
 }
 
 // Server owns the HTTP router.
@@ -156,6 +164,8 @@ func (s *Server) routes() {
 	protected.HandleFunc("GET /api/webhook-events", s.handleWebhookEvents)
 	protected.HandleFunc("GET /api/system/consistency", s.handleConsistency)
 	protected.HandleFunc("GET /api/system/provider", s.handleProviderState)
+	protected.HandleFunc("GET /api/whatsapp-instances", s.handleListInstances)
+	protected.HandleFunc("GET /api/whatsapp-instances/states", s.handleInstanceStates)
 	protected.HandleFunc("GET /api/system/settings", s.handleSystemSettings)
 
 	protected.HandleFunc("GET /api/admins", s.handleListAdmins)

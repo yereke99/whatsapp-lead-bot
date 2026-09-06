@@ -26,6 +26,7 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/domain"
 	"github.com/ayran/whatsapp-automation/internal/exports"
 	"github.com/ayran/whatsapp-automation/internal/inbound"
+	"github.com/ayran/whatsapp-automation/internal/instances"
 	"github.com/ayran/whatsapp-automation/internal/logging"
 	"github.com/ayran/whatsapp-automation/internal/media"
 	"github.com/ayran/whatsapp-automation/internal/messaging"
@@ -90,9 +91,26 @@ func run() error {
 			slog.String("configured_path", cfg.Media.FFmpegPath))
 	}
 
-	provider := greenapi.New(cfg.GreenAPI, log)
-	if !provider.Configured() {
-		log.Warn("green api credentials are not set: inbound and outbound messaging is disabled")
+	// One WhatsApp account, one immutable client. The registry is built once,
+	// after migrations have guaranteed the account rows exist, and is never
+	// written to afterwards -- so no request path can swap a live client's
+	// credentials, and two accounts sending at the same moment cannot reach
+	// each other's.
+	instanceRepo := instances.NewRepository(db)
+	registry, err := instances.Load(ctx, instanceRepo, cfg, log)
+	if err != nil {
+		return fmt.Errorf("load whatsapp accounts: %w", err)
+	}
+
+	primary, err := registry.Get(domain.PrimaryInstanceID)
+	if err != nil {
+		return fmt.Errorf("resolve the primary whatsapp account: %w", err)
+	}
+	provider := primary.Client
+	if provider == nil || !provider.Configured() {
+		provider = greenapi.New(cfg.GreenAPI, log)
+		log.Warn("green api credentials are not set for the primary account: " +
+			"inbound and outbound messaging is disabled for it")
 	}
 
 	// ---- repositories -----------------------------------------------------
@@ -114,18 +132,29 @@ func run() error {
 	templateSvc := templates.NewService(templateRepo, mediaSvc)
 	campaignSvc := campaigns.NewService(campaignRepo, jobRepo, contactRepo, log).
 		WithTriggerDelay(cfg.Scheduler.TriggerDelay)
-	sender := messaging.NewSender(provider, messageRepo, contactRepo, mediaStore, log)
+	// The sender resolves a client per message from the account the message
+	// carries, so there is no such thing as "the" provider on the send path.
+	sender := messaging.NewSender(registry, messageRepo, contactRepo, mediaStore, log)
 	analyticsSvc := analytics.NewService(db)
 	exportSvc := exports.NewService(contactRepo)
 
-	// Every automated message leaves through this one gate, which bounds how
-	// many sends run at once and how closely together they go out. Scheduler
-	// workers hand messages to it rather than calling the provider themselves.
-	outboundGate := outbound.New(cfg.Outbound, sender, log)
+	// Every automated message leaves through this router, which holds one
+	// queue per account: each bounds how many of that account's sends run at
+	// once and how closely together they go out. Scheduler workers hand
+	// messages to it rather than calling a provider themselves, and a burst on
+	// one number cannot delay the other's reminders.
+	outboundSpecs := make([]outbound.InstanceSpec, 0, len(registry.All()))
+	for _, inst := range registry.All() {
+		outboundSpecs = append(outboundSpecs, outbound.InstanceSpec{
+			ID:       inst.ID,
+			Key:      inst.Key,
+			Outbound: inst.Outbound,
+		})
+	}
+	outboundGate := outbound.NewRouter(outboundSpecs, sender, log)
 
 	notifications := inbound.NewProcessor(cfg.Scheduler, notificationRepo, contactRepo,
 		messageRepo, campaignSvc, templateRepo, sender, mediaStore, log)
-	receiver := inbound.NewReceiver(provider, notifications, cfg.GreenAPI, log)
 
 	worker := scheduler.NewWorker(cfg.Scheduler, jobRepo, templateRepo, contactRepo,
 		outboundGate, mediaStore, log)
@@ -171,21 +200,42 @@ func run() error {
 
 	// ---- background work --------------------------------------------------
 
-	var receiverDone chan struct{}
+	var receiversDone []chan struct{}
 
 	authSvc.StartMaintenance(ctx)
 	notifications.Start(ctx)
 
-	// Inbound messages are pulled from the provider's queue; without
-	// credentials there is nothing to poll, and the panel stays usable.
-	if cfg.WhatsAppConfigured() {
-		receiverDone = make(chan struct{})
-		go func() {
-			defer close(receiverDone)
-			receiver.Run(ctx)
-		}()
-	} else {
-		log.Warn("green api is not configured: inbound polling is disabled")
+	// One poller per account, each in its own goroutine with its own client
+	// and its own backoff state.
+	//
+	// The number of goroutines is bounded by the number of configured
+	// accounts, which is bounded by the environment -- there is no per-message
+	// or per-notification goroutine here. Concurrency for the work itself
+	// lives behind Ingest, in the notification worker pool, exactly as it did
+	// with one account.
+	//
+	// Failure isolation falls out of the structure rather than being handled:
+	// a second number whose subscription lapsed retries on its own timer, in
+	// its own loop, and the first number's poller never observes it. Neither
+	// can crash the other, and neither can stop the scheduler or the panel.
+	active := registry.Active()
+	if len(active) == 0 {
+		log.Warn("[WHATSAPP] no account is both enabled and configured: inbound polling is disabled")
+	}
+	for _, inst := range active {
+		done := make(chan struct{})
+		receiversDone = append(receiversDone, done)
+
+		receiver := inbound.NewReceiver(inst.ID, inst.Key, inst.Client, notifications, inst.Poll, log)
+		go func(r *inbound.Receiver, done chan struct{}) {
+			defer close(done)
+			r.Run(ctx)
+		}(receiver, done)
+
+		log.Info("[WHATSAPP] inbound poller started",
+			slog.Int64("whatsapp_instance_id", inst.ID),
+			slog.String("instance", inst.Key),
+			slog.String("name", inst.Name))
 	}
 
 	if cfg.Scheduler.Enabled {
@@ -217,6 +267,8 @@ func run() error {
 		Analytics:        analyticsSvc,
 		Exports:          exportSvc,
 		Provider:         provider,
+		Instances:        instanceRepo,
+		Registry:         registry,
 	})
 
 	httpServer := &http.Server{
@@ -262,7 +314,10 @@ func run() error {
 	go func() {
 		worker.Wait()
 		notifications.Wait()
-		if receiverDone != nil {
+		// Every poller observes the same cancelled root context, so they stop
+		// in parallel; this only waits for the last one to finish the
+		// notification it was holding.
+		for _, receiverDone := range receiversDone {
 			<-receiverDone
 		}
 		close(done)

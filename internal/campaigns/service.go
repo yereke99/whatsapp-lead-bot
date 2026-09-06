@@ -59,16 +59,23 @@ func (s *Service) Repo() *Repository { return s.repo }
 
 // MatchTrigger finds the campaign a message should enroll into.
 //
+// instanceID is the WhatsApp account the message arrived on, and it is a hard
+// boundary: only that account's campaigns are considered. A customer writing
+// to one of the installation's numbers can only ever enter a funnel that
+// number owns, whatever words happen to be configured elsewhere. The same
+// keyword may therefore exist on two accounts and mean two different things,
+// because the number it was sent to has already resolved the ambiguity.
+//
 // Only triggers belonging to ACTIVE campaigns are considered, so pausing a
 // campaign immediately stops new entries. Ordering from the query makes the
 // result deterministic when several keywords could match.
-func (s *Service) MatchTrigger(ctx context.Context, q sqlite.Querier, messageText string) (*TriggerMatch, error) {
+func (s *Service) MatchTrigger(ctx context.Context, q sqlite.Querier, instanceID int64, messageText string) (*TriggerMatch, error) {
 	normalized := textnorm.Normalize(messageText)
 	if normalized == "" {
 		return nil, nil
 	}
 
-	triggers, err := s.repo.ActiveTriggers(ctx, q)
+	triggers, err := s.repo.ActiveTriggers(ctx, q, instanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -82,14 +89,15 @@ func (s *Service) MatchTrigger(ctx context.Context, q sqlite.Querier, messageTex
 	return nil, nil
 }
 
-// IsUnsubscribe reports whether a message is a stop word for this contact.
-func (s *Service) IsUnsubscribe(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, messageText string) (bool, error) {
+// IsUnsubscribe reports whether a message is a stop word for this contact on
+// the account that received it.
+func (s *Service) IsUnsubscribe(ctx context.Context, q sqlite.Querier, contactID uuid.UUID, instanceID int64, messageText string) (bool, error) {
 	normalized := textnorm.Normalize(messageText)
 	if normalized == "" {
 		return false, nil
 	}
 
-	keywords, err := s.repo.UnsubscribeKeywordsFor(ctx, q, contactID)
+	keywords, err := s.repo.UnsubscribeKeywordsFor(ctx, q, contactID, instanceID)
 	if err != nil {
 		return false, err
 	}
@@ -136,10 +144,15 @@ func (s *Service) HandleTrigger(ctx context.Context, contact *domain.Contact, ma
 	if contact == nil || match == nil {
 		return &EnrollResult{Action: ActionIgnored, Reason: "no trigger match"}, nil
 	}
-	if !contact.CanReceiveMessages() {
+	// The account-independent half of consent: they wrote to us first, and
+	// nobody has blocked them. The unsubscribe half is checked inside the
+	// transaction below, against the account this trigger belongs to, because
+	// somebody who left the first number's funnel may legitimately join the
+	// second number's.
+	if !contact.CanBeContacted() {
 		return &EnrollResult{
 			Action: ActionBlocked,
-			Reason: "contact has opted out or is blocked",
+			Reason: "contact is blocked or has never written to us",
 		}, nil
 	}
 
@@ -152,6 +165,17 @@ func (s *Service) HandleTrigger(ctx context.Context, contact *domain.Contact, ma
 		}
 		if campaign == nil {
 			return ErrNotFound
+		}
+
+		instanceID := domain.InstanceIDOrPrimary(campaign.WhatsAppInstanceID)
+		optedOut, err := s.contacts.IsOptedOutOn(ctx, tx, instanceID, contact.ID)
+		if err != nil {
+			return err
+		}
+		if optedOut {
+			result.Action = ActionBlocked
+			result.Reason = "contact has unsubscribed from this whatsapp account"
+			return nil
 		}
 		if !campaign.AcceptsEnrollments() {
 			result.Action = ActionIgnored
@@ -482,13 +506,20 @@ func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, cam
 
 // SaveInput is the validated payload for creating or updating a campaign.
 type SaveInput struct {
-	Name        string
-	Description string
-	EventType   string
-	EventDate   string
-	EventTime   string
-	Timezone    string
-	WebinarLink string
+	// WhatsAppInstanceID is the account the campaign sends through. Nil means
+	// Primary: it is what a request written before multi-account support sends,
+	// and Primary is where every campaign lived until now.
+	//
+	// Honoured on create only. Update carries the campaign's stored value
+	// forward -- a campaign's account never changes.
+	WhatsAppInstanceID *int64
+	Name               string
+	Description        string
+	EventType          string
+	EventDate          string
+	EventTime          string
+	Timezone           string
+	WebinarLink        string
 	// IsDailyRecurring turns the single webinar into a daily one. EventDate
 	// then means the day the series starts, and RecurrenceTime the hour it
 	// happens at.
@@ -527,6 +558,7 @@ func (in SaveInput) toCampaign() (*domain.Campaign, error) {
 	}
 
 	c := &domain.Campaign{
+		WhatsAppInstanceID:      in.WhatsAppInstanceID,
 		Name:                    name,
 		Description:             strings.TrimSpace(in.Description),
 		EventType:               defaultIfEmpty(in.EventType, "WEBINAR"),
@@ -1342,8 +1374,25 @@ func (s *Service) Validate(ctx context.Context, id uuid.UUID) (*domain.Campaign,
 	return campaign, Validate(campaign), nil
 }
 
-// StopForContact ends every active enrollment and cancels pending jobs, used
-// on unsubscribe and on block.
+// StopForContactOnInstance ends the contact's enrollments on one account and
+// cancels their pending jobs there, leaving every other account untouched.
+//
+// It is the unsubscribe-keyword path. On an installation running a single
+// account it reaches exactly the same rows StopForContact does.
+func (s *Service) StopForContactOnInstance(ctx context.Context, contactID uuid.UUID, instanceID int64, status domain.EnrollmentStatus, reason string) error {
+	return s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
+		if err := s.repo.StopForContactOnInstance(ctx, tx, contactID, instanceID, status, reason); err != nil {
+			return err
+		}
+		_, err := s.jobs.CancelPendingForContactOnInstance(ctx, tx, contactID, instanceID, reason)
+		return err
+	})
+}
+
+// StopForContact ends every active enrollment on every account and cancels the
+// contact's pending jobs, used when an administrator blocks or unsubscribes
+// somebody. That is a decision about the person, so it is not scoped to one
+// number.
 func (s *Service) StopForContact(ctx context.Context, contactID uuid.UUID, status domain.EnrollmentStatus, reason string) error {
 	return s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
 		if err := s.repo.StopAllForContact(ctx, tx, contactID, status, reason); err != nil {

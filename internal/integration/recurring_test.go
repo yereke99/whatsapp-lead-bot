@@ -97,7 +97,7 @@ func enroll(t *testing.T, f *fixture, campaignID uuid.UUID, phone string, at tim
 	ctx := context.Background()
 
 	contact := f.createContact(t, phone)
-	match, err := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, err := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if err != nil || match == nil {
 		t.Fatalf("MatchTrigger: %v (match=%v)", err, match)
 	}
@@ -644,7 +644,7 @@ func TestTwoRecurringCampaignsDoNotCrossContaminate(t *testing.T) {
 	b := recurringCampaignWithTrigger(t, f, "Qaimaq", "Қаймақ", clockB, startDate, []int{-3600, 0})
 
 	contactA := f.createContact(t, "77010000014")
-	matchA, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	matchA, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if matchA == nil || matchA.CampaignID != a.ID {
 		t.Fatalf("trigger routed to %v, want campaign A", matchA)
 	}
@@ -653,7 +653,7 @@ func TestTwoRecurringCampaignsDoNotCrossContaminate(t *testing.T) {
 	}
 
 	contactB := f.createContact(t, "77010000015")
-	matchB, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Қаймақ")
+	matchB, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Қаймақ")
 	if matchB == nil || matchB.CampaignID != b.ID {
 		t.Fatalf("trigger routed to %v, want campaign B", matchB)
 	}
@@ -713,7 +713,7 @@ func TestRestartTriggerMovesTheContactToTheNextWebinar(t *testing.T) {
 	}
 
 	contact := f.createContact(t, "77010000016")
-	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, "Айран")
+	match, _ := f.campaignSvc.MatchTrigger(ctx, nil, primaryInstance, "Айран")
 	if _, err := f.campaignSvc.HandleTrigger(ctx, contact, match, time.Now().UTC()); err != nil {
 		t.Fatalf("HandleTrigger: %v", err)
 	}

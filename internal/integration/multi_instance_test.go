@@ -579,6 +579,51 @@ func TestTriggersInheritTheirCampaignsAccount(t *testing.T) {
 	}
 }
 
+func TestCampaignQueriesLoadTriggersWithAccount(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	campaign := f.createCampaignOn(t, secondaryInstance, "Trigger scan campaign",
+		time.Now().UTC().Add(2*time.Hour), []int{-3600})
+	f.addTrigger(t, campaign.ID, "LOAD")
+
+	list, err := f.campaignRepo.List(ctx, campaigns.ListFilter{IncludeArchived: true})
+	if err != nil {
+		t.Fatalf("list campaigns: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected one campaign in list, got %d", len(list))
+	}
+	if len(list[0].Triggers) != 1 {
+		t.Fatalf("campaign list loaded %d triggers, want 1", len(list[0].Triggers))
+	}
+	if got := domain.InstanceIDOrPrimary(list[0].Triggers[0].WhatsAppInstanceID); got != secondaryInstance {
+		t.Fatalf("listed trigger account %d, want %d", got, secondaryInstance)
+	}
+
+	full, err := f.campaignRepo.GetFull(ctx, campaign.ID)
+	if err != nil {
+		t.Fatalf("get full campaign: %v", err)
+	}
+	if len(full.Triggers) != 1 {
+		t.Fatalf("campaign detail loaded %d triggers, want 1", len(full.Triggers))
+	}
+	if got := domain.InstanceIDOrPrimary(full.Triggers[0].WhatsAppInstanceID); got != secondaryInstance {
+		t.Fatalf("detail trigger account %d, want %d", got, secondaryInstance)
+	}
+
+	triggers, err := f.campaignRepo.ListTriggers(ctx, campaign.ID)
+	if err != nil {
+		t.Fatalf("list triggers: %v", err)
+	}
+	if len(triggers) != 1 {
+		t.Fatalf("ListTriggers loaded %d triggers, want 1", len(triggers))
+	}
+	if got := domain.InstanceIDOrPrimary(triggers[0].WhatsAppInstanceID); got != secondaryInstance {
+		t.Fatalf("ListTriggers account %d, want %d", got, secondaryInstance)
+	}
+}
+
 // TestReconciliationStillRepairsTheOtherAccount is the quiet failure this
 // design is most likely to produce if the scope is ever widened by accident.
 //

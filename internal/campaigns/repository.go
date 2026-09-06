@@ -177,10 +177,12 @@ func (r *Repository) attachTriggers(ctx context.Context, list []domain.Campaign)
 	}
 
 	const query = `
-		SELECT id, campaign_id, keyword, normalized_keyword, match_mode, is_active, created_at, updated_at
-		FROM campaign_triggers
-		WHERE campaign_id IN (SELECT value FROM json_each($1))
-		ORDER BY created_at`
+		SELECT t.id, t.campaign_id, COALESCE(t.whatsapp_instance_id, c.whatsapp_instance_id, 1),
+		       t.keyword, t.normalized_keyword, t.match_mode, t.is_active, t.created_at, t.updated_at
+		FROM campaign_triggers t
+		JOIN campaigns c ON c.id = t.campaign_id
+		WHERE t.campaign_id IN (SELECT value FROM json_each($1))
+		ORDER BY t.created_at`
 
 	rows, err := r.db.Query(ctx, query, ids)
 	if err != nil {
@@ -444,7 +446,7 @@ func (r *Repository) ListTriggers(ctx context.Context, campaignID uuid.UUID) ([]
 	var out []domain.CampaignTrigger
 	for rows.Next() {
 		var t domain.CampaignTrigger
-		if err := rows.Scan(&t.ID, &t.CampaignID, &t.Keyword, &t.Normalized,
+		if err := rows.Scan(&t.ID, &t.CampaignID, &t.WhatsAppInstanceID, &t.Keyword, &t.Normalized,
 			&t.MatchMode, &t.IsActive, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}

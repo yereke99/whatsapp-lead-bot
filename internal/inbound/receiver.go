@@ -101,13 +101,10 @@ func (r *Receiver) Run(ctx context.Context) {
 
 		notification, err := r.client.ReceiveNotification(ctx, r.cfg.ReceiveTimeout)
 		switch {
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		case ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
 			// Shutdown, not a provider fault.
-			if ctx.Err() != nil {
-				r.log.Info("[GREENAPI] polling stopped")
-				return
-			}
-			continue
+			r.log.Info("[GREENAPI] polling stopped")
+			return
 
 		case err != nil:
 			// A provider outage must not spin the CPU or crash the service.
@@ -126,9 +123,9 @@ func (r *Receiver) Run(ctx context.Context) {
 			r.log.Info("[GREENAPI] polling recovered")
 			hadProviderFailure = false
 		}
-		backoff = r.floor()
 
 		if notification == nil {
+			backoff = r.floor()
 			// An empty queue is the normal idle state. The receive call already
 			// blocked server-side for receive_timeout, so this is a short pause
 			// rather than a busy loop.
@@ -138,7 +135,14 @@ func (r *Receiver) Run(ctx context.Context) {
 			continue
 		}
 
-		r.handle(ctx, notification)
+		if !r.handle(ctx, notification) {
+			if !sleep(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff)
+		} else {
+			backoff = r.floor()
+		}
 	}
 }
 
@@ -150,7 +154,7 @@ func (r *Receiver) Run(ctx context.Context) {
 // failing message block every message behind it. Once Ingest returns, the event
 // is committed to the local queue, where the worker pool retries it and stale
 // locks are recovered after a crash — deleting is safe, and nothing is lost.
-func (r *Receiver) handle(ctx context.Context, notification *greenapi.Notification) {
+func (r *Receiver) handle(ctx context.Context, notification *greenapi.Notification) bool {
 	log := r.log.With(slog.Int64("receipt_id", notification.ReceiptID))
 	log.Debug("[GREENAPI] notification received")
 
@@ -167,7 +171,7 @@ func (r *Receiver) handle(ctx context.Context, notification *greenapi.Notificati
 		// Storage failed: keep the notification queued and try again.
 		log.Error("[GREENAPI] ingest failed; notification kept for retry",
 			slog.String("error", err.Error()))
-		return
+		return false
 
 	case accepted:
 		log.Info("[GREENAPI] notification queued")
@@ -184,9 +188,10 @@ func (r *Receiver) handle(ctx context.Context, notification *greenapi.Notificati
 	if err := r.client.DeleteNotification(deleteCtx, notification.ReceiptID); err != nil {
 		// Harmless: the entry reappears and deduplication rejects it.
 		log.Warn("[GREENAPI] delete failed; notification will be redelivered", providerErrorAttrs(err)...)
-		return
+		return false
 	}
 	log.Debug("[GREENAPI] notification deleted")
+	return true
 }
 
 // providerErrorAttrs keeps provider failures queryable without requiring an

@@ -56,6 +56,7 @@ type Outbound struct {
 	EnrollmentID       *uuid.UUID
 	CampaignStepID     *uuid.UUID
 	ScheduledMessageID *uuid.UUID
+	IncomingEventID    *uuid.UUID
 	TemplateID         *uuid.UUID
 	TemplateVersion    *int
 
@@ -112,6 +113,16 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 	if contact == nil {
 		return nil, errors.New("contact is required")
 	}
+	if out.ScheduledMessageID != nil || out.IncomingEventID != nil {
+		sent, err := s.messages.SuccessfulOutbound(ctx, out.ScheduledMessageID, out.IncomingEventID)
+		if err != nil {
+			return nil, fmt.Errorf("check previous response: %w", err)
+		}
+		if sent != nil {
+			s.log.Info("trigger_reply_already_sent", slog.String("message_id", sent.ID.String()))
+			return sent, nil
+		}
+	}
 
 	instanceID := domain.InstanceIDOrPrimary(&out.WhatsAppInstanceID)
 
@@ -142,6 +153,7 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 		EnrollmentID:       out.EnrollmentID,
 		CampaignStepID:     out.CampaignStepID,
 		ScheduledMessageID: out.ScheduledMessageID,
+		IncomingEventID:    out.IncomingEventID,
 		Direction:          domain.DirectionOutgoing,
 		Type:               string(msgType),
 		Text:               out.Text,
@@ -172,13 +184,16 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 	}
 
 	sentAt := time.Now().UTC()
-	if err := s.messages.MarkSent(ctx, nil, record.ID, result.ExternalID, sentAt); err != nil {
-		// The provider accepted the message; failing to persist the id costs
-		// us later status correlation but the send itself stands.
+	// Shutdown must not cancel recording an acknowledgement already received.
+	receiptCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := s.messages.MarkSent(receiptCtx, nil, record.ID, result.ExternalID, sentAt); err != nil {
 		s.log.Error("message sent but not recorded as sent",
 			slog.String("message_id", record.ID.String()),
 			slog.String("external_id", result.ExternalID),
 			slog.String("error", err.Error()))
+		return record, &whatsapp.Error{Provider: provider.Name(), Op: "persistSendReceipt",
+			Message: "provider accepted message but receipt could not be saved; inspect before retry", Err: err}
 	}
 
 	record.Status = domain.MessageStatusSent

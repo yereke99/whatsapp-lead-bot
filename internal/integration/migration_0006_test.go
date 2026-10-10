@@ -48,8 +48,8 @@ func TestMigration0006PreservesExistingData(t *testing.T) {
 	if err := db.Migrate(ctx, os.DirFS(before0006), discardLogger()); err != nil {
 		t.Fatalf("migrate to the pre-feature schema: %v", err)
 	}
-	if pending != 1 {
-		t.Fatalf("migrations newer than 0005 = %d, want exactly the one under test", pending)
+	if pending < 1 {
+		t.Fatalf("migrations newer than 0005 = %d, want at least migration 0006", pending)
 	}
 
 	eventStart := time.Now().UTC().Add(6 * time.Hour)

@@ -169,6 +169,7 @@ type Scheduler struct {
 	// many are claimed per batch.
 	NotificationWorkers   int
 	NotificationBatchSize int
+	RecoveryBatchSize     int
 }
 
 // Outbound paces everything the platform sends. One WhatsApp account is one
@@ -269,6 +270,7 @@ func Load() (*Config, error) {
 			TriggerDelay:          time.Duration(envInt("TRIGGER_GREETING_DELAY_MS", 2000)) * time.Millisecond,
 			NotificationWorkers:   envInt("GREEN_API_WORKERS", 5),
 			NotificationBatchSize: envInt("GREEN_API_BATCH_SIZE", 50),
+			RecoveryBatchSize:     envInt("RECOVERY_BATCH_SIZE", 150),
 		},
 		Outbound: Outbound{
 			Workers:  envInt("WHATSAPP_SEND_WORKERS", 1),
@@ -428,6 +430,9 @@ func (c *Config) validate() error {
 	}
 	if c.Scheduler.NotificationWorkers < 1 {
 		problems = append(problems, "GREEN_API_WORKERS must be at least 1")
+	}
+	if c.Scheduler.RecoveryBatchSize < 1 || c.Scheduler.RecoveryBatchSize > 1000 {
+		problems = append(problems, "RECOVERY_BATCH_SIZE must be between 1 and 1000")
 	}
 	// The outbound limits exist to keep automated sending calm and predictable.
 	// A misconfiguration here is the one that gets a WhatsApp account into

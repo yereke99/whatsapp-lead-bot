@@ -540,7 +540,7 @@ juggling and no attempt to disguise automated traffic; the queue simply refuses
 to go faster than configured, and holds work rather than dropping it when a
 campaign hits its own hourly or daily limit.
 
-### Duplicates cannot happen
+### Idempotent business processing
 
 - `scheduled_messages` has a unique constraint on
   `(enrollment_id, campaign_step_id, run_number)`. One delivery per step, per
@@ -552,6 +552,13 @@ campaign hits its own hourly or daily limit.
   outbound echoes.
 - Repeat triggers follow the campaign's configured behaviour: ignore (default),
   restart, continue, or send one special reply.
+- Incoming event identity is the account ID plus the external message ID.
+  Legacy dedupe keys are recognized without changing historical rows.
+- `webhook_events.trigger_result` checkpoints the enrollment decision and the
+  initial reply job in the same transaction as enrollment and scheduling.
+  Retrying an event does not restart the campaign or recreate its schedule.
+- A persisted outbound receipt is checked before sending a recovered job or
+  special reply, including when the process died before marking the job SENT.
 
 The one case that cannot be made perfectly exactly-once is a crash *between*
 the provider accepting a message and the acknowledgement being recorded, since
@@ -564,6 +571,9 @@ a retry that finds an existing provider id will not send again.
 If the service is down for six hours, releasing "starts in 5 hours" messages
 afterwards would be worse than sending nothing. Pending jobs older than
 `SCHEDULER_STALE_JOB_TTL` are cancelled with a reason visible in the panel.
+The initial ON_TRIGGER reply linked to an incoming trigger is retained until
+successful delivery or an explicit consent/configuration refusal. Other steps
+keep the existing expiry, catch-up, audience and daily webinar rules.
 
 At enrollment the opposite rule applies: a contact who triggers two hours
 before the webinar immediately receives the **most recent** missed step, and
@@ -696,6 +706,70 @@ An always-empty queue is almost always one of two setup mistakes, both silent:
 If notifications arrive but no trigger fires, compare the message against the
 configured keyword and match mode: `EXACT` requires the whole message to equal
 the keyword, so a long trigger phrase will not fire on a single word from it.
+
+### Recovering missed trigger replies
+
+The receive path commits `webhook_events` before deleting the Green API
+notification. SQLite uses `synchronous=FULL`, so acknowledgement follows a
+durable commit, including across machine power loss. Background workers resume
+RECEIVED events and expired PROCESSING leases on startup; exhausted retryable
+event failures are revisited after the configured retry backoff. Incoming event
+identities and business checkpoints are retained rather than pruned.
+Each drain is bounded by both `GREEN_API_BATCH_SIZE` and `RECOVERY_BATCH_SIZE`.
+Workers reserve slots for live triggers, oldest queued work and triggers ready
+for business processing, so a large queue of pending replies cannot occupy all
+incoming processing slots.
+
+The audited failure was downstream of acknowledgement: the old handler returned
+as soon as `messages.external_id` already existed, even when the prior attempt
+had crashed before enrollment. It also marked events PROCESSED after scheduling
+the reply, swallowed special-reply failures, and allowed the generic TTL to
+cancel an unsent greeting. Those paths now retain a checkpoint and wait for the
+successful response receipt. An owed initial reply keeps retrying transient
+provider failures with the existing bounded exponential backoff; other scheduled
+messages retain their configured retry budget and all scheduling policies.
+
+Migration `0008_incoming_recovery.sql` only adds three nullable fields and lookup
+indexes. It changes no existing values or migration checksums. Scheduled jobs,
+contacts, campaigns, templates, enrollments, message history and admin data stay
+in their existing tables. Take the backup described below before a production
+upgrade, keep the existing `.env`, `DATABASE_PATH` and volumes, then use the
+normal build/restart procedure. Auto-migration applies the addition once; with
+`DATABASE_AUTO_MIGRATE=false`, run the existing `make migrate` before restarting
+the new application. The upgrade test compares every original column before
+and after migration and five subsequent migration runs.
+
+For historical records marked PROCESSED by the old application, use the
+owner-only, session-authenticated recovery API:
+
+1. `GET /api/incoming-recovery?instance_id=1` returns counts for already replied,
+   nonmatching, ineligible, ambiguous, already queued and eligible events, plus
+   the oldest eligible event IDs for one batch. Omit `instance_id` for all accounts.
+2. Review those IDs, then `POST /api/incoming-recovery/requeue` with
+   `{"event_ids":["<event UUID>"]}` and the normal `X-CSRF-Token` header.
+3. Repeat preview/requeue for further batches. `RECOVERY_BATCH_SIZE` defaults to
+   150. The HTTP handler queues work; delivery uses the existing outbound router
+   and per-account rate limiter. A stale preview is rechecked before requeue.
+
+Recovery preserves an existing enrollment/run and only revives the missing
+initial reply's job. Expired webinar reminders and intentionally cancelled
+jobs are not revived. Already sent replies are skipped using both message
+receipts and job status. Legacy records that cannot prove which reply is owed
+are reported as ambiguous instead of being bulk sent. This tool scans existing
+`webhook_events`; history-only messages whose raw events were already pruned by
+an older release require separate investigation and are not reconstructed.
+
+Green API stores receive notifications for
+[24 hours](https://green-api.com/docs/api/receiving/technology-http-api/ReceiveNotification/).
+An outage longer than that can lose messages that never reached this database.
+The application cannot recover a notification absent from both its persisted
+events and the provider queue. The production database is not included in this
+checkout, so historical counts must be obtained from the deployed preview.
+
+The remaining transport ambiguity is a crash between external acceptance and
+saving the receipt. Green API and SQLite cannot share a transaction. A known
+receipt is never resent; `persistSendReceipt` failures stop automatic sending
+and require inspection before a manual retry.
 
 ### Backups
 

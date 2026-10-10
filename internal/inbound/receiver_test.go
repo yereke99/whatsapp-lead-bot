@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ayran/whatsapp-automation/internal/config"
+	"github.com/ayran/whatsapp-automation/internal/whatsapp"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
 )
 
@@ -208,6 +209,20 @@ func TestReceiverRecoversFromProviderErrors(t *testing.T) {
 	receiver.backoffFloor = time.Millisecond // keep the test quick
 
 	runUntil(t, receiver, func() bool { return len(client.deletedIDs()) == 1 })
+}
+
+func TestReceiverSurvivesUnauthorizedAndRequestTimeoutWithBackoff(t *testing.T) {
+	client := &fakeClient{errs: []error{
+		&whatsapp.Error{StatusCode: 401, Retryable: false}, context.DeadlineExceeded,
+		&whatsapp.Error{StatusCode: 466, Retryable: false},
+	}, queue: []*greenapi.Notification{notification(52, "recovered")}}
+	receiver := NewReceiver(1, "primary", client, &fakeIngester{accepted: true}, testConfig(), discardLogger())
+	receiver.backoffFloor = 5 * time.Millisecond
+	started := time.Now()
+	runUntil(t, receiver, func() bool { return len(client.deletedIDs()) == 1 })
+	if time.Since(started) < 30*time.Millisecond {
+		t.Fatal("provider failures retried without backoff")
+	}
 }
 
 // An idle queue is normal: no work, no error, no busy loop.

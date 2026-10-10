@@ -516,6 +516,7 @@ type Message struct {
 	EnrollmentID       *uuid.UUID    `json:"enrollment_id"`
 	CampaignStepID     *uuid.UUID    `json:"campaign_step_id"`
 	ScheduledMessageID *uuid.UUID    `json:"scheduled_message_id"`
+	IncomingEventID    *uuid.UUID    `json:"incoming_event_id,omitempty"`
 	Direction          Direction     `json:"direction"`
 	Type               string        `json:"type"`
 	Text               string        `json:"text"`

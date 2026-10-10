@@ -22,7 +22,7 @@ const messageColumns = `
 	m.media_url, m.file_name, m.mime_type, m.external_id, m.status, m.error,
 	m.is_manual, m.sent_by_admin_id, m.template_id, m.template_version,
 	m.media_download_status, m.sent_at, m.delivered_at, m.read_at,
-	m.created_at, m.updated_at`
+	m.created_at, m.updated_at, m.incoming_event_id`
 
 // ErrDuplicate reports that a message with the same provider id already exists.
 var ErrDuplicate = errors.New("message already recorded")
@@ -53,9 +53,9 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, m *domain.Mes
 			direction, type, text, media_file_id, media_url, file_name, mime_type,
 			external_id, status, error, is_manual, sent_by_admin_id, template_id,
 			template_version, media_download_status, sent_at, delivered_at, read_at,
-			whatsapp_instance_id
+			whatsapp_instance_id, incoming_event_id
 		) VALUES (
-			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25
 		)
 		RETURNING id, created_at, updated_at`
 
@@ -70,6 +70,7 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, m *domain.Mes
 		m.ExternalID, m.Status, m.Error, m.IsManual, m.SentByAdminID, m.TemplateID,
 		m.TemplateVersion, downloadState, m.SentAt, m.DeliveredAt, m.ReadAt,
 		domain.InstanceIDOrPrimary(m.WhatsAppInstanceID),
+		m.IncomingEventID,
 	).Scan(&m.ID, &m.CreatedAt, &m.UpdatedAt)
 
 	if err != nil {
@@ -102,6 +103,34 @@ func (r *Repository) ExistsByExternalID(ctx context.Context, q sqlite.Querier, e
 	err := r.querier(q).QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM messages WHERE external_id = $1)`, externalID).Scan(&exists)
 	return exists, err
+}
+
+// SuccessfulOutbound finds the provider receipt even if a crash left the job
+// PROCESSING. sent_at survives a later FAILED delivery-status notification:
+// that notification must not cause another API message to be created.
+func (r *Repository) SuccessfulOutbound(ctx context.Context, jobID, eventID *uuid.UUID) (*domain.Message, error) {
+	// Separate identity lookups keep SQLite on the receipt indexes. An OR
+	// combined with ORDER BY made it scan the whole outgoing history per job.
+	for _, identity := range []struct {
+		column string
+		id     *uuid.UUID
+	}{{"scheduled_message_id", jobID}, {"incoming_event_id", eventID}} {
+		if identity.id == nil {
+			continue
+		}
+		query := `SELECT ` + messageColumns + ` FROM messages m
+		  WHERE direction = 'OUTGOING' AND m.` + identity.column + ` = $1
+		    AND (sent_at IS NOT NULL OR status IN ('SENT','DELIVERED','READ')) LIMIT 1`
+		var m domain.Message
+		if err := scanMessage(r.db.QueryRow(ctx, query, identity.id), &m); err != nil {
+			if sqlite.IsNoRows(err) {
+				continue
+			}
+			return nil, err
+		}
+		return &m, nil
+	}
+	return nil, nil
 }
 
 // Timeline returns a contact's messages oldest-first within a window.
@@ -334,7 +363,7 @@ func scanMessage(row scanner, m *domain.Message, extra ...any) error {
 		&m.MediaURL, &m.FileName, &m.MimeType, &m.ExternalID, &m.Status, &m.Error,
 		&m.IsManual, &m.SentByAdminID, &m.TemplateID, &m.TemplateVersion,
 		&m.MediaDownloadState, &m.SentAt, &m.DeliveredAt, &m.ReadAt,
-		&m.CreatedAt, &m.UpdatedAt,
+		&m.CreatedAt, &m.UpdatedAt, &m.IncomingEventID,
 	}
 	dest = append(dest, extra...)
 	return row.Scan(dest...)

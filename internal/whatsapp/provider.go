@@ -154,6 +154,14 @@ func IsRetryable(err error) bool {
 	return true
 }
 
+// IsAvailabilityFailure is used for owed trigger replies. Credentials and
+// subscriptions can be restored by the operator after an outage, so these
+// leads must remain queued rather than exhaust a short send-attempt budget.
+func IsAvailabilityFailure(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && (e.StatusCode == 401 || e.StatusCode == 403 || e.StatusCode == 466)
+}
+
 // RetryableStatus classifies an HTTP status code from any provider.
 func RetryableStatus(code int) bool {
 	switch {

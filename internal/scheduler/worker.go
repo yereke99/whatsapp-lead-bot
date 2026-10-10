@@ -132,9 +132,13 @@ func (w *Worker) pollLoop(ctx context.Context, index int) {
 	}
 }
 
-// drain claims and processes batches until nothing is due.
+// drain processes up to one configured batch, renewing each active lease.
 func (w *Worker) drain(ctx context.Context) {
-	for {
+	limit := w.cfg.BatchSize
+	if limit <= 0 {
+		limit = 25
+	}
+	for i := 0; i < limit; i++ {
 		if ctx.Err() != nil {
 			return
 		}
@@ -143,13 +147,18 @@ func (w *Worker) drain(ctx context.Context) {
 		// A lease older than this belongs to a worker that is gone. Such a row
 		// must not hold up the rest of its contact's queue while it waits for
 		// the recovery sweep.
-		jobs, err := w.repo.Claim(ctx, w.workerID, w.cfg.BatchSize, now, now.Add(-w.cfg.LockTimeout))
+		// Claim only the job this worker can immediately execute. Reserving a
+		// batch behind paced sends lets the tail expire before it even starts.
+		jobs, err := w.repo.claim(ctx, w.workerID, 1, now, now.Add(-w.cfg.LockTimeout), i%2 == 0)
 		if err != nil {
 			w.log.Error("claiming jobs failed", slog.String("error", err.Error()))
 			return
 		}
 		if len(jobs) == 0 {
-			return
+			jobs, err = w.repo.Claim(ctx, w.workerID, 1, now, now.Add(-w.cfg.LockTimeout))
+			if err != nil || len(jobs) == 0 {
+				return
+			}
 		}
 
 		for i := range jobs {
@@ -199,6 +208,8 @@ func (w *Worker) maintenanceLoop(ctx context.Context) {
 // delivery. A message that does not arrive should be explainable from the log
 // alone, without reading the database.
 func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
+	ctx, release := w.keepLease(ctx, job.ID)
+	defer release()
 	log := w.log.With(
 		slog.String("scheduled_message_id", job.ID.String()),
 		slog.String("campaign_id", job.CampaignID.String()),
@@ -209,6 +220,13 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		slog.Int("attempt", job.AttemptCount+1))
 
 	log.Info("JOB_CLAIMED", slog.String("worker_id", w.workerID))
+	if reconciled, err := w.repo.ReconcileReceipt(ctx, job.ID); err != nil {
+		log.Error("reading prior send receipt failed", slog.String("error", err.Error()))
+		return
+	} else if reconciled {
+		log.Info("trigger_reply_already_sent")
+		return
+	}
 
 	jobCtx, err := w.repo.LoadContext(ctx, job.ID)
 	if err != nil {
@@ -310,13 +328,8 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		sentAt = *message.SentAt
 	}
 	if err := w.repo.MarkSent(ctx, nil, job.ID, message.ID, sentAt); err != nil {
-		// The provider has accepted the message but the row still says
-		// PROCESSING. This is the one gap no database can close, because the
-		// send and the write cannot share a transaction with an external API.
-		// It is logged loudly and left to the lease to recover: the job returns
-		// to PENDING and may send a second time. Losing the message would be
-		// worse than repeating it, so the recovery is deliberately biased that
-		// way — see the send-idempotency note in the package docs.
+		// messages already holds the provider receipt. A recovered worker
+		// reconciles that receipt before sending, so this gap cannot resend.
 		log.Error("JOB_SENT_UNRECORDED",
 			slog.String("message_id", message.ID.String()),
 			slog.String("error", err.Error()))
@@ -328,6 +341,9 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 		slog.String("step", jobCtx.StepName),
 		slog.String("message_id", message.ID.String()),
 		slog.Time("sent_at", sentAt))
+	if jobCtx.InitialReply {
+		log.Info("trigger_reply_sent", slog.String("message_id", message.ID.String()))
+	}
 }
 
 // resolveTemplate loads the content this job should render.
@@ -403,7 +419,7 @@ func shouldSkip(jc *JobContext) (string, bool) {
 
 	case !audienceEligible(jc):
 		return domain.SkipNotEligible, true
-	case jc.EnrollmentStatus != domain.EnrollmentActive:
+	case jc.EnrollmentStatus != domain.EnrollmentActive && !(jc.InitialReply && jc.EnrollmentStatus == domain.EnrollmentCompleted):
 		return "enrollment is no longer active", true
 	// The unsubscribe that counts is the one given to *this job's* number.
 	// Reading the whole-person flag here would let a customer who left the
@@ -515,8 +531,17 @@ func (w *Worker) retryOrFail(ctx context.Context, job domain.ScheduledMessage, m
 
 	attempts := job.AttemptCount + 1
 	retryable := whatsapp.IsRetryable(cause)
+	jc, contextErr := w.repo.LoadContext(ctx, job.ID)
+	if contextErr != nil {
+		log.Error("reading trigger reply retry policy failed", slog.String("error", contextErr.Error()))
+		return
+	}
+	owedReply := jc != nil && jc.InitialReply
+	if owedReply && whatsapp.IsAvailabilityFailure(cause) {
+		retryable = true
+	}
 
-	if !retryable || attempts >= maxAttempts {
+	if !retryable || (attempts >= maxAttempts && !owedReply) {
 		reason := cause.Error()
 		if !retryable {
 			reason = "permanent failure: " + reason

@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 	"github.com/ayran/whatsapp-automation/internal/templates"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
+	"github.com/ayran/whatsapp-automation/pkg/backoff"
 	"github.com/ayran/whatsapp-automation/pkg/phone"
 	"github.com/ayran/whatsapp-automation/pkg/render"
 	"github.com/ayran/whatsapp-automation/pkg/textnorm"
@@ -36,12 +38,16 @@ type Processor struct {
 	messages  *conversations.Repository
 	campaigns *campaigns.Service
 	templates *templates.Repository
-	sender    *messaging.Sender
+	sender    replyDispatcher
 	media     *media.Store
 	log       *slog.Logger
 
 	wg   sync.WaitGroup
 	once sync.Once
+}
+
+type replyDispatcher interface {
+	Send(context.Context, *domain.Contact, messaging.Outbound) (*domain.Message, error)
 }
 
 func NewProcessor(
@@ -51,7 +57,7 @@ func NewProcessor(
 	messageRepo *conversations.Repository,
 	campaignSvc *campaigns.Service,
 	templateRepo *templates.Repository,
-	sender *messaging.Sender,
+	sender replyDispatcher,
 	mediaStore *media.Store,
 	log *slog.Logger,
 ) *Processor {
@@ -94,11 +100,11 @@ func (p *Processor) Ingest(ctx context.Context, instanceID int64, instanceKey st
 		return false, nil
 	}
 
-	p.log.Info("[WHATSAPP] notification stored",
+	p.log.Info("incoming_event_persisted",
 		slog.Int64("whatsapp_instance_id", instanceID),
 		slog.String("instance", instanceKey),
 		slog.String("type", event.RawType),
-		slog.String("external_id", event.ExternalID))
+		slog.String("external_message_id", event.ExternalID))
 	return true, nil
 }
 
@@ -113,12 +119,8 @@ func (p *Processor) Ingest(ctx context.Context, instanceID int64, instanceKey st
 // table, so a notification handled on one number can no longer silently
 // suppress an identical-looking one on the other.
 //
-// Rows stored before this existed keep their unprefixed keys. That cannot
-// collide with anything, and the only consequence is that a notification which
-// was stored but whose delete call failed at the moment of the upgrade may be
-// stored a second time under the new key. Reprocessing an inbound message is
-// already safe -- the unique index on messages.external_id catches it and the
-// handler returns before any trigger runs -- so nothing is sent twice.
+// Legacy keys are also recognized by instance + external incoming message ID
+// in Repository.Insert. Existing rows do not need to be rewritten.
 func scopedDedupeKey(instanceKey, dedupeKey string) string {
 	instanceKey = strings.TrimSpace(instanceKey)
 	if instanceKey == "" {
@@ -135,6 +137,7 @@ func (p *Processor) Start(ctx context.Context) {
 		} else if released > 0 {
 			p.log.Warn("requeued notifications from a previous run", slog.Int64("count", released))
 		}
+		p.recoverRetryable(ctx)
 
 		workers := p.cfg.NotificationWorkers
 		if workers < 1 {
@@ -174,18 +177,44 @@ func (p *Processor) loop(ctx context.Context) {
 }
 
 func (p *Processor) drain(ctx context.Context) {
-	for {
+	limit := p.cfg.NotificationBatchSize
+	if limit <= 0 {
+		limit = 50
+	}
+	limit = min(limit, p.recoveryBatchSize())
+	for i := 0; i < limit; i++ {
 		if ctx.Err() != nil {
 			return
 		}
 
-		events, err := p.repo.Claim(ctx, p.cfg.NotificationBatchSize)
+		// Claim only work about to run: queued claims must not lose their
+		// leases while another reply waits for outbound pacing. Reserve slots
+		// for live traffic, oldest work, and triggers not waiting for a queued
+		// reply. Rechecking a large outbound backlog must not starve new work.
+		lane := claimReady
+		switch i % 4 {
+		case 0:
+			lane = claimLive
+		case 1:
+			lane = claimOldest
+		}
+		events, err := p.repo.claim(ctx, 1, lane)
 		if err != nil {
 			p.log.Error("claiming notifications failed", slog.String("error", err.Error()))
 			return
 		}
+		if len(events) == 0 && lane == claimLive {
+			events, err = p.repo.claim(ctx, 1, claimReady)
+			if err != nil {
+				p.log.Error("claiming notifications failed", slog.String("error", err.Error()))
+				return
+			}
+		}
 		if len(events) == 0 {
-			return
+			events, err = p.repo.Claim(ctx, 1)
+			if err != nil || len(events) == 0 {
+				return
+			}
 		}
 
 		for _, event := range events {
@@ -200,18 +229,25 @@ func (p *Processor) drain(ctx context.Context) {
 func (p *Processor) maintenanceLoop(ctx context.Context) {
 	defer p.wg.Done()
 
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	lastPrune := time.Now()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			p.recoverRetryable(ctx)
 			if _, err := p.repo.ReleaseStale(ctx, 5*time.Minute); err != nil {
 				p.log.Error("releasing stale notifications failed", slog.String("error", err.Error()))
 			}
-			// Keep two weeks of processed events for debugging, then drop them.
+			if time.Since(lastPrune) < 10*time.Minute {
+				continue
+			}
+			lastPrune = time.Now()
+			// Retain incoming identities/checkpoints. Other processed provider
+			// notifications keep the existing two-week diagnostics retention.
 			if pruned, err := p.repo.Prune(ctx, 14*24*time.Hour); err != nil {
 				p.log.Error("pruning notifications failed", slog.String("error", err.Error()))
 			} else if pruned > 0 {
@@ -224,6 +260,8 @@ func (p *Processor) maintenanceLoop(ctx context.Context) {
 const maxWebhookAttempts = 5
 
 func (p *Processor) handle(ctx context.Context, stored StoredEvent) {
+	ctx, release := p.keepLease(ctx, stored)
+	defer release()
 	event, err := greenapi.ParseWebhook(stored.Payload)
 	if err != nil {
 		// A payload that cannot be parsed will never parse; do not retry it.
@@ -236,26 +274,42 @@ func (p *Processor) handle(ctx context.Context, stored StoredEvent) {
 	// to the same account it arrived on.
 	instanceID := domain.InstanceIDOrPrimary(&stored.WhatsAppInstanceID)
 
-	handlerErr := p.apply(ctx, instanceID, event)
+	handlerErr := p.apply(ctx, instanceID, stored, event)
 	if handlerErr == nil {
 		p.finish(ctx, stored.ID, domain.WebhookProcessed, "")
 		return
 	}
+	if errors.Is(handlerErr, errAwaitingReply) {
+		if err := p.repo.Defer(ctx, stored.ID, time.Now().UTC().Add(5*time.Second), handlerErr.Error(), true); err != nil {
+			p.log.Error("deferring trigger event failed", slog.String("error", err.Error()))
+		}
+		return
+	}
 
-	if stored.Attempts >= maxWebhookAttempts {
+	retryable := whatsapp.IsRetryable(handlerErr) || whatsapp.IsAvailabilityFailure(handlerErr)
+	if !retryable || stored.Attempts >= maxWebhookAttempts {
 		p.log.Error("notification failed permanently",
+			slog.Int64("instance_id", stored.WhatsAppInstanceID),
+			slog.String("external_message_id", stored.ExternalID),
 			slog.String("type", event.RawType),
 			slog.Int("attempts", stored.Attempts),
 			slog.String("error", handlerErr.Error()))
-		p.finish(ctx, stored.ID, domain.WebhookFailed, handlerErr.Error())
+		reason := handlerErr.Error()
+		if !retryable {
+			reason = "permanent failure: " + reason
+		}
+		p.finish(ctx, stored.ID, domain.WebhookFailed, reason)
 		return
 	}
 
 	p.log.Warn("notification will be retried",
+		slog.Int64("instance_id", stored.WhatsAppInstanceID),
+		slog.String("external_message_id", stored.ExternalID),
 		slog.String("type", event.RawType),
 		slog.Int("attempts", stored.Attempts),
 		slog.String("error", handlerErr.Error()))
-	if err := p.repo.Requeue(ctx, stored.ID, handlerErr.Error()); err != nil {
+	next := backoff.Default(p.cfg.RetryBaseDelay, p.cfg.RetryMaxDelay).NextAttemptAt(time.Now().UTC(), stored.Attempts)
+	if err := p.repo.Defer(ctx, stored.ID, next, handlerErr.Error(), false); err != nil {
 		p.log.Error("requeueing notification failed", slog.String("error", err.Error()))
 	}
 }
@@ -266,10 +320,10 @@ func (p *Processor) finish(ctx context.Context, id uuid.UUID, status domain.Webh
 	}
 }
 
-func (p *Processor) apply(ctx context.Context, instanceID int64, event *whatsapp.Event) error {
+func (p *Processor) apply(ctx context.Context, instanceID int64, stored StoredEvent, event *whatsapp.Event) error {
 	switch event.Kind {
 	case whatsapp.EventIncomingMessage:
-		return p.handleIncoming(ctx, instanceID, event)
+		return p.handleIncoming(ctx, instanceID, stored, event)
 	case whatsapp.EventOutgoingMessage:
 		return p.handleOutgoingEcho(ctx, instanceID, event)
 	case whatsapp.EventOutgoingStatus:
@@ -295,7 +349,7 @@ func (p *Processor) apply(ctx context.Context, instanceID int64, event *whatsapp
 // every decision below: which campaigns may claim the message, which stop
 // words count, and which enrolments an unsubscribe ends. Nothing here ever
 // looks at the installation as a whole.
-func (p *Processor) handleIncoming(ctx context.Context, instanceID int64, event *whatsapp.Event) error {
+func (p *Processor) handleIncoming(ctx context.Context, instanceID int64, stored StoredEvent, event *whatsapp.Event) error {
 	if event.Message == nil {
 		return nil
 	}
@@ -323,6 +377,7 @@ func (p *Processor) handleIncoming(ctx context.Context, instanceID int64, event 
 	}
 
 	message := &domain.Message{
+		IncomingEventID:    &stored.ID,
 		ContactID:          contact.ID,
 		WhatsAppInstanceID: &instanceID,
 		Direction:          domain.DirectionIncoming,
@@ -344,19 +399,43 @@ func (p *Processor) handleIncoming(ctx context.Context, instanceID int64, event 
 		message.MediaDownloadState = "PENDING"
 	}
 
+	duplicate := false
 	if err := p.messages.Create(ctx, nil, message); err != nil {
 		if errors.Is(err, conversations.ErrDuplicate) {
-			// A replay that slipped past the event-level dedupe.
-			p.log.Debug("duplicate inbound message ignored",
-				slog.String("external_id", event.ExternalID))
-			return nil
+			// messages still has the original global external-id index. Keep
+			// it intact on production databases, but do not let another
+			// account's identical provider ID suppress this message's history.
+			var sameAccount bool
+			if err := p.repo.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages
+			  WHERE external_id = $1 AND direction = 'INCOMING'
+			    AND COALESCE(whatsapp_instance_id, 1) = $2)`, event.ExternalID, instanceID).Scan(&sameAccount); err != nil {
+				return err
+			}
+			if !sameAccount {
+				scopedID := fmt.Sprintf("incoming:%d:%s", instanceID, event.ExternalID)
+				message.ExternalID = &scopedID
+				if err := p.messages.Create(ctx, nil, message); err != nil && !errors.Is(err, conversations.ErrDuplicate) {
+					return err
+				} else if err == nil {
+					duplicate = false
+				} else {
+					duplicate = true
+				}
+			} else {
+				// Recording history is not proof that the trigger ran. Resume
+				// from the transactional business checkpoint instead of returning.
+				duplicate = true
+			}
+		} else {
+			return fmt.Errorf("record inbound message: %w", err)
 		}
-		return fmt.Errorf("record inbound message: %w", err)
 	}
 
-	preview := messaging.Preview(event.Message.Type, event.Message.Text, event.Message.FileName)
-	if err := p.contacts.RecordIncoming(ctx, nil, contact.ID, preview, string(event.Message.Type), event.Timestamp); err != nil {
-		p.log.Warn("updating contact activity failed", slog.String("error", err.Error()))
+	if !duplicate {
+		preview := messaging.Preview(event.Message.Type, event.Message.Text, event.Message.FileName)
+		if err := p.contacts.RecordIncoming(ctx, nil, contact.ID, preview, string(event.Message.Type), event.Timestamp); err != nil {
+			p.log.Warn("updating contact activity failed", slog.String("error", err.Error()))
+		}
 	}
 
 	// Only text carries intent the automation can act on.
@@ -373,7 +452,8 @@ func (p *Processor) handleIncoming(ctx context.Context, instanceID int64, event 
 		return nil
 	}
 
-	return p.handleTrigger(ctx, instanceID, contact, event.Message.Text, event.Timestamp)
+	return p.handleTrigger(ctx, instanceID, stored, contact, event.Message.Text, event.Timestamp,
+		duplicate || stored.Error == "manual trigger recovery")
 }
 
 // handleUnsubscribe applies a stop word to the account that received it.
@@ -418,7 +498,16 @@ func (p *Processor) handleUnsubscribe(ctx context.Context, instanceID int64, con
 	return true, nil
 }
 
-func (p *Processor) handleTrigger(ctx context.Context, instanceID int64, contact *domain.Contact, text string, at time.Time) error {
+var errAwaitingReply = errors.New("trigger reply is waiting in the outbound queue")
+
+func (p *Processor) handleTrigger(ctx context.Context, instanceID int64, stored StoredEvent, contact *domain.Contact, text string, at time.Time, recovery bool) error {
+	if stored.TriggerResult != nil {
+		var result campaigns.EnrollResult
+		if err := json.Unmarshal([]byte(*stored.TriggerResult), &result); err != nil {
+			return fmt.Errorf("read trigger checkpoint: %w", err)
+		}
+		return p.completeTriggerReply(ctx, instanceID, stored.ID, contact, &result)
+	}
 	// Only this account's campaigns are candidates. A word configured on the
 	// other number is not a trigger here, however exactly it matches.
 	match, err := p.campaigns.MatchTrigger(ctx, nil, instanceID, text)
@@ -431,32 +520,49 @@ func (p *Processor) handleTrigger(ctx context.Context, instanceID int64, contact
 		return nil
 	}
 
-	result, err := p.campaigns.HandleTrigger(ctx, contact, match, at)
+	result, err := p.campaigns.HandleTriggerEvent(ctx, contact, match, at, stored.ID, recovery)
 	if err != nil {
 		return fmt.Errorf("handle trigger: %w", err)
 	}
 
-	p.log.Info("[TRIGGER] matched",
+	p.log.Info("trigger_matched",
 		slog.Int64("whatsapp_instance_id", instanceID),
 		slog.String("campaign", match.CampaignName),
 		slog.String("campaign_id", match.CampaignID.String()),
+		slog.String("trigger_id", match.TriggerID.String()),
+		slog.String("external_message_id", stored.ExternalID),
 		slog.String("contact_id", contact.ID.String()),
 		slog.String("action", string(result.Action)))
 
-	if result.Action == campaigns.ActionSpecialMessage && result.SpecialTemplateID != nil {
-		if err := p.sendSpecialReply(ctx, instanceID, contact, result); err != nil {
-			// The enrollment decision already stands; a failed courtesy reply
-			// must not cause the whole event to be retried.
-			p.log.Error("repeat-trigger reply failed", slog.String("error", err.Error()))
-		}
-	}
+	return p.completeTriggerReply(ctx, instanceID, stored.ID, contact, result)
+}
 
+func (p *Processor) completeTriggerReply(ctx context.Context, instanceID int64, eventID uuid.UUID, contact *domain.Contact, result *campaigns.EnrollResult) error {
+	if result.InitialJobID != nil {
+		return p.repo.InitialReplyOutcome(ctx, *result.InitialJobID)
+	}
+	if result.Action != campaigns.ActionSpecialMessage || result.SpecialTemplateID == nil {
+		return nil
+	}
+	sent, err := p.messages.SuccessfulOutbound(ctx, nil, &eventID)
+	if err != nil {
+		return err
+	}
+	if sent != nil {
+		p.log.Info("trigger_reply_already_sent", slog.String("event_id", eventID.String()), slog.String("contact_id", contact.ID.String()))
+		return nil
+	}
+	if err := p.sendSpecialReply(ctx, instanceID, eventID, contact, result); err != nil {
+		p.log.Warn("trigger_reply_retry", slog.String("event_id", eventID.String()), slog.String("error", err.Error()))
+		return err
+	}
+	p.log.Info("trigger_reply_sent", slog.String("event_id", eventID.String()), slog.String("contact_id", contact.ID.String()))
 	return nil
 }
 
 // sendSpecialReply answers a repeat trigger with the configured template,
 // through the account the trigger arrived on.
-func (p *Processor) sendSpecialReply(ctx context.Context, instanceID int64, contact *domain.Contact, result *campaigns.EnrollResult) error {
+func (p *Processor) sendSpecialReply(ctx context.Context, instanceID int64, eventID uuid.UUID, contact *domain.Contact, result *campaigns.EnrollResult) error {
 	spec, err := p.templates.ResolveForSend(ctx, nil, *result.SpecialTemplateID)
 	if err != nil {
 		return err
@@ -481,6 +587,7 @@ func (p *Processor) sendSpecialReply(ctx context.Context, instanceID int64, cont
 	}
 
 	out := messaging.Outbound{
+		IncomingEventID:    &eventID,
 		WhatsAppInstanceID: instanceID,
 
 		Type:            spec.Type,

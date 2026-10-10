@@ -286,6 +286,10 @@ func (r *Repository) SkipPending(ctx context.Context, q sqlite.Querier, jobID uu
 // Both rules are evaluated against the pre-update snapshot of the table, so
 // they hold within a single batch as well as across concurrent workers.
 func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now time.Time, leaseCutoff time.Time) ([]domain.ScheduledMessage, error) {
+	return r.claim(ctx, workerID, limit, now, leaseCutoff, false)
+}
+
+func (r *Repository) claim(ctx context.Context, workerID string, limit int, now time.Time, leaseCutoff time.Time, liveOnly bool) ([]domain.ScheduledMessage, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -298,6 +302,9 @@ func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now 
 			WHERE due.status = 'PENDING'
 			  AND due.scheduled_at <= $2
 			  AND (due.next_attempt_at IS NULL OR due.next_attempt_at <= $2)
+			  AND ($5 = 0 OR EXISTS (SELECT 1 FROM webhook_events we
+			    WHERE we.trigger_result IS NOT NULL AND CAST(json_extract(we.trigger_result, '$.initial_job_id') AS TEXT) = due.id
+			      AND we.received_at >= $6))
 			  AND NOT EXISTS (
 				SELECT 1 FROM scheduled_messages busy
 				WHERE busy.contact_id = due.contact_id
@@ -320,7 +327,7 @@ func (r *Repository) Claim(ctx context.Context, workerID string, limit int, now 
 		WHERE sm.id = due.id
 		RETURNING ` + jobColumnsUnqualified
 
-	rows, err := r.db.Query(ctx, query, workerID, now, limit, leaseCutoff)
+	rows, err := r.db.Query(ctx, query, workerID, now, limit, leaseCutoff, liveOnly, now.Add(-time.Minute))
 	if err != nil {
 		return nil, fmt.Errorf("claim jobs: %w", err)
 	}
@@ -393,6 +400,7 @@ type JobContext struct {
 	// one-time campaign, where the campaign's own event start is the answer.
 	EnrollmentOccurrenceAt *time.Time
 	StepEnabled            bool
+	InitialReply           bool
 }
 
 func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobContext, error) {
@@ -412,7 +420,9 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 			EXISTS (SELECT 1 FROM contact_instance_optouts o
 			        WHERE o.contact_id = sm.contact_id
 			          AND o.whatsapp_instance_id = COALESCE(camp.whatsapp_instance_id, 1)),
-			cc.status, cc.enrolled_at, cc.occurrence_at
+			cc.status, cc.enrolled_at, cc.occurrence_at,
+			EXISTS (SELECT 1 FROM webhook_events we
+		    WHERE we.trigger_result IS NOT NULL AND CAST(json_extract(we.trigger_result, '$.initial_job_id') AS TEXT) = sm.id)
 		FROM scheduled_messages sm
 		JOIN campaigns camp        ON camp.id = sm.campaign_id
 		JOIN campaign_steps cs     ON cs.id = sm.campaign_step_id
@@ -435,6 +445,7 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 		&jc.ContactOptedOut, &jc.ContactBlocked, &jc.ContactStatus, &jc.ContactConsentAt,
 		&jc.ContactOptedOutHere,
 		&jc.EnrollmentStatus, &jc.EnrollmentJoinedAt, &jc.EnrollmentOccurrenceAt,
+		&jc.InitialReply,
 	)
 
 	if err := row.Scan(dest...); err != nil {
@@ -536,7 +547,9 @@ func (r *Repository) CancelStale(ctx context.Context, olderThan time.Duration) (
 		UPDATE scheduled_messages SET
 			status = 'CANCELLED', cancelled_at = now(),
 			cancel_reason = 'send window expired', updated_at = now()
-		WHERE status = 'PENDING' AND scheduled_at < $1`
+		WHERE status = 'PENDING' AND scheduled_at < $1
+		  AND NOT EXISTS (SELECT 1 FROM webhook_events we
+		    WHERE we.trigger_result IS NOT NULL AND CAST(json_extract(we.trigger_result, '$.initial_job_id') AS TEXT) = scheduled_messages.id)`
 
 	tag, err := r.db.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
 	if err != nil {

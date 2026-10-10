@@ -2,6 +2,7 @@ package campaigns
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -133,6 +134,9 @@ type EnrollResult struct {
 	// sent and no new schedule is created.
 	SpecialTemplateID *uuid.UUID
 	Reason            string
+	// InitialJobID binds the incoming event to the greeting in the existing
+	// scheduler. The checkpoint is committed together with enrollment/jobs.
+	InitialJobID *uuid.UUID `json:"initial_job_id,omitempty"`
 }
 
 // HandleTrigger enrolls a contact into the matched campaign, or applies the
@@ -141,6 +145,17 @@ type EnrollResult struct {
 // The whole decision runs in one transaction, so two webhook deliveries racing
 // on the same trigger cannot both create a schedule.
 func (s *Service) HandleTrigger(ctx context.Context, contact *domain.Contact, match *TriggerMatch, at time.Time) (*EnrollResult, error) {
+	return s.handleTrigger(ctx, contact, match, at, nil, false)
+}
+
+// HandleTriggerEvent checkpoints the business decision in the same transaction
+// as its effects. Replaying this event never reapplies RESTART or CONTINUE.
+// Recovery of legacy records preserves an existing enrollment and its jobs.
+func (s *Service) HandleTriggerEvent(ctx context.Context, contact *domain.Contact, match *TriggerMatch, at time.Time, eventID uuid.UUID, recovery bool) (*EnrollResult, error) {
+	return s.handleTrigger(ctx, contact, match, at, &eventID, recovery)
+}
+
+func (s *Service) handleTrigger(ctx context.Context, contact *domain.Contact, match *TriggerMatch, at time.Time, eventID *uuid.UUID, recovery bool) (*EnrollResult, error) {
 	if contact == nil || match == nil {
 		return &EnrollResult{Action: ActionIgnored, Reason: "no trigger match"}, nil
 	}
@@ -159,98 +174,140 @@ func (s *Service) HandleTrigger(ctx context.Context, contact *domain.Contact, ma
 	result := &EnrollResult{}
 
 	err := s.repo.DB().InTx(ctx, func(tx sqlite.Querier) error {
-		campaign, err := s.repo.GetByID(ctx, tx, match.CampaignID)
-		if err != nil {
-			return err
+		if eventID != nil {
+			var checkpoint *string
+			if err := tx.QueryRow(ctx, `SELECT trigger_result FROM webhook_events WHERE id = $1`, *eventID).Scan(&checkpoint); err != nil {
+				return err
+			}
+			if checkpoint != nil {
+				return json.Unmarshal([]byte(*checkpoint), result)
+			}
 		}
-		if campaign == nil {
-			return ErrNotFound
-		}
-
-		instanceID := domain.InstanceIDOrPrimary(campaign.WhatsAppInstanceID)
-		optedOut, err := s.contacts.IsOptedOutOn(ctx, tx, instanceID, contact.ID)
-		if err != nil {
-			return err
-		}
-		if optedOut {
-			result.Action = ActionBlocked
-			result.Reason = "contact has unsubscribed from this whatsapp account"
-			return nil
-		}
-		if !campaign.AcceptsEnrollments() {
-			result.Action = ActionIgnored
-			result.Reason = "campaign is not accepting enrollments"
-			return nil
-		}
-		result.Campaign = campaign
-
-		existing, err := s.repo.FindEnrollment(ctx, tx, campaign.ID, contact.ID)
-		if err != nil {
-			return err
-		}
-
-		if existing != nil {
-			return s.applyExistingBehavior(ctx, tx, campaign, contact, existing, match, at, result)
-		}
-
-		// An optional cap on how many contacts one campaign may be running at
-		// once. New entries stop; contacts already in the funnel finish.
-		if campaign.MaxActiveContacts != nil {
-			active, err := s.repo.ActiveEnrollmentCount(ctx, tx, campaign.ID)
+		// All returns below pass through this closure so even an IGNORE decision
+		// is remembered, rather than becoming a different action on a retry.
+		if err := func() error {
+			campaign, err := s.repo.GetByID(ctx, tx, match.CampaignID)
 			if err != nil {
 				return err
 			}
-			if active >= *campaign.MaxActiveContacts {
-				result.Action = ActionIgnored
-				result.Reason = fmt.Sprintf("белсенді клиент шегі толды (%d)", *campaign.MaxActiveContacts)
-				s.log.Warn("campaign contact limit reached; enrollment refused",
-					slog.String("campaign_id", campaign.ID.String()),
-					slog.Int("active", active),
-					slog.Int("limit", *campaign.MaxActiveContacts))
+			if campaign == nil {
+				return ErrNotFound
+			}
+
+			instanceID := domain.InstanceIDOrPrimary(campaign.WhatsAppInstanceID)
+			optedOut, err := s.contacts.IsOptedOutOn(ctx, tx, instanceID, contact.ID)
+			if err != nil {
+				return err
+			}
+			if optedOut {
+				result.Action = ActionBlocked
+				result.Reason = "contact has unsubscribed from this whatsapp account"
 				return nil
 			}
-		}
+			if !campaign.AcceptsEnrollments() {
+				result.Action = ActionIgnored
+				result.Reason = "campaign is not accepting enrollments"
+				return nil
+			}
+			result.Campaign = campaign
 
-		enrollment := &domain.Enrollment{
-			CampaignID:     campaign.ID,
-			ContactID:      contact.ID,
-			TriggerID:      &match.TriggerID,
-			TriggerKeyword: match.Keyword,
-		}
+			existing, err := s.repo.FindEnrollment(ctx, tx, campaign.ID, contact.ID)
+			if err != nil {
+				return err
+			}
 
-		// A recurring campaign pins the webinar this contact is joining before
-		// the enrolment row exists, so the anchor is written once, atomically,
-		// and every later read — planner, reconciler, worker — sees the same
-		// answer. For a one-time campaign this is nil and nothing changes.
-		occurrence, err := s.occurrenceFor(ctx, tx, campaign, at)
+			if existing != nil {
+				if recovery {
+					result.Enrollment = existing
+					result.Action = ActionContinued
+					result.Reason = "recover missing initial reply; preserve existing enrollment"
+					return nil
+				}
+				return s.applyExistingBehavior(ctx, tx, campaign, contact, existing, match, at, result)
+			}
+
+			// An optional cap on how many contacts one campaign may be running at
+			// once. New entries stop; contacts already in the funnel finish.
+			if campaign.MaxActiveContacts != nil {
+				active, err := s.repo.ActiveEnrollmentCount(ctx, tx, campaign.ID)
+				if err != nil {
+					return err
+				}
+				if active >= *campaign.MaxActiveContacts {
+					result.Action = ActionIgnored
+					result.Reason = fmt.Sprintf("белсенді клиент шегі толды (%d)", *campaign.MaxActiveContacts)
+					s.log.Warn("campaign contact limit reached; enrollment refused",
+						slog.String("campaign_id", campaign.ID.String()),
+						slog.Int("active", active),
+						slog.Int("limit", *campaign.MaxActiveContacts))
+					return nil
+				}
+			}
+
+			enrollment := &domain.Enrollment{
+				CampaignID:     campaign.ID,
+				ContactID:      contact.ID,
+				TriggerID:      &match.TriggerID,
+				TriggerKeyword: match.Keyword,
+			}
+
+			// A recurring campaign pins the webinar this contact is joining before
+			// the enrolment row exists, so the anchor is written once, atomically,
+			// and every later read — planner, reconciler, worker — sees the same
+			// answer. For a one-time campaign this is nil and nothing changes.
+			occurrence, err := s.occurrenceFor(ctx, tx, campaign, at)
+			if err != nil {
+				return err
+			}
+			enrollment.OccurrenceAt = occurrence
+
+			if err := s.repo.CreateEnrollment(ctx, tx, enrollment); err != nil {
+				if errors.Is(err, ErrAlreadyEnrolled) {
+					// Lost a race with a concurrent delivery of the same trigger.
+					// The other transaction has done the work.
+					result.Action = ActionIgnored
+					result.Reason = "duplicate trigger delivery"
+					return nil
+				}
+				return err
+			}
+			result.Enrollment = enrollment
+			result.Action = ActionEnrolled
+
+			if err := s.contacts.SetFirstCampaign(ctx, tx, contact.ID, campaign.ID, match.Keyword); err != nil {
+				return err
+			}
+
+			created, err := s.scheduleEnrollment(ctx, tx, campaign, enrollment, at)
+			if err != nil {
+				return err
+			}
+			result.JobsCreated = created
+			return nil
+		}(); err != nil {
+			return err
+		}
+		if eventID == nil {
+			return nil
+		}
+		if result.Enrollment != nil && (result.Action == ActionEnrolled || result.Action == ActionRestarted || result.Action == ActionContinued) {
+			jobID, err := s.InitialReplyJob(ctx, tx, result.Enrollment)
+			if err != nil {
+				return err
+			}
+			result.InitialJobID = jobID
+			if recovery && jobID != nil {
+				if err := s.RecoverInitialReply(ctx, tx, *jobID); err != nil {
+					return err
+				}
+			}
+		}
+		checkpoint, err := json.Marshal(result)
 		if err != nil {
 			return err
 		}
-		enrollment.OccurrenceAt = occurrence
-
-		if err := s.repo.CreateEnrollment(ctx, tx, enrollment); err != nil {
-			if errors.Is(err, ErrAlreadyEnrolled) {
-				// Lost a race with a concurrent delivery of the same trigger.
-				// The other transaction has done the work.
-				result.Action = ActionIgnored
-				result.Reason = "duplicate trigger delivery"
-				return nil
-			}
-			return err
-		}
-		result.Enrollment = enrollment
-		result.Action = ActionEnrolled
-
-		if err := s.contacts.SetFirstCampaign(ctx, tx, contact.ID, campaign.ID, match.Keyword); err != nil {
-			return err
-		}
-
-		created, err := s.scheduleEnrollment(ctx, tx, campaign, enrollment, at)
-		if err != nil {
-			return err
-		}
-		result.JobsCreated = created
-		return nil
+		_, err = tx.Exec(ctx, `UPDATE webhook_events SET trigger_result = $2 WHERE id = $1`, *eventID, string(checkpoint))
+		return err
 	})
 
 	if err != nil {

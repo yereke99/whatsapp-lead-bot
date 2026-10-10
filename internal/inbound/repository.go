@@ -1,5 +1,5 @@
-// Package inbound ingests provider notifications, guarantees each one is
-// processed exactly once, and drives the inbound side of the automation:
+// Package inbound durably ingests and retries provider notifications and
+// drives the inbound side of the automation:
 // contact creation, conversation history, trigger detection and unsubscribes.
 package inbound
 
@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,6 +37,11 @@ type StoredEvent struct {
 	DedupeKey          string
 	Payload            json.RawMessage
 	Attempts           int
+	ExternalID         string
+	ReceivedAt         time.Time
+	TriggerResult      *string
+	Status             domain.WebhookEventStatus
+	Error              string
 }
 
 // Insert records an event, returning false when it is a replay.
@@ -60,20 +66,51 @@ func (r *Repository) Insert(ctx context.Context, instanceID int64, provider, eve
 		RETURNING id`
 
 	var id uuid.UUID
-	err := r.db.QueryRow(ctx, query,
-		provider, eventType, dedupeKey, externalID, payload, receivedAt, instanceID).Scan(&id)
-
-	if err != nil {
-		if sqlite.IsNoRows(err) {
-			return uuid.Nil, false, nil
+	inserted := false
+	err := r.db.InTx(ctx, func(tx sqlite.Querier) error {
+		// Old deployments used unscoped keys. Reuse their record by the actual
+		// provider identity, without modifying historical dedupe keys.
+		if eventType == "incomingMessageReceived" && externalID != "" {
+			var existing uuid.UUID
+			err := tx.QueryRow(ctx, `SELECT id FROM webhook_events
+			  WHERE provider = $1 AND COALESCE(whatsapp_instance_id, 1) = $2
+			    AND external_id = $3 AND event_type = $4 ORDER BY created_at, id LIMIT 1`,
+				provider, instanceID, externalID, eventType).Scan(&existing)
+			if err == nil {
+				id = existing
+				return nil
+			}
+			if !sqlite.IsNoRows(err) {
+				return err
+			}
 		}
+		err := tx.QueryRow(ctx, query, provider, eventType, dedupeKey, externalID, payload, receivedAt, instanceID).Scan(&id)
+		if sqlite.IsNoRows(err) {
+			return nil
+		}
+		inserted = err == nil
+		return err
+	})
+	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("store webhook event: %w", err)
 	}
-	return id, true, nil
+	return id, inserted, nil
 }
 
 // Claim moves up to limit queued events into PROCESSING.
 func (r *Repository) Claim(ctx context.Context, limit int) ([]StoredEvent, error) {
+	return r.claim(ctx, limit, claimOldest)
+}
+
+type claimLane int
+
+const (
+	claimOldest claimLane = iota
+	claimLive
+	claimReady
+)
+
+func (r *Repository) claim(ctx context.Context, limit int, lane claimLane) ([]StoredEvent, error) {
 	if limit <= 0 {
 		limit = 25
 	}
@@ -86,14 +123,17 @@ func (r *Repository) Claim(ctx context.Context, limit int) ([]StoredEvent, error
 		FROM (
 			SELECT id FROM webhook_events
 			WHERE status = 'RECEIVED'
-			ORDER BY received_at
+			  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+			  AND ($2 != 1 OR (attempts = 0 AND trigger_result IS NULL AND received_at >= $3))
+			  AND ($2 != 2 OR error != $4)
+			ORDER BY received_at, id
 			LIMIT $1
 		) queued
 		WHERE we.id = queued.id
 		RETURNING id, provider, event_type, dedupe_key, payload, attempts,
-		          COALESCE(whatsapp_instance_id, 1)`
+		          COALESCE(whatsapp_instance_id, 1), external_id, received_at, trigger_result, status, error`
 
-	rows, err := r.db.Query(ctx, query, limit)
+	rows, err := r.db.Query(ctx, query, limit, lane, time.Now().UTC().Add(-time.Minute), errAwaitingReply.Error())
 	if err != nil {
 		return nil, fmt.Errorf("claim webhook events: %w", err)
 	}
@@ -103,11 +143,18 @@ func (r *Repository) Claim(ctx context.Context, limit int) ([]StoredEvent, error
 	for rows.Next() {
 		var e StoredEvent
 		if err := rows.Scan(&e.ID, &e.Provider, &e.EventType, &e.DedupeKey, &e.Payload,
-			&e.Attempts, &e.WhatsAppInstanceID); err != nil {
+			&e.Attempts, &e.WhatsAppInstanceID, &e.ExternalID, &e.ReceivedAt, &e.TriggerResult, &e.Status, &e.Error); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
 	}
+	// SQLite's RETURNING order is unspecified, even with an ordered subquery.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ReceivedAt.Equal(out[j].ReceivedAt) {
+			return out[i].ID.String() < out[j].ID.String()
+		}
+		return out[i].ReceivedAt.Before(out[j].ReceivedAt)
+	})
 	return out, rows.Err()
 }
 
@@ -115,7 +162,7 @@ func (r *Repository) MarkProcessed(ctx context.Context, id uuid.UUID, status dom
 	const query = `
 		UPDATE webhook_events
 		SET status = $2, error = $3, processed_at = now(), updated_at = now()
-		WHERE id = $1`
+		WHERE id = $1 AND status = 'PROCESSING'`
 
 	_, err := r.db.Exec(ctx, query, id, status, truncate(errText, 2000))
 	return err
@@ -123,12 +170,17 @@ func (r *Repository) MarkProcessed(ctx context.Context, id uuid.UUID, status dom
 
 // Requeue returns a failed event to the queue for another attempt.
 func (r *Repository) Requeue(ctx context.Context, id uuid.UUID, errText string) error {
+	return r.Defer(ctx, id, time.Now().UTC().Add(10*time.Second), errText, false)
+}
+
+func (r *Repository) Defer(ctx context.Context, id uuid.UUID, until time.Time, errText string, waiting bool) error {
 	const query = `
 		UPDATE webhook_events
-		SET status = 'RECEIVED', error = $2, updated_at = now()
-		WHERE id = $1`
+		SET status = 'RECEIVED', error = $2, next_attempt_at = $3,
+		    attempts = max(0, attempts - $4), updated_at = now()
+		WHERE id = $1 AND status = 'PROCESSING'`
 
-	_, err := r.db.Exec(ctx, query, id, truncate(errText, 2000))
+	_, err := r.db.Exec(ctx, query, id, truncate(errText, 2000), until, waiting)
 	return err
 }
 
@@ -189,7 +241,9 @@ func (r *Repository) List(ctx context.Context, status string, limit, offset int)
 func (r *Repository) Prune(ctx context.Context, olderThan time.Duration) (int64, error) {
 	const query = `
 		DELETE FROM webhook_events
-		WHERE status IN ('PROCESSED', 'IGNORED') AND received_at < $1`
+		WHERE status IN ('PROCESSED', 'IGNORED') AND received_at < $1
+		  AND event_type != 'incomingMessageReceived'
+		  AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.incoming_event_id = webhook_events.id)`
 
 	tag, err := r.db.Exec(ctx, query, time.Now().UTC().Add(-olderThan))
 	if err != nil {

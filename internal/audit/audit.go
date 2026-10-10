@@ -57,13 +57,14 @@ const (
 	ActionContactResubscribed = "contact.resubscribed"
 	ActionContactDeleted      = "contact.deleted"
 
-	ActionManualMessage = "message.manual_sent"
-	ActionBulkAction    = "contacts.bulk_action"
-	ActionExport        = "contacts.exported"
-	ActionMediaUploaded = "media.uploaded"
-	ActionMediaDeleted  = "media.deleted"
-	ActionJobRequeued   = "job.requeued"
-	ActionJobCancelled  = "job.cancelled"
+	ActionManualMessage     = "message.manual_sent"
+	ActionBulkAction        = "contacts.bulk_action"
+	ActionExport            = "contacts.exported"
+	ActionMediaUploaded     = "media.uploaded"
+	ActionMediaDeleted      = "media.deleted"
+	ActionJobRequeued       = "job.requeued"
+	ActionJobCancelled      = "job.cancelled"
+	ActionIncomingRecovered = "incoming.requeued"
 )
 
 // Actor identifies who performed an action.

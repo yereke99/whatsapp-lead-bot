@@ -162,6 +162,8 @@ func (s *Server) routes() {
 
 	protected.HandleFunc("GET /api/audit-logs", s.handleAuditLogs)
 	protected.HandleFunc("GET /api/webhook-events", s.handleWebhookEvents)
+	protected.HandleFunc("GET /api/incoming-recovery", s.handleRecoveryPreview)
+	protected.HandleFunc("POST /api/incoming-recovery/requeue", s.handleRecoveryRequeue)
 	protected.HandleFunc("GET /api/system/consistency", s.handleConsistency)
 	protected.HandleFunc("GET /api/system/provider", s.handleProviderState)
 	protected.HandleFunc("GET /api/whatsapp-instances", s.handleListInstances)

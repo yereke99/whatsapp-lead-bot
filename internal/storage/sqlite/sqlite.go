@@ -132,9 +132,9 @@ func dsn(path string, cfg config.Database) string {
 	// Wait for a busy lock instead of returning SQLITE_BUSY immediately.
 	params.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busy.Milliseconds()))
 	params.Add("_pragma", "foreign_keys(ON)")
-	// WAL already survives a process crash; NORMAL only risks the last commits
-	// on a machine-level power loss and removes an fsync per transaction.
-	params.Add("_pragma", "synchronous(NORMAL)")
+	// A notification is deleted remotely after this commit. FULL also syncs
+	// the WAL at commit, protecting acknowledged leads on machine power loss.
+	params.Add("_pragma", "synchronous(FULL)")
 	// Let SQLite keep a page cache worth having (negative means KiB).
 	params.Add("_pragma", "cache_size(-16000)")
 	// Every transaction takes the write lock up front. Without this, a

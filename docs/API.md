@@ -674,6 +674,31 @@ media operations.
 Raw provider deliveries with their processing status and attempt counts.
 Useful for confirming the provider is reaching the server.
 
+### GET /api/incoming-recovery
+
+Owner-only. Optional `instance_id` scopes the preview to one account. Read-only
+scan, using bounded database pages. Returns `incoming_events_found`,
+`already_replied`, `not_matching_active_campaign`, `already_queued`, `ineligible`,
+`ambiguous_legacy_events`, `eligible_for_recovery`, `batch_size`, and `items`.
+Each item contains `event_id`, `instance_id`, `external_message_id`, `received_at`.
+Items contain the oldest eligible batch; counts cover all persisted incoming
+events in the chosen scope. Ordinary queued work is already recovered automatically.
+
+### POST /api/incoming-recovery/requeue
+
+Owner-only, requires the session cookie and `X-CSRF-Token`. Body:
+
+```json
+{"event_ids":["00000000-0000-0000-0000-000000000001"]}
+```
+
+Supply 1 to `RECOVERY_BATCH_SIZE` IDs from the preview (default 150). Eligibility
+and successful response receipts are rechecked. Response contains `requested`,
+`requeued`, `skipped`. Repeated requests are safe. It only requeues persisted
+events and the specific missed initial job; normal workers deliver replies.
+No direct bulk sending takes place in the handler. Requeue is recorded in the
+audit log as `incoming.requeued`.
+
 ### GET /api/health
 
 Unauthenticated.

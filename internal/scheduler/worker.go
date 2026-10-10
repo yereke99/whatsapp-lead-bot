@@ -527,11 +527,13 @@ func (w *Worker) retryOrFail(ctx context.Context, job domain.ScheduledMessage, m
 		// FAILED is a resting place, not a deletion: the row keeps its error,
 		// its attempt count and its schedule, stays visible in the panel and
 		// can be requeued by hand.
-		log.Error("JOB_FAILED",
+		attrs := []any{
 			slog.Int("attempts", attempts),
 			slog.Int("max_attempts", maxAttempts),
 			slog.Bool("retryable", retryable),
-			slog.String("error", cause.Error()))
+			slog.String("error", cause.Error()),
+		}
+		log.Error("JOB_FAILED", append(attrs, scheduledProviderErrorAttrs(cause)...)...)
 		return
 	}
 
@@ -541,11 +543,24 @@ func (w *Worker) retryOrFail(ctx context.Context, job domain.ScheduledMessage, m
 		return
 	}
 
-	log.Warn("JOB_RETRY",
+	attrs := []any{
 		slog.Int("attempts", attempts),
 		slog.Int("max_attempts", maxAttempts),
 		slog.Time("next_attempt", next),
-		slog.String("error", cause.Error()))
+		slog.String("error", cause.Error()),
+	}
+	log.Warn("JOB_RETRY", append(attrs, scheduledProviderErrorAttrs(cause)...)...)
+}
+
+func scheduledProviderErrorAttrs(err error) []any {
+	var providerErr *whatsapp.Error
+	if !errors.As(err, &providerErr) {
+		return nil
+	}
+	return []any{
+		slog.String("provider_op", providerErr.Op),
+		slog.Int("http_status", providerErr.StatusCode),
+	}
 }
 
 func contactFromJob(jc *JobContext) *domain.Contact {

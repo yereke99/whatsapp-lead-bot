@@ -911,7 +911,7 @@ func (s *Service) SetStatus(ctx context.Context, id uuid.UUID, status domain.Cam
 		return s.Activate(ctx, id)
 	}
 	if !domain.ValidCampaignStatus(string(status)) {
-		return nil, fmt.Errorf("мәртебе жарамсыз: %s", status)
+		return nil, fmt.Errorf("%w: %s", ErrInvalidStatus, status)
 	}
 	if err := s.repo.SetStatus(ctx, nil, id, status); err != nil {
 		return nil, err

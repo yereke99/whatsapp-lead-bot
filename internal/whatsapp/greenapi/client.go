@@ -493,6 +493,11 @@ func (c *Client) doRequest(ctx context.Context, method, url, contentType string,
 		if errors.Is(err, context.Canceled) {
 			retryable = false
 		}
+		// net/http includes the complete request URL in transport errors. Green
+		// API puts the instance token in that URL, so returning or logging the raw
+		// error leaks credentials into both the application log and a failed
+		// scheduled message's last_error column.
+		err = c.redactTransportError(err)
 		c.log.Warn("provider request failed",
 			slog.String("op", op),
 			slog.Duration("took", time.Since(started)),
@@ -513,18 +518,18 @@ func (c *Client) doRequest(ctx context.Context, method, url, contentType string,
 		slog.Duration("took", time.Since(started)))
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, classifyHTTP(op, resp.StatusCode, raw)
+		return nil, classifyHTTP(op, resp.StatusCode, c.redact(string(raw)))
 	}
 	return raw, nil
 }
 
-func classifyHTTP(op string, status int, body []byte) *whatsapp.Error {
+func classifyHTTP(op string, status int, body string) *whatsapp.Error {
 	err := &whatsapp.Error{
 		Provider:   providerName,
 		Op:         op,
 		StatusCode: status,
-		Body:       truncate(string(body), 1000),
-		Retryable:  whatsapp.RetryableStatus(status),
+		Body:       truncate(body, 1000),
+		Retryable:  retryableResponse(status, body),
 	}
 
 	switch status {
@@ -549,7 +554,7 @@ func classifyHTTP(op string, status int, body []byte) *whatsapp.Error {
 
 	// Green API answers with a JSON body on most failures; surface it.
 	var parsed map[string]any
-	if json.Unmarshal(body, &parsed) == nil {
+	if json.Unmarshal([]byte(body), &parsed) == nil {
 		for _, key := range []string{"message", "error", "reason", "description"} {
 			if v, ok := parsed[key].(string); ok && v != "" {
 				err.Message = err.Message + ": " + v
@@ -559,6 +564,53 @@ func classifyHTTP(op string, status int, body []byte) *whatsapp.Error {
 	}
 
 	return err
+}
+
+// retryableResponse adds Green API's provider-specific transient states to
+// the generic HTTP retry policy.
+//
+// Green API reports a starting or temporarily disconnected WhatsApp session
+// as HTTP 400. A blanket "all 400s are permanent" classification therefore
+// moved a due scheduled message straight to FAILED on its first attempt. Only
+// the documented session-state responses are retried; validation errors and
+// expired/deleted instances remain permanent.
+func retryableResponse(status int, body string) bool {
+	if whatsapp.RetryableStatus(status) || status == 499 {
+		return true
+	}
+	if status != http.StatusBadRequest {
+		return false
+	}
+
+	message := strings.ToLower(body)
+	mentionsInstance := strings.Contains(message, "instance")
+	return (mentionsInstance && strings.Contains(message, "starting")) ||
+		(mentionsInstance && strings.Contains(message, "not authorized")) ||
+		strings.Contains(message, "notauthorized")
+}
+
+// redactedError preserves errors.Is/errors.As through Unwrap while ensuring
+// Error never exposes the credential-bearing request URL.
+type redactedError struct {
+	text string
+	err  error
+}
+
+func (e *redactedError) Error() string { return e.text }
+func (e *redactedError) Unwrap() error { return e.err }
+
+func (c *Client) redactTransportError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &redactedError{text: c.redact(err.Error()), err: err}
+}
+
+func (c *Client) redact(value string) string {
+	if c.token == "" {
+		return value
+	}
+	return strings.ReplaceAll(value, c.token, "[REDACTED]")
 }
 
 func wrapLocal(op string, err error) *whatsapp.Error {

@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -342,12 +343,27 @@ func (s *Server) handleCampaignStatus(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, campaigns.ErrNotFound):
 			httpx.Fail(w, http.StatusNotFound, httpx.CodeNotFound, "Кампания табылмады")
 		case errors.As(err, &invalid):
+			s.log.Warn("campaign status update rejected",
+				slog.String("campaign_id", id.String()),
+				slog.String("target_status", string(status)),
+				slog.Int("blocking_problems", len(invalid.Problems)))
 			// Every blocking problem at once, so the operator fixes the
 			// campaign in one pass instead of one error per attempt.
 			httpx.FailWithDetails(w, http.StatusBadRequest, httpx.CodeValidation,
 				"Кампанияны іске қосу мүмкін емес", map[string]any{"problems": invalid.Problems})
-		default:
+		case errors.Is(err, campaigns.ErrInvalidStatus):
+			s.log.Warn("campaign status update rejected",
+				slog.String("campaign_id", id.String()),
+				slog.String("target_status", string(status)),
+				slog.String("error", err.Error()))
 			httpx.Fail(w, http.StatusBadRequest, httpx.CodeValidation, err.Error())
+		default:
+			// Storage and other backend faults are not validation failures. Log
+			// the real cause with the transition that failed, while keeping the
+			// internal error out of the response shown to the operator.
+			httpx.Internal(w, s.log.With(
+				slog.String("campaign_id", id.String()),
+				slog.String("target_status", string(status))), err, "set campaign status")
 		}
 		return
 	}

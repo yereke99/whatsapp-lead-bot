@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/ayran/whatsapp-automation/internal/config"
+	"github.com/ayran/whatsapp-automation/internal/whatsapp"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
 )
 
@@ -89,6 +91,7 @@ func (r *Receiver) Run(ctx context.Context) {
 		slog.Duration("receive_timeout", r.cfg.ReceiveTimeout))
 
 	backoff := r.floor()
+	hadProviderFailure := false
 
 	for {
 		if ctx.Err() != nil {
@@ -108,9 +111,10 @@ func (r *Receiver) Run(ctx context.Context) {
 
 		case err != nil:
 			// A provider outage must not spin the CPU or crash the service.
-			r.log.Error("[GREENAPI] receive failed",
-				slog.String("error", err.Error()),
-				slog.Duration("retry_in", backoff))
+			attrs := providerErrorAttrs(err)
+			attrs = append(attrs, slog.Duration("retry_in", backoff))
+			r.log.Error("[GREENAPI] receive failed", attrs...)
+			hadProviderFailure = true
 			if !sleep(ctx, backoff) {
 				return
 			}
@@ -118,6 +122,10 @@ func (r *Receiver) Run(ctx context.Context) {
 			continue
 		}
 
+		if hadProviderFailure {
+			r.log.Info("[GREENAPI] polling recovered")
+			hadProviderFailure = false
+		}
 		backoff = r.floor()
 
 		if notification == nil {
@@ -175,11 +183,38 @@ func (r *Receiver) handle(ctx context.Context, notification *greenapi.Notificati
 
 	if err := r.client.DeleteNotification(deleteCtx, notification.ReceiptID); err != nil {
 		// Harmless: the entry reappears and deduplication rejects it.
-		log.Warn("[GREENAPI] delete failed; notification will be redelivered",
-			slog.String("error", err.Error()))
+		log.Warn("[GREENAPI] delete failed; notification will be redelivered", providerErrorAttrs(err)...)
 		return
 	}
 	log.Debug("[GREENAPI] notification deleted")
+}
+
+// providerErrorAttrs keeps provider failures queryable without requiring an
+// operator to parse one long error string. Credentials are absent because the
+// Green API client redacts them before an error leaves the transport layer.
+func providerErrorAttrs(err error) []any {
+	attrs := []any{slog.String("error", err.Error())}
+
+	var providerErr *whatsapp.Error
+	if !errors.As(err, &providerErr) {
+		return attrs
+	}
+	attrs = append(attrs,
+		slog.String("provider_op", providerErr.Op),
+		slog.Int("http_status", providerErr.StatusCode),
+		slog.Bool("retryable", providerErr.Retryable))
+
+	// Green API reports these session states as HTTP 400 rather than as a
+	// distinct status field. Promote the state into its own log attribute so an
+	// outage can be found without matching prose in the error body.
+	body := strings.ToLower(providerErr.Body)
+	switch {
+	case strings.Contains(body, "not authorized"), strings.Contains(body, "notauthorized"):
+		attrs = append(attrs, slog.String("provider_state", "notAuthorized"))
+	case strings.Contains(body, "starting"):
+		attrs = append(attrs, slog.String("provider_state", "starting"))
+	}
+	return attrs
 }
 
 // isMalformed reports whether an ingest error is a permanent parse failure

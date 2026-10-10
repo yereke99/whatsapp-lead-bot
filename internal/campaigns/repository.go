@@ -22,6 +22,7 @@ var (
 	ErrStepNotFound   = errors.New("campaign step not found")
 	ErrNoEventStart   = errors.New("campaign has no event start time")
 	ErrNoEnabledSteps = errors.New("campaign has no enabled steps")
+	ErrInvalidStatus  = errors.New("invalid campaign status")
 )
 
 const campaignColumns = `

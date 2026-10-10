@@ -34,6 +34,14 @@ type recoveryProvider struct {
 	status   int
 	accepted int
 	times    []time.Time
+	history  func(context.Context, string) (*whatsapp.ReplyHistory, error)
+}
+
+func (p *recoveryProvider) ReplyHistory(ctx context.Context, chatID string) (*whatsapp.ReplyHistory, error) {
+	if p.history == nil {
+		return nil, fmt.Errorf("history unavailable")
+	}
+	return p.history(ctx, chatID)
 }
 
 func (p *recoveryProvider) Name() string { return "fake" }
@@ -113,13 +121,32 @@ func recoverySetup(t *testing.T, behavior domain.ExistingContactBehavior) *recov
 		t.Fatal(err)
 	}
 	provider := &recoveryProvider{status: 503}
+	provider.history = func(ctx context.Context, chatID string) (*whatsapp.ReplyHistory, error) {
+		h := &whatsapp.ReplyHistory{PhoneRepliesRecorded: true}
+		rows, err := db.Query(ctx, `SELECT external_id, received_at FROM webhook_events
+		  WHERE event_type = 'incomingMessageReceived' AND json_extract(payload, '$.senderData.chatId') = $1`, chatID)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			var at time.Time
+			if err := rows.Scan(&id, &at); err != nil {
+				return nil, err
+			}
+			h.Messages = append(h.Messages, whatsapp.HistoryMessage{Type: "incoming", ExternalID: id, Timestamp: at.Unix(), ChatID: chatID})
+		}
+		return h, rows.Err()
+	}
 	sender := messaging.NewSender(recoveryRegistry{provider}, messageRepo, contactRepo, store, discardLogger())
 	gate := outbound.NewRouter([]outbound.InstanceSpec{{ID: 1, Key: "primary", Outbound: config.Outbound{Workers: 1, MinDelay: 2 * time.Millisecond, MaxDelay: 2 * time.Millisecond}},
 		{ID: 2, Key: "secondary", Outbound: config.Outbound{Workers: 1}}}, sender, discardLogger())
 	cfg := config.Scheduler{Workers: 2, PollInterval: 5 * time.Millisecond, BatchSize: 25, NotificationWorkers: 1,
 		NotificationBatchSize: 150, RecoveryBatchSize: 150, RetryBaseDelay: 5 * time.Millisecond, RetryMaxDelay: 30 * time.Millisecond,
 		LockTimeout: time.Minute, StaleJobTTL: 2 * time.Hour, MaxAttempts: 2}
-	p := NewProcessor(cfg, NewRepository(db), contactRepo, messageRepo, campaignSvc, templateRepo, gate, store, discardLogger())
+	p := NewProcessor(cfg, NewRepository(db), contactRepo, messageRepo, campaignSvc, templateRepo, gate, store, discardLogger()).
+		WithReplyHistory(messaging.NewReplyHistory(recoveryRegistry{provider}, messageRepo))
 	return &recoveryFixture{db, p, provider, jobRepo, campaign, cfg, gate, store}
 }
 

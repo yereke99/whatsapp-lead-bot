@@ -57,6 +57,7 @@ type Outbound struct {
 	CampaignStepID     *uuid.UUID
 	ScheduledMessageID *uuid.UUID
 	IncomingEventID    *uuid.UUID
+	ExpiresAt          *time.Time
 	TemplateID         *uuid.UUID
 	TemplateVersion    *int
 
@@ -81,6 +82,7 @@ type Sender struct {
 	contacts   *contacts.Repository
 	mediaStore *media.Store
 	log        *slog.Logger
+	history    *ReplyHistory
 }
 
 func NewSender(
@@ -96,6 +98,7 @@ func NewSender(
 		contacts:   contactRepo,
 		mediaStore: mediaStore,
 		log:        log.With(slog.String("component", "messaging")),
+		history:    NewReplyHistory(providers, messages),
 	}
 }
 
@@ -122,9 +125,46 @@ func (s *Sender) Send(ctx context.Context, contact *domain.Contact, out Outbound
 			s.log.Info("trigger_reply_already_sent", slog.String("message_id", sent.ID.String()))
 			return sent, nil
 		}
+		uncertain, err := s.messages.UncertainOutbound(ctx, out.ScheduledMessageID, out.IncomingEventID)
+		if err != nil {
+			return nil, err
+		}
+		if uncertain {
+			return nil, ManualReviewError()
+		}
 	}
 
 	instanceID := domain.InstanceIDOrPrimary(&out.WhatsAppInstanceID)
+	// This runs after outbound pacing, including when a queue crossed its
+	// send window while waiting for another message.
+	if out.ExpiresAt != nil && !time.Now().UTC().Before(*out.ExpiresAt) {
+		return nil, ErrSendWindowExpired
+	}
+	if out.IncomingEventID != nil {
+		externalID, at, err := s.messages.IncomingIdentity(ctx, *out.IncomingEventID)
+		if err != nil {
+			return nil, err
+		}
+		answered, err := s.messages.ManuallyAnsweredSince(ctx, instanceID, contact.ID, at)
+		if err != nil {
+			return nil, err
+		}
+		if answered {
+			return nil, ErrAlreadyAnswered
+		}
+		if time.Since(at) > HistoricalReplyAge {
+			state, err := s.history.Check(ctx, instanceID, contact.ID, contact.ChatID, externalID, at)
+			if err != nil {
+				return nil, err
+			}
+			if state == ReplyAnswered {
+				return nil, ErrAlreadyAnswered
+			}
+			if state != ReplyUnanswered {
+				return nil, ManualReviewError()
+			}
+		}
+	}
 
 	// Resolve the transport before anything is written. A message that cannot
 	// leave through the account it belongs to must not be recorded as pending

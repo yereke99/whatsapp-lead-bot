@@ -278,7 +278,7 @@ func (s *Service) handleTrigger(ctx context.Context, contact *domain.Contact, ma
 				return err
 			}
 
-			created, err := s.scheduleEnrollment(ctx, tx, campaign, enrollment, at)
+			created, err := s.scheduleEnrollment(ctx, tx, campaign, enrollment, at, recovery)
 			if err != nil {
 				return err
 			}
@@ -352,7 +352,7 @@ func (s *Service) applyExistingBehavior(
 		result.Enrollment = restarted
 		result.Action = ActionRestarted
 
-		created, err := s.scheduleEnrollment(ctx, tx, campaign, restarted, at)
+		created, err := s.scheduleEnrollment(ctx, tx, campaign, restarted, at, false)
 		if err != nil {
 			return err
 		}
@@ -385,7 +385,7 @@ func (s *Service) applyExistingBehavior(
 				existing.OccurrenceAt = occurrence
 			}
 		}
-		created, err := s.scheduleEnrollment(ctx, tx, campaign, existing, at)
+		created, err := s.scheduleEnrollment(ctx, tx, campaign, existing, at, false)
 		if err != nil {
 			return err
 		}
@@ -471,7 +471,7 @@ func (s *Service) occurrenceFor(ctx context.Context, tx sqlite.Querier, campaign
 // most recent message they missed is a judgement about someone who has just
 // arrived; later repairs must never make it again, or a step added late would
 // fire at everyone already in the funnel at once.
-func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, campaign *domain.Campaign, enrollment *domain.Enrollment, at time.Time) (int, error) {
+func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, campaign *domain.Campaign, enrollment *domain.Enrollment, at time.Time, recovery bool) (int, error) {
 	steps, err := s.repo.ListSteps(ctx, tx, campaign.ID)
 	if err != nil {
 		return 0, err
@@ -508,7 +508,7 @@ func (s *Service) scheduleEnrollment(ctx context.Context, tx sqlite.Querier, cam
 	plan := BuildPlan(EventAnchor(campaign, enrollment), steps, PlanOptions{
 		EnrolledAt:            at,
 		Now:                   now,
-		CatchUp:               campaign.CatchUpMissedSteps,
+		CatchUp:               campaign.CatchUpMissedSteps && !recovery,
 		TriggerDelay:          s.triggerDelay,
 		DailySequenceConsumed: dailyConsumed,
 	})

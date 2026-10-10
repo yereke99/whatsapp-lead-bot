@@ -154,7 +154,8 @@ func run() error {
 	outboundGate := outbound.NewRouter(outboundSpecs, sender, log)
 
 	notifications := inbound.NewProcessor(cfg.Scheduler, notificationRepo, contactRepo,
-		messageRepo, campaignSvc, templateRepo, outboundGate, mediaStore, log)
+		messageRepo, campaignSvc, templateRepo, outboundGate, mediaStore, log).
+		WithReplyHistory(messaging.NewReplyHistory(registry, messageRepo))
 
 	worker := scheduler.NewWorker(cfg.Scheduler, jobRepo, templateRepo, contactRepo,
 		outboundGate, mediaStore, log)

@@ -13,6 +13,7 @@ import (
 
 	"github.com/ayran/whatsapp-automation/internal/campaigns"
 	"github.com/ayran/whatsapp-automation/internal/domain"
+	"github.com/ayran/whatsapp-automation/internal/messaging"
 	"github.com/ayran/whatsapp-automation/internal/storage/sqlite"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp"
 	"github.com/ayran/whatsapp-automation/internal/whatsapp/greenapi"
@@ -36,6 +37,7 @@ type RecoveryPreview struct {
 	Eligible       int            `json:"eligible_for_recovery"`
 	BatchSize      int            `json:"batch_size"`
 	Items          []RecoveryItem `json:"items"`
+	ReviewItems    []RecoveryItem `json:"manual_review_items"`
 }
 
 const storedEventColumns = `id, COALESCE(whatsapp_instance_id, 1), provider,
@@ -60,7 +62,7 @@ func (r *Repository) Get(ctx context.Context, id uuid.UUID) (*StoredEvent, error
 // history; the response contains at most one configured batch of event IDs.
 // Requeue rechecks every ID because this preview can race with live workers.
 func (p *Processor) PreviewRecovery(ctx context.Context, instanceID int64) (*RecoveryPreview, error) {
-	out := &RecoveryPreview{BatchSize: p.recoveryBatchSize(), Items: []RecoveryItem{}}
+	out := &RecoveryPreview{BatchSize: p.recoveryBatchSize(), Items: []RecoveryItem{}, ReviewItems: []RecoveryItem{}}
 	var cursorID string
 	var cursorAt time.Time
 	for {
@@ -105,6 +107,9 @@ func (p *Processor) PreviewRecovery(ctx context.Context, instanceID int64) (*Rec
 				out.Ineligible++
 			case "ambiguous":
 				out.Ambiguous++
+				if len(out.ReviewItems) < out.BatchSize {
+					out.ReviewItems = append(out.ReviewItems, RecoveryItem{e.ID, e.WhatsAppInstanceID, e.ExternalID, e.ReceivedAt})
+				}
 			case "eligible":
 				out.Eligible++
 				if len(out.Items) < out.BatchSize {
@@ -230,6 +235,13 @@ func (p *Processor) recoveryEligibility(ctx context.Context, e StoredEvent) (str
 			}
 		}
 	}
+	uncertain, err := p.messages.UncertainOutbound(ctx, initialJobID, &e.ID)
+	if err != nil {
+		return "", nil, err
+	}
+	if uncertain {
+		return "ambiguous", nil, nil
+	}
 	if contact != nil {
 		optedOut, err := p.contacts.IsOptedOutOn(ctx, nil, e.WhatsAppInstanceID, contact.ID)
 		if err != nil {
@@ -241,6 +253,21 @@ func (p *Processor) recoveryEligibility(ctx context.Context, e StoredEvent) (str
 		}
 		if !contact.CanBeContacted() || optedOut || stop {
 			return "ineligible", nil, nil
+		}
+	}
+	contactID := uuid.Nil
+	if contact != nil {
+		contactID = contact.ID
+	}
+	// Historical replay requires more than the absence of a linked welcome
+	// receipt: phone replies and unrelated successful outgoing messages count.
+	if e.Status != domain.WebhookReceived && e.Status != domain.WebhookProcessing {
+		state, err := p.history.Check(ctx, e.WhatsAppInstanceID, contactID, event.ChatID, e.ExternalID, event.Timestamp)
+		if err != nil {
+			return "", nil, err
+		}
+		if state != messaging.ReplyUnanswered {
+			return state, nil, nil
 		}
 	}
 	// PENDING or leased work is already handled by normal startup recovery.
@@ -290,7 +317,12 @@ func (p *Processor) RequeueRecovery(ctx context.Context, ids []uuid.UUID) (*Reco
 			    AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.direction = 'OUTGOING'
 			      AND (m.incoming_event_id = $1 OR ($2 IS NOT NULL AND m.scheduled_message_id = $2))
 			      AND (m.sent_at IS NOT NULL OR m.status IN ('SENT','DELIVERED','READ')))
-			    AND NOT EXISTS (SELECT 1 FROM scheduled_messages WHERE id = $2 AND status = 'SENT')`, id, jobID)
+			    AND NOT EXISTS (SELECT 1 FROM scheduled_messages WHERE id = $2 AND status = 'SENT')
+			    AND NOT EXISTS (SELECT 1 FROM messages m JOIN contacts c ON c.id = m.contact_id
+			      WHERE c.chat_id = json_extract(webhook_events.payload, '$.senderData.chatId')
+			        AND m.direction = 'OUTGOING' AND COALESCE(m.whatsapp_instance_id, 1) = COALESCE(webhook_events.whatsapp_instance_id, 1)
+			        AND COALESCE(m.sent_at, m.created_at) >= webhook_events.received_at
+			        AND (m.sent_at IS NOT NULL OR m.status IN ('SENT','DELIVERED','READ')))`, id, jobID)
 			if err != nil || tag.RowsAffected() == 0 {
 				return err
 			}

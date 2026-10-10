@@ -64,14 +64,29 @@ func (r *Repository) Create(ctx context.Context, q sqlite.Querier, m *domain.Mes
 		downloadState = "NONE"
 	}
 
-	err := r.querier(q).QueryRow(ctx, query,
-		m.ContactID, m.CampaignID, m.EnrollmentID, m.CampaignStepID, m.ScheduledMessageID,
-		m.Direction, m.Type, m.Text, m.MediaFileID, m.MediaURL, m.FileName, m.MimeType,
-		m.ExternalID, m.Status, m.Error, m.IsManual, m.SentByAdminID, m.TemplateID,
-		m.TemplateVersion, downloadState, m.SentAt, m.DeliveredAt, m.ReadAt,
-		domain.InstanceIDOrPrimary(m.WhatsAppInstanceID),
-		m.IncomingEventID,
-	).Scan(&m.ID, &m.CreatedAt, &m.UpdatedAt)
+	insert := func() error {
+		return r.querier(q).QueryRow(ctx, query,
+			m.ContactID, m.CampaignID, m.EnrollmentID, m.CampaignStepID, m.ScheduledMessageID,
+			m.Direction, m.Type, m.Text, m.MediaFileID, m.MediaURL, m.FileName, m.MimeType,
+			m.ExternalID, m.Status, m.Error, m.IsManual, m.SentByAdminID, m.TemplateID,
+			m.TemplateVersion, downloadState, m.SentAt, m.DeliveredAt, m.ReadAt,
+			domain.InstanceIDOrPrimary(m.WhatsAppInstanceID),
+			m.IncomingEventID,
+		).Scan(&m.ID, &m.CreatedAt, &m.UpdatedAt)
+	}
+	err := insert()
+	if sqlite.IsUniqueViolation(err, "messages_external_id_key") && m.ExternalID != nil {
+		var otherInstance bool
+		if readErr := r.querier(q).QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages WHERE external_id = $1
+		  AND COALESCE(whatsapp_instance_id, 1) <> $2)`, *m.ExternalID, domain.InstanceIDOrPrimary(m.WhatsAppInstanceID)).Scan(&otherInstance); readErr != nil {
+			return readErr
+		}
+		if otherInstance {
+			id := scopedExternalID(domain.InstanceIDOrPrimary(m.WhatsAppInstanceID), m.Direction, *m.ExternalID)
+			m.ExternalID = &id
+			err = insert()
+		}
+	}
 
 	if err != nil {
 		if sqlite.IsUniqueViolation(err, "messages_external_id_key") {
@@ -103,6 +118,65 @@ func (r *Repository) ExistsByExternalID(ctx context.Context, q sqlite.Querier, e
 	err := r.querier(q).QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM messages WHERE external_id = $1)`, externalID).Scan(&exists)
 	return exists, err
+}
+
+func scopedExternalID(instanceID int64, direction domain.Direction, externalID string) string {
+	return fmt.Sprintf("%s:%d:%s", strings.ToLower(string(direction)), instanceID, externalID)
+}
+
+func (r *Repository) ExistsByExternalIDOn(ctx context.Context, q sqlite.Querier, instanceID int64, externalID string) (bool, error) {
+	var exists bool
+	err := r.querier(q).QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages
+	  WHERE COALESCE(whatsapp_instance_id, 1) = $1 AND direction = 'OUTGOING'
+	    AND external_id IN ($2, $3))`, instanceID, externalID,
+		scopedExternalID(instanceID, domain.DirectionOutgoing, externalID)).Scan(&exists)
+	return exists, err
+}
+
+func (r *Repository) AnsweredSince(ctx context.Context, q sqlite.Querier, instanceID int64, contactID uuid.UUID, at time.Time) (bool, error) {
+	return r.answeredSince(ctx, q, instanceID, contactID, at, false)
+}
+
+func (r *Repository) ManuallyAnsweredSince(ctx context.Context, instanceID int64, contactID uuid.UUID, at time.Time) (bool, error) {
+	return r.answeredSince(ctx, nil, instanceID, contactID, at, true)
+}
+
+func (r *Repository) answeredSince(ctx context.Context, q sqlite.Querier, instanceID int64, contactID uuid.UUID, at time.Time, manualOnly bool) (bool, error) {
+	var answered bool
+	err := r.querier(q).QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages
+	  WHERE contact_id = $1 AND COALESCE(whatsapp_instance_id, 1) = $2 AND direction = 'OUTGOING'
+	    AND COALESCE(sent_at, created_at) >= $3
+	    AND ($4 = 0 OR is_manual = 1 OR (scheduled_message_id IS NULL AND incoming_event_id IS NULL))
+	    AND (sent_at IS NOT NULL OR status IN ('SENT','DELIVERED','READ')))`, contactID, instanceID, at, manualOnly).Scan(&answered)
+	return answered, err
+}
+
+func (r *Repository) IncomingIdentity(ctx context.Context, eventID uuid.UUID) (string, time.Time, error) {
+	var externalID string
+	var at time.Time
+	err := r.db.QueryRow(ctx, `SELECT external_id, received_at FROM webhook_events WHERE id = $1`, eventID).Scan(&externalID, &at)
+	return externalID, at, err
+}
+
+func (r *Repository) UncertainOutbound(ctx context.Context, jobID, eventID *uuid.UUID) (bool, error) {
+	for _, identity := range []struct {
+		column string
+		id     *uuid.UUID
+	}{
+		{"scheduled_message_id", jobID}, {"incoming_event_id", eventID},
+	} {
+		if identity.id == nil {
+			continue
+		}
+		var uncertain bool
+		err := r.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages
+		  WHERE direction = 'OUTGOING' AND `+identity.column+` = $1
+		    AND sent_at IS NULL AND (status = 'PENDING' OR error LIKE '%persistSendReceipt%'))`, identity.id).Scan(&uncertain)
+		if err != nil || uncertain {
+			return uncertain, err
+		}
+	}
+	return false, nil
 }
 
 // SuccessfulOutbound finds the provider receipt even if a crash left the job
@@ -202,6 +276,20 @@ func (r *Repository) MarkSent(ctx context.Context, q sqlite.Querier, id uuid.UUI
 
 	_, err := r.querier(q).Exec(ctx, query, id, externalID, sentAt)
 	if err != nil && sqlite.IsUniqueViolation(err, "messages_external_id_key") {
+		var instanceID int64
+		var otherInstance bool
+		if readErr := r.querier(q).QueryRow(ctx, `SELECT COALESCE(m.whatsapp_instance_id, 1), EXISTS (
+		  SELECT 1 FROM messages prior WHERE prior.external_id = $2
+		    AND COALESCE(prior.whatsapp_instance_id, 1) <> COALESCE(m.whatsapp_instance_id, 1))
+		  FROM messages m WHERE m.id = $1`, id, externalID).Scan(&instanceID, &otherInstance); readErr != nil {
+			return readErr
+		}
+		if otherInstance {
+			_, err = r.querier(q).Exec(ctx, query, id, scopedExternalID(instanceID, domain.DirectionOutgoing, externalID), sentAt)
+			if err == nil {
+				return nil
+			}
+		}
 		return ErrDuplicate
 	}
 	return err
@@ -219,7 +307,7 @@ func (r *Repository) MarkFailed(ctx context.Context, q sqlite.Querier, id uuid.U
 // Providers do not guarantee ordering, so a READ notification can arrive
 // before its DELIVERED counterpart. The rank comparison makes the transition
 // monotonic and keeps the timeline honest.
-func (r *Repository) ApplyStatus(ctx context.Context, q sqlite.Querier, externalID string, status whatsapp.DeliveryStatus, at time.Time, description string) (bool, error) {
+func (r *Repository) ApplyStatus(ctx context.Context, q sqlite.Querier, instanceID int64, externalID string, status whatsapp.DeliveryStatus, at time.Time, description string) (bool, error) {
 	if status == "" {
 		return false, nil
 	}
@@ -231,7 +319,7 @@ func (r *Repository) ApplyStatus(ctx context.Context, q sqlite.Querier, external
 			read_at      = CASE WHEN $2 = 'READ' THEN COALESCE(read_at, $4) ELSE read_at END,
 			error        = CASE WHEN $3 = 'FAILED' THEN $5 ELSE error END,
 			updated_at   = now()
-		WHERE external_id = $1
+		WHERE external_id IN ($1, $8) AND COALESCE(whatsapp_instance_id, 1) = $7
 		  AND direction = 'OUTGOING'
 		  AND $6 > CASE status
 				WHEN 'SENT' THEN 1
@@ -243,7 +331,7 @@ func (r *Repository) ApplyStatus(ctx context.Context, q sqlite.Querier, external
 
 	tag, err := r.querier(q).Exec(ctx, query,
 		externalID, string(status), string(status), at,
-		truncate(description, 1000), status.Rank())
+		truncate(description, 1000), status.Rank(), instanceID, scopedExternalID(instanceID, domain.DirectionOutgoing, externalID))
 	if err != nil {
 		return false, err
 	}

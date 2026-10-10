@@ -273,6 +273,13 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 			slog.Time("next_attempt", next))
 		return
 	}
+	if expires := w.sendWindowEnd(jobCtx, job); expires != nil && !time.Now().UTC().Before(*expires) {
+		if err := w.repo.Cancel(ctx, job.ID, messaging.ErrSendWindowExpired.Error()); err != nil {
+			log.Error("cancelling expired job failed", slog.String("error", err.Error()))
+		}
+		log.Info("JOB_CANCELLED", slog.String("reason", messaging.ErrSendWindowExpired.Error()))
+		return
+	}
 
 	// Sending caps hold the queue rather than dropping messages, so an
 	// operator who set a conservative limit finds work waiting, not lost.
@@ -312,6 +319,13 @@ func (w *Worker) process(ctx context.Context, job domain.ScheduledMessage) {
 	contact := contactFromJob(jobCtx)
 	message, sendErr := w.sender.Send(ctx, contact, out)
 	if sendErr != nil {
+		if errors.Is(sendErr, messaging.ErrAlreadyAnswered) || errors.Is(sendErr, messaging.ErrSendWindowExpired) {
+			if err := w.repo.Cancel(ctx, job.ID, sendErr.Error()); err != nil {
+				log.Error("cancelling job failed", slog.String("error", err.Error()))
+			}
+			log.Info("JOB_CANCELLED", slog.String("reason", sendErr.Error()))
+			return
+		}
 		// A consent failure can never succeed on retry.
 		if errors.Is(sendErr, messaging.ErrNoConsent) || errors.Is(sendErr, messaging.ErrOptedOut) {
 			if cancelErr := w.repo.Cancel(ctx, job.ID, sendErr.Error()); cancelErr != nil {
@@ -468,6 +482,8 @@ func (w *Worker) buildOutbound(jc *JobContext, spec *templates.SendSpec, job dom
 		EnrollmentID:       &jc.Job.EnrollmentID,
 		CampaignStepID:     &jc.Job.StepID,
 		ScheduledMessageID: &job.ID,
+		IncomingEventID:    jc.InitialEventID,
+		ExpiresAt:          w.sendWindowEnd(jc, job),
 		TemplateID:         &spec.TemplateID,
 		TemplateVersion:    &spec.Version,
 	}
@@ -484,6 +500,30 @@ func (w *Worker) buildOutbound(jc *JobContext, spec *templates.SendSpec, job dom
 	}
 
 	return out, nil
+}
+
+// Enforce expiry on the send path as well as the periodic reaper. Initial
+// replies keep their recovery policy; webinar reminders never cross into the
+// next local day, even if that is within the generic TTL.
+func (w *Worker) sendWindowEnd(jc *JobContext, job domain.ScheduledMessage) *time.Time {
+	if jc.InitialReply {
+		return nil
+	}
+	var end *time.Time
+	if w.cfg.StaleJobTTL > 0 {
+		t := job.ScheduledAt.Add(w.cfg.StaleJobTTL)
+		end = &t
+	}
+	if jc.StepDailyWebinar && jc.StepScheduleKind != domain.ScheduleOnTrigger {
+		if loc, err := timex.Location(jc.CampaignTimezone); err == nil {
+			local := job.ScheduledAt.In(loc)
+			t := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, loc).UTC()
+			if end == nil || t.Before(*end) {
+				end = &t
+			}
+		}
+	}
+	return end
 }
 
 // renderValues assembles the template variables for one recipient.

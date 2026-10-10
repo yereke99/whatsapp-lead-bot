@@ -664,8 +664,9 @@ func TestTwoRecurringCampaignsDoNotCrossContaminate(t *testing.T) {
 	enrollA := enrollmentOf(t, f, a.ID, contactA.ID)
 	enrollB := enrollmentOf(t, f, b.ID, contactB.ID)
 
-	wantA := almatyTime(t, startDate, clockA)
-	wantB := almatyTime(t, startDate, clockB)
+	// Adding hours may cross midnight in the campaign's timezone.
+	wantA := now.Add(3 * time.Hour).Truncate(time.Minute).UTC()
+	wantB := now.Add(5 * time.Hour).Truncate(time.Minute).UTC()
 
 	if enrollA.OccurrenceAt == nil || !enrollA.OccurrenceAt.Equal(wantA) {
 		t.Errorf("campaign A occurrence = %v, want %s", enrollA.OccurrenceAt, localOf(wantA))

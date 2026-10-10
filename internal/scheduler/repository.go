@@ -299,6 +299,7 @@ func (r *Repository) claim(ctx context.Context, workerID string, limit int, now 
 		SET status = 'PROCESSING', locked_by = $1, locked_at = $2, updated_at = now()
 		FROM (
 			SELECT due.id FROM scheduled_messages due
+			JOIN campaigns due_campaign ON due_campaign.id = due.campaign_id
 			WHERE due.status = 'PENDING'
 			  AND due.scheduled_at <= $2
 			  AND (due.next_attempt_at IS NULL OR due.next_attempt_at <= $2)
@@ -306,15 +307,17 @@ func (r *Repository) claim(ctx context.Context, workerID string, limit int, now 
 			    WHERE we.trigger_result IS NOT NULL AND CAST(json_extract(we.trigger_result, '$.initial_job_id') AS TEXT) = due.id
 			      AND we.received_at >= $6))
 			  AND NOT EXISTS (
-				SELECT 1 FROM scheduled_messages busy
+				SELECT 1 FROM scheduled_messages busy JOIN campaigns busy_campaign ON busy_campaign.id = busy.campaign_id
 				WHERE busy.contact_id = due.contact_id
+				  AND COALESCE(busy_campaign.whatsapp_instance_id, 1) = COALESCE(due_campaign.whatsapp_instance_id, 1)
 				  AND busy.status = 'PROCESSING'
 				  AND busy.locked_at IS NOT NULL
 				  AND busy.locked_at > $4
 			  )
 			  AND NOT EXISTS (
-				SELECT 1 FROM scheduled_messages earlier
+				SELECT 1 FROM scheduled_messages earlier JOIN campaigns earlier_campaign ON earlier_campaign.id = earlier.campaign_id
 				WHERE earlier.contact_id = due.contact_id
+				  AND COALESCE(earlier_campaign.whatsapp_instance_id, 1) = COALESCE(due_campaign.whatsapp_instance_id, 1)
 				  AND earlier.status = 'PENDING'
 				  AND earlier.scheduled_at <= $2
 				  AND (earlier.next_attempt_at IS NULL OR earlier.next_attempt_at <= $2)
@@ -367,9 +370,11 @@ type JobContext struct {
 	CampaignMaxPerHour  *int
 	CampaignMaxPerDay   *int
 
-	StepName   string
-	StepOffset int
-	TemplateID uuid.UUID
+	StepName         string
+	StepOffset       int
+	TemplateID       uuid.UUID
+	StepScheduleKind domain.ScheduleKind
+	StepDailyWebinar bool
 	// StepAudienceFilter and StepAudienceMinJoinedAt carry the step's audience
 	// cutoff so the send path can re-check eligibility against the enrolment,
 	// rather than trusting that whatever queued this row got it right.
@@ -401,6 +406,7 @@ type JobContext struct {
 	EnrollmentOccurrenceAt *time.Time
 	StepEnabled            bool
 	InitialReply           bool
+	InitialEventID         *uuid.UUID
 }
 
 func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobContext, error) {
@@ -412,7 +418,7 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 			camp.name, camp.status, camp.timezone, camp.webinar_link, camp.event_start_at,
 			camp.max_send_attempts, camp.pin_template_version,
 			camp.max_messages_per_hour, camp.max_messages_per_day,
-			cs.name, cs.offset_seconds, cs.message_template_id, cs.enabled,
+			cs.name, cs.offset_seconds, cs.message_template_id, cs.enabled, cs.schedule_kind, cs.include_in_daily_webinar,
 			cs.audience_filter_enabled, cs.audience_min_joined_at,
 			c.phone, c.chat_id, c.name, c.push_name, c.opted_out, (c.blocked_at IS NOT NULL), c.status, c.first_contact_at,
 			-- The unsubscribe that matters for this job: the one recorded
@@ -423,6 +429,8 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 			cc.status, cc.enrolled_at, cc.occurrence_at,
 			EXISTS (SELECT 1 FROM webhook_events we
 		    WHERE we.trigger_result IS NOT NULL AND CAST(json_extract(we.trigger_result, '$.initial_job_id') AS TEXT) = sm.id)
+			, (SELECT we.id FROM webhook_events we WHERE we.trigger_result IS NOT NULL
+			   AND CAST(json_extract(we.trigger_result, '$.initial_job_id') AS TEXT) = sm.id ORDER BY we.received_at, we.id LIMIT 1)
 		FROM scheduled_messages sm
 		JOIN campaigns camp        ON camp.id = sm.campaign_id
 		JOIN campaign_steps cs     ON cs.id = sm.campaign_step_id
@@ -439,13 +447,14 @@ func (r *Repository) LoadContext(ctx context.Context, jobID uuid.UUID) (*JobCont
 		&jc.CampaignName, &jc.CampaignStatus, &jc.CampaignTimezone, &jc.CampaignLink,
 		&jc.CampaignEventStart, &jc.CampaignMaxAttempts, &jc.CampaignPinVersion,
 		&jc.CampaignMaxPerHour, &jc.CampaignMaxPerDay,
-		&jc.StepName, &jc.StepOffset, &jc.TemplateID, &jc.StepEnabled,
+		&jc.StepName, &jc.StepOffset, &jc.TemplateID, &jc.StepEnabled, &jc.StepScheduleKind, &jc.StepDailyWebinar,
 		&jc.StepAudienceFilter, &jc.StepAudienceMinJoinedAt,
 		&jc.ContactPhone, &jc.ContactChatID, &jc.ContactName, &jc.ContactPushName,
 		&jc.ContactOptedOut, &jc.ContactBlocked, &jc.ContactStatus, &jc.ContactConsentAt,
 		&jc.ContactOptedOutHere,
 		&jc.EnrollmentStatus, &jc.EnrollmentJoinedAt, &jc.EnrollmentOccurrenceAt,
 		&jc.InitialReply,
+		&jc.InitialEventID,
 	)
 
 	if err := row.Scan(dest...); err != nil {

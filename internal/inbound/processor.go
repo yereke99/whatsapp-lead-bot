@@ -41,6 +41,7 @@ type Processor struct {
 	sender    replyDispatcher
 	media     *media.Store
 	log       *slog.Logger
+	history   *messaging.ReplyHistory
 
 	wg   sync.WaitGroup
 	once sync.Once
@@ -71,7 +72,13 @@ func NewProcessor(
 		sender:    sender,
 		media:     mediaStore,
 		log:       log.With(slog.String("component", "notifications")),
+		history:   messaging.NewReplyHistory(nil, messageRepo),
 	}
+}
+
+func (p *Processor) WithReplyHistory(history *messaging.ReplyHistory) *Processor {
+	p.history = history
+	return p
 }
 
 // Ingest stores a raw notification and returns whether it was new.
@@ -327,7 +334,7 @@ func (p *Processor) apply(ctx context.Context, instanceID int64, stored StoredEv
 	case whatsapp.EventOutgoingMessage:
 		return p.handleOutgoingEcho(ctx, instanceID, event)
 	case whatsapp.EventOutgoingStatus:
-		return p.handleStatus(ctx, event)
+		return p.handleStatus(ctx, instanceID, event)
 	case whatsapp.EventStateChanged:
 		p.log.Info("[WHATSAPP] provider state changed",
 			slog.Int64("whatsapp_instance_id", instanceID),
@@ -519,6 +526,20 @@ func (p *Processor) handleTrigger(ctx context.Context, instanceID int64, stored 
 		// replies to a message it was not configured to answer.
 		return nil
 	}
+	if time.Since(at) > messaging.HistoricalReplyAge || stored.Error == "manual trigger recovery" {
+		state, err := p.history.Check(ctx, instanceID, contact.ID, contact.ChatID, stored.ExternalID, at)
+		if err != nil {
+			return err
+		}
+		if state == messaging.ReplyAnswered {
+			p.log.Info("trigger_reply_already_sent", slog.String("event_id", stored.ID.String()))
+			return nil
+		}
+		if state != messaging.ReplyUnanswered {
+			return messaging.ManualReviewError()
+		}
+		recovery = true
+	}
 
 	result, err := p.campaigns.HandleTriggerEvent(ctx, contact, match, at, stored.ID, recovery)
 	if err != nil {
@@ -553,6 +574,9 @@ func (p *Processor) completeTriggerReply(ctx context.Context, instanceID int64, 
 		return nil
 	}
 	if err := p.sendSpecialReply(ctx, instanceID, eventID, contact, result); err != nil {
+		if errors.Is(err, messaging.ErrAlreadyAnswered) {
+			return nil
+		}
 		p.log.Warn("trigger_reply_retry", slog.String("event_id", eventID.String()), slog.String("error", err.Error()))
 		return err
 	}
@@ -624,7 +648,7 @@ func (p *Processor) handleOutgoingEcho(ctx context.Context, instanceID int64, ev
 
 	// Messages this platform sent are already recorded; only echoes of
 	// messages composed elsewhere need to be added.
-	exists, err := p.messages.ExistsByExternalID(ctx, nil, event.ExternalID)
+	exists, err := p.messages.ExistsByExternalIDOn(ctx, nil, instanceID, event.ExternalID)
 	if err != nil {
 		return err
 	}
@@ -681,12 +705,12 @@ func (p *Processor) handleOutgoingEcho(ctx context.Context, instanceID int64, ev
 	return nil
 }
 
-func (p *Processor) handleStatus(ctx context.Context, event *whatsapp.Event) error {
+func (p *Processor) handleStatus(ctx context.Context, instanceID int64, event *whatsapp.Event) error {
 	if event.Status == nil || event.Status.ExternalID == "" || event.Status.Status == "" {
 		return nil
 	}
 
-	if _, err := p.messages.ApplyStatus(ctx, nil,
+	if _, err := p.messages.ApplyStatus(ctx, nil, instanceID,
 		event.Status.ExternalID, event.Status.Status, event.Timestamp, event.Status.Description); err != nil {
 		return fmt.Errorf("apply delivery status: %w", err)
 	}

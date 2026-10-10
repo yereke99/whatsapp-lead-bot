@@ -561,6 +561,10 @@ func classifyHTTP(op string, status int, body string) *whatsapp.Error {
 				break
 			}
 		}
+	} else if detail := strings.TrimSpace(body); detail != "" && !strings.HasPrefix(detail, "<") {
+		// Account expiry is returned as plain text, not JSON. Preserve the
+		// redacted explanation instead of reporting only a payload error.
+		err.Message += ": " + truncate(detail, 300)
 	}
 
 	return err

@@ -28,6 +28,7 @@ func TestClassifyHTTPRetriesTemporaryInstanceStates(t *testing.T) {
 		{"client closed request", 499, ``, true},
 		{"bad payload", http.StatusBadRequest, `{"message":"Validation failed: chatId is required"}`, false},
 		{"expired account", http.StatusBadRequest, `{"message":"Instance account is expired"}`, false},
+		{"expired account plain text", http.StatusBadRequest, `Instance account is expired. Renew your instance from personal area.`, false},
 		{"bad token", http.StatusUnauthorized, `{"message":"Unauthorized"}`, false},
 	}
 
@@ -39,6 +40,9 @@ func TestClassifyHTTPRetriesTemporaryInstanceStates(t *testing.T) {
 			}
 			if whatsapp.IsRetryable(err) != tc.retryable {
 				t.Fatalf("IsRetryable = %v, want %v", whatsapp.IsRetryable(err), tc.retryable)
+			}
+			if strings.Contains(tc.name, "expired account") && !strings.Contains(err.Error(), "account is expired") {
+				t.Fatalf("expiry explanation missing: %v", err)
 			}
 		})
 	}

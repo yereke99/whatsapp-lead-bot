@@ -754,7 +754,23 @@ owner-only, session-authenticated recovery API:
 Recovery preserves an existing enrollment/run and only revives the missing
 initial reply's job. Expired webinar reminders and intentionally cancelled
 jobs are not revived. Already sent replies are skipped using both message
-receipts and job status. Legacy records that cannot prove which reply is owed
+receipts and job status. Successful outgoing phone/admin messages after the
+trigger also exclude a contact. Before replay, the provider journal must contain
+the exact incoming message, have phone-message capture enabled, and show no
+successful or pending outgoing reply since that message. Missing journal
+coverage or unavailable history requires manual review. The send path repeats
+these checks for delayed replies, so a phone reply arriving after preview also
+prevents replay. An orphaned PENDING submission without a provider receipt is
+retained for manual review rather than submitted again.
+
+Historical recovery disables catch-up of expired webinar steps. The scheduler
+and sender enforce the existing send-window TTL before submission, including
+after outbound pacing; daily webinar reminders also expire at the end of their
+scheduled local day. Normal live enrollment retains its configured catch-up
+policy. Phone echoes, provider receipts and delivery-status updates are scoped
+to their WhatsApp instance without rewriting existing history or indexes.
+
+Legacy records that cannot prove which reply is owed
 are reported as ambiguous instead of being bulk sent. This tool scans existing
 `webhook_events`; history-only messages whose raw events were already pruned by
 an older release require separate investigation and are not reconstructed.

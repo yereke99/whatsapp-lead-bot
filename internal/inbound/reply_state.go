@@ -25,7 +25,7 @@ func (r *Repository) InitialReplyOutcome(ctx context.Context, jobID uuid.UUID) e
 		}
 		return fmt.Errorf("read initial reply state: %w", err)
 	}
-	if sent || status == "SENT" {
+	if sent || status == "SENT" || (status == "CANCELLED" && reason == "trigger already answered") {
 		return nil
 	}
 	if status == "PENDING" || status == "PROCESSING" {
@@ -54,6 +54,7 @@ func (p *Processor) recoverRetryable(ctx context.Context) {
 	  WHERE id IN (SELECT id FROM webhook_events WHERE status = 'FAILED'
 	    AND event_type = 'incomingMessageReceived'
 	    AND error NOT LIKE 'permanent failure:%' AND updated_at <= $1
+	    AND error NOT LIKE '%persistSendReceipt%'
 	    ORDER BY received_at, id LIMIT $2)`, time.Now().UTC().Add(-delay), p.recoveryBatchSize())
 	if err != nil {
 		p.log.Error("incoming recovery failed", slog.String("error", err.Error()))
